@@ -45,6 +45,7 @@ claude --plugin-dir ./agentic-sdlc
 ## Components
 
 **Agents** (`agents/`)
+
 - `sdlc-spec-writer` — writes PRD + FRD for a `{phase, module, feature}`.
 - `sdlc-spec-reviewer` — gates the spec (APPROVED / CHANGES-REQUESTED) before branching.
 - `sdlc-branch-opener` — the single owner of branch creation; validates the name,
@@ -53,6 +54,7 @@ claude --plugin-dir ./agentic-sdlc
   out to the project's configured reviewers.
 
 **Skills** (`skills/`)
+
 - `sdlc-init` — bootstrap: detect stack, write config, scaffold docs.
 - `start-feature` — chain spec → review → branch → DI.
 - `dev-instructions` (DI), `verification-report` (CVR), `implementation-report` (IR) —

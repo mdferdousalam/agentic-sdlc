@@ -1,0 +1,19 @@
+{
+  // Markdown lint config for CI. Relaxes rules that conflict with this repo's
+  // doc style (long prose lines, tables, frontmatter, mixed code fences) while
+  // keeping the structural rules that catch real mistakes.
+  "config": {
+    "default": true,
+    "MD013": false, // line length — prose and tables run long on purpose
+    "MD024": { "siblings_only": true }, // allow repeated headings across sections
+    "MD025": false, // prompt docs use several top-level (#) section headings
+    "MD033": false, // inline HTML
+    "MD060": false, // table pipe spacing style — purely cosmetic
+    "MD036": false, // bold-as-pseudo-heading in templates
+    "MD040": false, // not every fence declares a language
+    "MD041": false, // files start with YAML frontmatter, not an H1
+    "MD046": false // mixed code block styles
+  },
+  "globs": ["**/*.md"],
+  "ignores": ["node_modules"]
+}
