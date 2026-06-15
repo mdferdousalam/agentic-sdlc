@@ -1,0 +1,9 @@
+{
+  "name": "agentic-sdlc",
+  "description": "Stack-agnostic agent-based SDLC pipeline: PRD -> FRD -> branch -> DI -> code -> CVR -> readiness gate -> IR. Per-phase/module/feature branching, doc-first enforcement, and a project-detected config adapter so the same pipeline runs on any stack. Run /agentic-sdlc:sdlc-init in any repo to bootstrap.",
+  "version": "0.1.0",
+  "author": { "name": "Engr Md Ferdous Alam", "email": "mdferdousalam1989@yahoo.com", "url": "https://github.com/mdferdousalam" },
+  "homepage": "https://github.com/mdferdousalam/agentic-sdlc",
+  "repository": "https://github.com/mdferdousalam/agentic-sdlc",
+  "license": "MIT"
+}

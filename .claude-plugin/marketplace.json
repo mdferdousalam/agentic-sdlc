@@ -1,0 +1,11 @@
+{
+  "name": "agentic-sdlc",
+  "owner": { "name": "Engr Md Ferdous Alam", "email": "mdferdousalam1989@yahoo.com", "url": "https://github.com/mdferdousalam" },
+  "plugins": [
+    {
+      "name": "agentic-sdlc",
+      "source": "./",
+      "description": "Portable agent-based SDLC pipeline for any project: PRD -> FRD -> branch -> DI -> code -> CVR -> readiness gate -> IR."
+    }
+  ]
+}
