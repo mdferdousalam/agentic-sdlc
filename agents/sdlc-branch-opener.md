@@ -63,4 +63,4 @@ scope. You never write feature code, never merge, never rewrite history.
 # Output
 
 Report: branch name, base trunk, push status, PR URL (or "no remote / manual PR"),
-and the ledger rows written. Then hand off to `/new-di`.
+and the ledger rows written. Then hand off to `/dev-instructions`.

@@ -2,7 +2,7 @@
 name: start-feature
 description: >
   One-command entry point that drives a feature through the front of the SDLC pipeline:
-  spec-writer (PRD+FRD) -> spec-reviewer -> branch-opener -> /new-di. Use when asked to
+  spec-writer (PRD+FRD) -> spec-reviewer -> branch-opener -> /dev-instructions. Use when asked to
   "start a feature", "kick off <feature>", or to begin work on a new module/feature.
   Args: phase=<phase-N> module=<slug> feature=<slug>.
 ---
@@ -34,10 +34,10 @@ feature, then confirm before proceeding.
      revises), and re-review. Do not advance until `APPROVED`.
 3. **Branch.** Invoke the `sdlc-branch-opener` agent. It validates the name, enforces
    doc-first, creates + pushes the branch, drafts the PR, and updates the ledgers.
-4. **DI.** Invoke `/new-di` to produce the Developer Instructions the implementer follows.
+4. **DI.** Invoke `/dev-instructions` to produce the Developer Instructions the implementer follows.
 
 ## Output
 
 Summarize: spec paths, review verdict, branch name + PR URL, DI path. Then tell the
-user what comes next: implement against the DI, then run `/new-cvr`, the
-`sdlc-readiness-gate`, and `/new-ir` before merge.
+user what comes next: implement against the DI, then run `/verification-report`, the
+`sdlc-readiness-gate`, and `/implementation-report` before merge.

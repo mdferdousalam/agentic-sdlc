@@ -84,11 +84,11 @@ Tell the user the pipeline is ready and show the entry point:
 | 2 FRD | Functional Requirements | `sdlc-spec-writer` | `.../FRD_v1.0.md` |
 | 2b Review | Spec gate | `sdlc-spec-reviewer` | verdict (no file) |
 | 3 Branch | Branch + draft PR | `sdlc-branch-opener` | git + `BRANCH_LEDGER.md` |
-| 4 DI | Developer Instructions | `/new-di` | `.../DI_v1.0.md` |
+| 4 DI | Developer Instructions | `/dev-instructions` | `.../DI_v1.0.md` |
 | 5 Code | Implementation | project scaffolding skills | source tree |
-| 6 CVR | Cross-Verification Report | `/new-cvr` | `.../CVR_of-DI-v1.0_r1.md` |
+| 6 CVR | Cross-Verification Report | `/verification-report` | `.../CVR_of-DI-v1.0_r1.md` |
 | 7 Gate | Pre-merge review | `sdlc-readiness-gate` | verdict (no file) |
-| 8 IR | Implementation Report | `/new-ir` | `.../IR_of-DI-v1.0_r1.md` |
+| 8 IR | Implementation Report | `/implementation-report` | `.../IR_of-DI-v1.0_r1.md` |
 | 9 Merge | Merge + status update | branch owner | `MODULES_MAP.md` status |
 
 Hard rule to record in SDLC.md: **no code merges without a DI → CVR → IR trail, and no

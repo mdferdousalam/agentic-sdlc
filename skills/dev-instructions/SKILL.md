@@ -1,12 +1,12 @@
 ---
-name: new-di
+name: dev-instructions
 description: >
   Generate the Developer Instructions (DI) document for a feature from its approved PRD
   and FRD — the concrete, step-by-step build plan the implementer follows. Use after the
   branch is created, or when asked to "write the DI / dev instructions" for a feature.
 ---
 
-# /new-di — Developer Instructions
+# /dev-instructions — Developer Instructions (DI)
 
 The DI translates the FRD into an ordered, unambiguous build plan. The implementer
 should be able to follow it without re-deriving decisions.

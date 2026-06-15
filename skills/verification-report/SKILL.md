@@ -1,12 +1,12 @@
 ---
-name: new-cvr
+name: verification-report
 description: >
   Generate the Cross-Verification Report (CVR) for a feature: verify the implementation
   on the branch against its DI, FRD, and PRD, item by item. Use after implementation and
   before the readiness gate, or when asked to "run the CVR / cross-verify this feature".
 ---
 
-# /new-cvr — Cross-Verification Report
+# /verification-report — Cross-Verification Report (CVR)
 
 The CVR is the evidence that what was built matches what was specified. It is a
 line-by-line audit, not a summary.

@@ -37,9 +37,9 @@ claude --plugin-dir ./agentic-sdlc
 /agentic-sdlc:start-feature phase=1 module=auth feature=2fa
 
 # 3. implement against the DI, then:
-/agentic-sdlc:new-cvr        # cross-verify build vs spec
+/agentic-sdlc:verification-report     # cross-verify build vs spec (CVR)
 # run the readiness gate (sdlc-readiness-gate agent) -> READY
-/agentic-sdlc:new-ir         # close the feature
+/agentic-sdlc:implementation-report   # close the feature (IR)
 ```
 
 ## Components
@@ -55,7 +55,8 @@ claude --plugin-dir ./agentic-sdlc
 **Skills** (`skills/`)
 - `sdlc-init` — bootstrap: detect stack, write config, scaffold docs.
 - `start-feature` — chain spec → review → branch → DI.
-- `new-di`, `new-cvr`, `new-ir` — artifact generators, parameterized by config paths.
+- `dev-instructions` (DI), `verification-report` (CVR), `implementation-report` (IR) —
+  artifact generators, parameterized by config paths.
 
 ## Conventions written into each project
 

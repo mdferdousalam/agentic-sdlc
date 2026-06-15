@@ -1,5 +1,5 @@
 ---
-name: new-ir
+name: implementation-report
 description: >
   Generate the Implementation Report (IR) that closes a feature: what shipped, how it
   was verified, deviations from the DI, and follow-ups. Use after the readiness gate
@@ -7,7 +7,7 @@ description: >
   implementation report".
 ---
 
-# /new-ir — Implementation Report
+# /implementation-report — Implementation Report (IR)
 
 The IR is the closing artifact: a durable record of what was delivered for this
 `{phase, module, feature}` and the proof it was verified.
