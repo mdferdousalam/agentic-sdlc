@@ -556,6 +556,17 @@ ok(r.returncode == 0, "adding a test and an assertion is not a weakening")
 
 r = run(["tests", "audit", "--base", "HEAD~1", "--acknowledge"], dt)
 ok(r.returncode == 0, "--acknowledge lets a justified change through")
+
+# Found by running this check against its own repository: the detector's own patterns, its
+# test fixtures and the evals that quote a suppression were all reported. A marker inside a
+# string literal suppresses nothing, and prose cannot disable a linter — so neither is a
+# loosening to skip. Six false positives on the tool's own diff would get the tool ignored.
+r = weaken({"src/patterns.py": 'SKIPS = ["# noqa", "@pytest.mark.skip", "// nolint"]\n'})
+ok(r.returncode == 0, "a suppression inside a string literal is a definition, not a suppression")
+r = weaken({"docs/guide.md": "Do not write `# noqa` or `@pytest.mark.skip` to pass the gate.\n"})
+ok(r.returncode == 0, "prose that quotes a suppression is not a suppression")
+r = weaken({"src/real.py": "def f():\n    return undefined_name  # noqa\n"})
+ok(r.returncode != 0, "but a real suppression in real code is still caught")
 shutil.rmtree(dt, ignore_errors=True)
 
 print("budget: a ceiling an agent cannot raise for itself")

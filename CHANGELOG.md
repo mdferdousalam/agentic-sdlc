@@ -57,6 +57,15 @@ the point, and it is a narrowing, so it is a major.
   share.
 - Four evals for the new refusals, and tests for every detection in both directions.
 
+### Noted
+
+Running `sdlc tests audit` against this repository reported six weakenings that were not
+weakenings: its own detection patterns, its own test fixtures, and the eval that quotes a
+skipped test. A marker inside a string literal suppresses nothing and prose cannot disable a
+linter, so neither is excluded at the cost of a bypass — but six false positives on the
+tool's own diff is how a tool gets ignored, so both are now excluded, with regression tests
+in each direction. Found by dogfooding, which is the point of dogfooding.
+
 ### Fixed
 
 - **`quality.cmd` never ran.** It was in the schema, documented as the Level 2 configuration,

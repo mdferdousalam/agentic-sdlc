@@ -1602,6 +1602,10 @@ SUPPRESS_ADDED = (
 
 NUM_SETTING = re.compile(r"([A-Za-z_][\w.\- ]{2,40})\s*[:=]\s*(\d{1,3})(?:\.\d+)?\s*%?\s*$")
 
+# Prose cannot skip a test or disable a linter. Documentation that quotes a suppression —
+# this repository's own evals do — is not a suppression.
+PROSE_RE = re.compile(r"\.(md|markdown|rst|txt|adoc)$", re.I)
+
 
 def diff_lines(root: str, base: str):
     """(path, added, removed) per file in the diff against base."""
@@ -1627,6 +1631,28 @@ def diff_lines(root: str, base: str):
     return out
 
 
+def in_string_literal(line: str, pos: int) -> bool:
+    """Is the match at pos inside a quoted string on this line?
+
+    A suppression marker inside a string literal suppresses nothing — it is a pattern
+    definition, a test fixture or a docstring. Skipping those is not a loosening, because the
+    thing being skipped is inert: there is no bypass in writing `# noqa` inside quotes.
+    Counts unescaped quotes before the match; odd means we are inside one.
+    """
+    depth, i, quote = 0, 0, None
+    while i < pos and i < len(line):
+        c = line[i]
+        if c == "\\":
+            i += 2
+            continue
+        if quote is None and c in "\"'`":
+            quote, depth = c, depth + 1
+        elif c == quote:
+            quote = None
+        i += 1
+    return quote is not None
+
+
 def suite_findings(root: str, base: str) -> list:
     """Everything in this diff that makes the gate easier to pass."""
     found = []
@@ -1650,15 +1676,15 @@ def suite_findings(root: str, base: str) -> list:
                 found.append((path, 0, f"{lost_a - gained_a} assertion(s) removed and not "
                                        f"replaced — the test may now prove less",
                               next(l.strip() for l in removed if ASSERT_RE.search(l))))
-        for line in added:
-            for pat, why in SKIP_ADDED:
-                if pat.search(line):
-                    found.append((path, 0, why, line.strip()))
+        for line in (added if not PROSE_RE.search(path or "") else []):
+            hit = None
+            for pat, why in SKIP_ADDED + SUPPRESS_ADDED:
+                m = pat.search(line)
+                if m and not in_string_literal(line, m.start()):
+                    hit = (why, line.strip())
                     break
-            for pat, why in SUPPRESS_ADDED:
-                if pat.search(line):
-                    found.append((path, 0, why, line.strip()))
-                    break
+            if hit:
+                found.append((path, 0, hit[0], hit[1]))
 
         # A threshold that went down. Same key, smaller number, same file.
         was = {}
