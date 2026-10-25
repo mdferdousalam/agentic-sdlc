@@ -636,6 +636,11 @@ def cmd_receipt(args) -> int:
     return 0
 
 
+def fingerprint_line(env: dict) -> str:
+    keys = [k for k in ("os", "arch", "python", "node", "go", "cargo", "git") if k in env]
+    return "  ".join(f"{k} {env[k]}" for k in keys)
+
+
 def cmd_status(_args) -> int:
     root = repo_root()
     cfg = load_config(root)
@@ -659,6 +664,7 @@ def cmd_status(_args) -> int:
         why = receipt_problem(root, kind, None, 10 ** 9)
         mark = "stale" if why else "current"
         print(f"  {kind:<13} {r.get('verdict','?'):<18} {str(r.get('commit',''))[:9]}  {r.get('at','')}  {mark}")
+    print(f"toolchain  {fingerprint_line(environment(root))}")
     return 0
 
 
@@ -692,6 +698,7 @@ def cmd_doctor(_args) -> int:
 
     present = detect_platforms()
     here = [k for k, v in present.items() if v]
+    print(f"toolchain       {fingerprint_line(environment(root))}")
     print(f"hosts detected  {', '.join(here) if here else 'none'}")
     installed = []
     for rel, label in ((".cursor/rules/agentic-sdlc.mdc", "cursor"),
@@ -1363,9 +1370,11 @@ def cmd_feedback(args) -> int:
         json.dump(d, fh, indent=2)
     audit(root, "feedback", f"{args.stage}: attempt {d['attempts']}")
     print(f"feedback recorded — attempt {d['attempts']} at stage {args.stage}")
-    if d["attempts"] >= 3:
-        print("Three attempts at the same stage. Stop and report rather than trying a fourth: "
-              "the specification or the approach is probably the problem, not the code.")
+    ceiling = int(budget_config(load_config(root)).get("maxRetries") or 3)
+    if d["attempts"] >= ceiling:
+        print(f"{d['attempts']} attempts at the same stage, and budget.maxRetries is "
+              f"{ceiling}. Stop and report rather than trying another: the specification or "
+              f"the approach is probably the problem, not the code.")
     return 0
 
 
@@ -1418,14 +1427,21 @@ def budget_problem(root: str, cfg: dict) -> str | None:
     st["toolCalls"] = st.get("toolCalls", 0) + 1
     budget_save(root, st)
 
+    warn_only = (b.get("stopPolicy") or "refuse") == "warn"
     limit = int(b.get("maxToolCalls") or 0)
+    if limit and st["toolCalls"] > limit and warn_only:
+        if st["toolCalls"] == limit + 1:  # say it once, not on every call after
+            print(f"agentic-sdlc: this task has passed its budget of {limit} tool calls. "
+                  f"stopPolicy is 'warn', so nothing is being refused — but nothing is "
+                  f"stopping a runaway either.", file=sys.stderr)
+        return None
     if limit and st["toolCalls"] > limit:
         return (f"this task has made {st['toolCalls']} tool calls and the budget is {limit}.\n"
                 f"Stop and report what is done, what is left and what it would cost. "
                 f"A person raises the ceiling in sdlc.config.json; an agent does not raise "
                 f"its own.\nReset with:  sdlc budget reset")
     mins = int(b.get("maxWallClockMin") or 0)
-    if mins:
+    if mins and not warn_only:
         try:
             began = calendar.timegm(time.strptime(st["startedAt"], "%Y-%m-%dT%H:%M:%SZ"))
             spent = (time.time() - began) / 60
@@ -1442,10 +1458,17 @@ def cmd_budget(args) -> int:
     cfg = load_config(root)
     b, st = budget_config(cfg), budget_state(root)
     if args.budget_action == "reset":
+        if not args.as_person:
+            print("sdlc budget reset needs --as '<your name>'.\n"
+                  "A ceiling an agent can clear for itself is not a ceiling — it is a pause. "
+                  "The reset records who accepted the extra cost, for the same reason "
+                  "`sdlc approve` does, and an agent must not run it on a person's behalf.",
+                  file=sys.stderr)
+            return 3
         budget_save(root, {"toolCalls": 0, "task": branch(root),
                            "startedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
-        audit(root, "budget.reset", f"by {args.as_person or 'agent'}")
-        print("budget reset for this task")
+        audit(root, "budget.reset", f"by {args.as_person}")
+        print(f"budget reset for this task by {args.as_person}")
         return 0
     spent_min = ""
     try:
@@ -1602,91 +1625,110 @@ SUPPRESS_ADDED = (
 
 NUM_SETTING = re.compile(r"([A-Za-z_][\w.\- ]{2,40})\s*[:=]\s*(\d{1,3})(?:\.\d+)?\s*%?\s*$")
 
-# Prose cannot skip a test or disable a linter. Documentation that quotes a suppression —
-# this repository's own evals do — is not a suppression.
-PROSE_RE = re.compile(r"\.(md|markdown|rst|txt|adoc)$", re.I)
+# Markdown is NOT excluded. In a plugin whose executable instructions are markdown, appending
+# `|| true` to a command in commands/gate.md is a real weakening, and skipping .md hid it.
+# Only a diff *illustration* inside documentation is skipped: a line whose own content begins
+# with + or -, which is an example of a change rather than a change.
+DOC_RE = re.compile(r"\.(md|markdown|rst|adoc)$", re.I)
+DIFF_ILLUSTRATION = re.compile(r"^\s*[+-]")
 
 
-def diff_lines(root: str, base: str):
-    """(path, added, removed) per file in the diff against base."""
-    out, path, added, removed, oldpath = [], None, [], [], None
-    raw = git("diff", "--unified=0", f"{base}...HEAD", cwd=root) or \
-        git("diff", "--unified=0", base, cwd=root)
-    for line in raw.splitlines():
-        if line.startswith("--- "):
-            # Remembered because a deleted file's +++ is /dev/null, and its removed lines
-            # would otherwise be attributed to whichever file came before it in the diff.
-            oldpath = line[6:] if line.startswith("--- a/") else None
-        elif line.startswith("+++ "):
-            if path:
-                out.append((path, added, removed))
-            new_path = line[6:] if line.startswith("+++ b/") else None
-            path, added, removed = (new_path or oldpath), [], []
-        elif line.startswith("+") and not line.startswith("+++"):
-            added.append(line[1:])
-        elif line.startswith("-") and not line.startswith("---"):
-            removed.append(line[1:])
-    if path:
+def diff_files(root: str, base: str):
+    """(path, added, removed) per changed file, or None if git could not tell us.
+
+    Each file is diffed on its own, with explicit prefixes. Parsing one combined diff let a
+    line of *content* beginning `++ b/x.md` pose as a file header and reassign every line
+    after it, and a developer's long-standing `diff.noprefix` setting removed the prefix this
+    parser keyed on — silently disabling the whole check. Neither is reachable per-file.
+    """
+    def run(*args):
+        return subprocess.run(["git", *args], cwd=root, capture_output=True, text=True)
+
+    r = run("diff", "--name-only", f"{base}...HEAD")
+    if r.returncode != 0:
+        r = run("diff", "--name-only", base)
+    if r.returncode != 0:
+        return None  # fail closed; the caller reports unexecuted, never "nothing found"
+
+    out = []
+    for path in [l for l in r.stdout.splitlines() if l.strip()]:
+        d = run("diff", "--no-color", "--unified=0", "--src-prefix=a/", "--dst-prefix=b/",
+                f"{base}...HEAD", "--", path)
+        if d.returncode != 0:
+            d = run("diff", "--no-color", "--unified=0", "--src-prefix=a/", "--dst-prefix=b/",
+                    base, "--", path)
+        if d.returncode != 0:
+            return None
+        added, removed, in_body = [], [], False
+        for line in d.stdout.splitlines():
+            if line.startswith("@@"):
+                in_body = True
+            elif in_body and line.startswith("+"):
+                added.append(line[1:])
+            elif in_body and line.startswith("-"):
+                removed.append(line[1:])
         out.append((path, added, removed))
     return out
 
 
-def in_string_literal(line: str, pos: int) -> bool:
-    """Is the match at pos inside a quoted string on this line?
+def marker_is_quoted(line: str, start: int, end: int) -> bool:
+    """Is this marker inside a quoted string — a pattern definition, or a fixture?
 
-    A suppression marker inside a string literal suppresses nothing — it is a pattern
-    definition, a test fixture or a docstring. Skipping those is not a loosening, because the
-    thing being skipped is inert: there is no bypass in writing `# noqa` inside quotes.
-    Counts unescaped quotes before the match; odd means we are inside one.
+    The previous version counted quote parity before the match, so one apostrophe in a comment
+    (`# don't lint  # noqa`) read as an open string and disarmed every marker after it on the
+    line. That was a bypass in the control, not a rough edge.
+
+    A quoted occurrence has a quote on BOTH sides of it on the same line; a real trailing
+    suppression has none after it. Requiring both cannot be opened by a single apostrophe, and
+    still skips only inert text — a suppression inside a string literal suppresses nothing.
     """
-    depth, i, quote = 0, 0, None
-    while i < pos and i < len(line):
-        c = line[i]
-        if c == "\\":
-            i += 2
-            continue
-        if quote is None and c in "\"'`":
-            quote, depth = c, depth + 1
-        elif c == quote:
-            quote = None
-        i += 1
-    return quote is not None
+    return (any(q in line[:start] for q in "\"'`")
+            and any(q in line[end:] for q in "\"'`"))
 
 
-def suite_findings(root: str, base: str) -> list:
-    """Everything in this diff that makes the gate easier to pass."""
+def suite_findings(root: str, base: str):
+    """Everything in this diff that makes the gate easier to pass, or None if git failed."""
     found = []
 
-    for path in (git("diff", "--name-only", "--diff-filter=D", f"{base}...HEAD", cwd=root)
-                 or "").splitlines():
+    r = subprocess.run(["git", "diff", "--name-only", "--diff-filter=D", f"{base}...HEAD"],
+                       cwd=root, capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    for path in r.stdout.splitlines():
         if path and TEST_PATH_RE.search(path):
-            found.append((path, 0, "a test file was deleted", path))
+            found.append((path, "a test file was deleted", path))
 
-    for path, added, removed in diff_lines(root, base):
-        is_test = TEST_PATH_RE.search(path or "")
-        if is_test:
+    files = diff_files(root, base)
+    if files is None:
+        return None
+
+    for path, added, removed in files:
+        if TEST_PATH_RE.search(path or ""):
             lost = sum(1 for l in removed if TEST_DECL.search(l))
             gained = sum(1 for l in added if TEST_DECL.search(l))
             if lost > gained:
-                found.append((path, 0, f"{lost - gained} test(s) removed and not replaced",
+                found.append((path, f"{lost - gained} test(s) removed and not replaced",
                               next(l.strip() for l in removed if TEST_DECL.search(l))))
             lost_a = sum(1 for l in removed if ASSERT_RE.search(l))
             gained_a = sum(1 for l in added if ASSERT_RE.search(l))
-            if lost_a - gained_a >= 2:
-                found.append((path, 0, f"{lost_a - gained_a} assertion(s) removed and not "
-                                       f"replaced — the test may now prove less",
+            # One removed assertion counts. The old threshold of two meant a reviewer could
+            # drop exactly one check per commit forever and never be reported.
+            if lost_a - gained_a >= 1:
+                n = lost_a - gained_a
+                found.append((path, f"{n} assertion(s) removed and not replaced — the test "
+                                    f"may now prove less",
                               next(l.strip() for l in removed if ASSERT_RE.search(l))))
-        for line in (added if not PROSE_RE.search(path or "") else []):
-            hit = None
+
+        is_doc = bool(DOC_RE.search(path or ""))
+        for line in added:
+            if is_doc and DIFF_ILLUSTRATION.search(line):
+                continue  # a diff shown as an example in documentation
             for pat, why in SKIP_ADDED + SUPPRESS_ADDED:
                 m = pat.search(line)
-                if m and not in_string_literal(line, m.start()):
-                    hit = (why, line.strip())
+                if m and not marker_is_quoted(line, m.start(), m.end()):
+                    found.append((path, why, line.strip()))
                     break
-            if hit:
-                found.append((path, 0, hit[0], hit[1]))
 
-        # A threshold that went down. Same key, smaller number, same file.
         was = {}
         for line in removed:
             m = NUM_SETTING.search(line.strip())
@@ -1697,8 +1739,8 @@ def suite_findings(root: str, base: str) -> list:
             if m:
                 key = m.group(1).strip().lower()
                 if key in was and int(m.group(2)) < was[key]:
-                    found.append((path, 0, f"a threshold was lowered: {key} "
-                                           f"{was[key]} -> {m.group(2)}", line.strip()))
+                    found.append((path, f"a threshold was lowered: {key} "
+                                        f"{was[key]} -> {m.group(2)}", line.strip()))
     return found
 
 
@@ -1708,12 +1750,19 @@ def cmd_tests(args) -> int:
     base = args.base or merge_base(root, cfg)
     found = suite_findings(root, base)
 
+    if found is None:
+        print(f"suite integrity: UNEXECUTED — git could not produce a diff against "
+              f"'{base}'. This is not a pass. A check that did not run is `unexecuted`; "
+              f"fix the ref and run it again.", file=sys.stderr)
+        audit(root, "suite.unexecuted", f"git diff failed against {base}")
+        return 1
+
     if not found:
         print(f"suite integrity: nothing in this diff weakens a check (against {base[:9]})")
         return 0
 
     print(f"suite integrity: {len(found)} thing(s) in this diff make the gate easier to pass\n")
-    for path, _, why, evidence in found:
+    for path, why, evidence in found:
         print(f"  {path}")
         print(f"    {why}")
         print(f"    > {evidence[:150]}")
@@ -1721,13 +1770,22 @@ def cmd_tests(args) -> int:
     print("pass without a sentence in the commit message saying why. Deleting a failing test,")
     print("weakening an assertion, skipping a case or lowering a threshold to make the gate")
     print("pass is the one failure this pipeline exists to prevent.")
-    print("\nIf a suppression is genuinely the right resolution, say so in the commit and")
-    print("re-run with --acknowledge to record that a human decision was made.")
-    audit(root, "suite.weakened", f"{len(found)} weakening change(s) against {base[:9]}")
 
     if args.acknowledge:
-        print("\nAcknowledged — recorded, not waived. The reviewers still see it.")
+        if not args.as_person:
+            print("\n--acknowledge needs --as '<your name>'. An acknowledgement with nobody "
+                  "behind it records nothing, which is the whole reason it exists.",
+                  file=sys.stderr)
+            return 3
+        audit(root, "suite.acknowledged",
+              f"{len(found)} weakening(s) accepted by {args.as_person} against {base[:9]}")
+        print(f"\nAcknowledged by {args.as_person} — recorded, not waived. The reviewers still "
+              f"see every one of these, and so does `sdlc metrics`.")
         return 0
+
+    print("\nIf a suppression is genuinely the right resolution, say so in the commit and")
+    print("re-run with --acknowledge --as '<your name>' to record who decided.")
+    audit(root, "suite.weakened", f"{len(found)} weakening change(s) against {base[:9]}")
     return 1
 
 
@@ -1825,11 +1883,37 @@ def merge_base(root: str, cfg: dict) -> str:
             or git("rev-list", "--max-parents=0", "HEAD", cwd=root))
 
 
+# A verify command is long by nature; a runaway one is the longest thing the pipeline runs,
+# and the ceiling meant to stop a runaway could not stop it.
+VERIFY_TIMEOUT_S = 1800
+
+
 def run_verify(root: str, cfg: dict):
+    """Run the project's verify command — through the same refusals as any other command.
+
+    `verifyCmd` comes from sdlc.config.json, which docs/rules.md section 7 classifies as data,
+    not authority. Running it with shell=True without consulting guard_problem opened a route
+    around every refusal in this file: a publish, a credential read or a deploy written into a
+    config string executed unchallenged, from a stage the branch-opener runs automatically.
+    The guard sees it first now, and it cannot run forever.
+    """
     cmd = cfg.get("gateCmd") or cfg.get("verifyCmd")
     if not cmd:
         return None, None, None
-    r = subprocess.run(cmd, shell=True, cwd=root, capture_output=True, text=True)
+    problem = guard_problem(root, cmd, cfg)
+    if problem:
+        audit(root, "blocked", f"verifyCmd: {problem.splitlines()[0]} :: {cmd}")
+        return cmd, 126, (f"REFUSED before running: the configured command is not allowed.\n"
+                          f"{problem}\n\nThis came from sdlc.config.json, which is data, not "
+                          f"authority. A command in a config file is held to the same rules "
+                          f"as one an agent types.")
+    try:
+        r = subprocess.run(cmd, shell=True, cwd=root, capture_output=True, text=True,
+                           timeout=VERIFY_TIMEOUT_S)
+    except subprocess.TimeoutExpired as e:
+        out = e.stdout if isinstance(e.stdout, str) else (e.stdout or b"").decode(errors="replace")
+        return cmd, 124, (f"{out}\nTIMED OUT after {VERIFY_TIMEOUT_S}s. That is `unexecuted` "
+                          f"— not a failure of the change, and not a pass.")
     return cmd, r.returncode, (r.stdout or "") + (r.stderr or "")
 
 
@@ -1967,7 +2051,30 @@ def finding_id(rule: str, file: str, line, summary: str) -> str:
     return "F-" + hashlib.sha256(key).hexdigest()[:8]
 
 
-def autofix_eligible(severity: str, confidence: str, has_repro: bool) -> bool:
+def never_autofix_rules() -> set:
+    """Rules the control spec marks **never** autofixable, whatever the severity pair says.
+
+    Parsed from the same table as the rule IDs. Without this the matrix alone decided, and a
+    TEST-SUITE-WEAKENED finding at critical/high came back "eligible for automatic fix" — an
+    agent authorised to repair a disarmed test suite unattended, which is the exact thing the
+    rule exists to stop.
+    """
+    try:
+        body = read_plugin("docs", "control-spec.md")
+    except Exception:
+        return set()
+    out = set()
+    for row in re.findall(r"^\|\s*`([A-Z][A-Z0-9-]*)`\s*\|(.*)$", body, re.M):
+        rule, rest = row
+        if re.search(r"\*\*never\*\*", rest, re.I):
+            out.add(rule)
+    return out
+
+
+def autofix_eligible(severity: str, confidence: str, has_repro: bool,
+                     rule: str = "") -> bool:
+    if rule and rule in never_autofix_rules():
+        return False
     policy = AUTOFIX.get((severity, confidence), False)
     if policy == "repro":
         return bool(has_repro)
@@ -2048,7 +2155,7 @@ def cmd_finding(args) -> int:
             "id": rid,
             "category": args.category,
             "ruleId": args.rule,
-            "component": args.component or None,
+            "component": args.component or "",
             "summary": args.summary,
             "evidence": {
                 "file": args.file,
@@ -2061,7 +2168,7 @@ def cmd_finding(args) -> int:
             "classification": {
                 "severity": severity,
                 "confidence": confidence,
-                "exploitability": args.exploitability or None,
+                "exploitability": args.exploitability or "not-applicable",
                 "impact": args.impact or None,
             },
             "rootCause": args.root_cause or None,
@@ -2078,14 +2185,16 @@ def cmd_finding(args) -> int:
                 "commit": head(root),
             },
         }
-        if args.repair:
-            # The agent proposes the change; the policy table decides whether it may make it.
-            rec["proposedRepair"] = {
-                "change": args.repair,
-                "expectedBehaviour": args.expected or "",
-                "sideEffects": args.side_effects or None,
-                "autofixEligible": autofix_eligible(severity, confidence, bool(args.repro)),
-            }
+        # The agent proposes the change; the policy table decides whether it may make it.
+        # Recorded even when no repair was proposed, so the remediator always has the
+        # machine-readable answer and never has to re-derive it from the prose.
+        rec["proposedRepair"] = {
+            "change": args.repair or "",
+            "expectedBehaviour": args.expected or "",
+            "sideEffects": args.side_effects or None,
+            "autofixEligible": autofix_eligible(severity, confidence,
+                                                bool(args.repro), args.rule),
+        }
         problems = finding_problems(rec)
         if problems:
             for why in problems:
@@ -2095,17 +2204,31 @@ def cmd_finding(args) -> int:
         os.makedirs(d, exist_ok=True)
         existing = os.path.join(d, rid + ".json")
         if os.path.exists(existing):
-            try:  # the same finding raised again keeps its outcome; it is one finding
+            # The same finding raised again is one finding — but if it was closed and has
+            # come back, it is NOT still closed. Re-opening it is the honest record: a defect
+            # re-detected after a bad fix was previously written straight back as `fixed`,
+            # and the gate reads `finding list --open`, so it vanished.
+            try:
                 prev = json.load(open(existing))
-                rec["outcome"] = prev.get("outcome", "open")
-                rec["closedBy"] = prev.get("closedBy")
+                was = prev.get("outcome", "open")
+                if was in ("fixed", "refused", "deferred"):
+                    rec["outcome"] = "open"
+                    rec["closedBy"] = None
+                    rec["reopened"] = int(prev.get("reopened", 0)) + 1
+                    print(f"  REOPENED — this was closed as {was} at "
+                          f"{str(prev.get('closedBy'))[:9]} and has been detected again.")
+                else:
+                    rec["outcome"] = was
+                    rec["closedBy"] = prev.get("closedBy")
+                    if prev.get("reopened"):
+                        rec["reopened"] = prev["reopened"]
             except Exception:
                 pass
         with open(existing, "w") as fh:
             json.dump(rec, fh, indent=2)
             fh.write("\n")
         audit(root, "finding.write", f"{rid} {args.rule} {severity}/{confidence} by {args.by}")
-        auto = (rec.get("proposedRepair") or {}).get("autofixEligible")
+        auto = rec["proposedRepair"]["autofixEligible"]
         print(f"{rid}  {args.rule}  {severity}/{confidence}  {args.file}"
               f"{':' + str(args.line) if args.line else ''}")
         if args.repair:
@@ -2163,14 +2286,22 @@ def cmd_finding(args) -> int:
               file=sys.stderr)
         return 3
     rec = json.load(open(p))
+    raiser = (rec.get("provenance") or {}).get("agent", "")
+    if raiser and args.by and raiser != args.by:
+        # Not refused — a remediator legitimately closes a reviewer's finding — but recorded,
+        # because "who closed this" was previously nowhere and any actor could close any
+        # finding silently.
+        print(f"note: {raiser} raised this; {args.by} is closing it.")
     rec["outcome"] = args.outcome
     rec["closedBy"] = args.commit or head(root)
+    rec["closedByActor"] = args.by
     if args.detail:
         rec["verificationPlan"] = rec.get("verificationPlan") or args.detail
     with open(p, "w") as fh:
         json.dump(rec, fh, indent=2)
         fh.write("\n")
-    audit(root, "finding.close", f"{args.id} {args.outcome}: {args.detail or ''}")
+    audit(root, "finding.close",
+          f"{args.id} outcome={args.outcome} by {args.by}: {args.detail or ''}")
     print(f"{args.id}: {args.outcome}")
     if args.outcome == "unexecuted":
         print("unexecuted is not closed — the fix was not verified. It stays on the gate's list.")
@@ -2270,7 +2401,9 @@ def cmd_metrics(args) -> int:
         # A finding re-raised after being closed as fixed did not stay fixed.
         fixed_then, refixed = set(), 0
         for r in rows:
-            if r["event"] == "finding.close" and " fixed" in r["detail"]:
+            # Matched on the structured field, not on free text: the old `" fixed" in detail`
+            # counted a close whose note said "could not be fixed yet" as a fix.
+            if r["event"] == "finding.close" and "outcome=fixed" in r["detail"]:
                 fixed_then.add(r["detail"].split()[0])
             elif r["event"] == "finding.write" and r["detail"].split()[0] in fixed_then:
                 refixed += 1
@@ -2489,6 +2622,8 @@ def main() -> int:
                     choices=[w for w in FINDING_OUTCOMES if w != "open"])
     fc.add_argument("--commit", default="")
     fc.add_argument("--detail", default="")
+    fc.add_argument("--by", default=os.environ.get("CLAUDE_AGENT", "agent"),
+                    help="who is closing it; recorded on the finding and in the audit log")
     fd.set_defaults(fn=cmd_finding)
 
     bl = sub.add_parser("baseline", help="what was already broken before the work started")
@@ -2504,6 +2639,8 @@ def main() -> int:
     ta.add_argument("--base", default="", help="compare against this ref instead of the merge base")
     ta.add_argument("--acknowledge", action="store_true",
                     help="record that a human decided each of these is correct")
+    ta.add_argument("--as", dest="as_person", default="",
+                    help="who is accepting them; required with --acknowledge")
     ts.set_defaults(fn=cmd_tests)
 
     bg = sub.add_parser("budget", help="what this task has spent, and its ceiling")

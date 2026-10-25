@@ -7,6 +7,14 @@ Enable with `"concerns": ["data"]`. Checked by `sdlc-code-reviewer` and `sdlc-sp
 Overlaps `profiles/webapp` deliberately: a service with a database needs these whether or not
 it has an admin surface.
 
+## What this concern can and cannot do
+
+A constraint that exists only in code, a transaction boundary that is wrong, an idempotency
+key that is missing — these are visible by reading. Whether the migration actually reverses,
+and whether the constraint holds under concurrent writes, are not. A `DATA-*` finding raised
+from the diff is `medium` confidence; a migration run forward and back against representative
+data, or a test that races two writers, makes it `high`. Say which you have.
+
 ## Schema
 
 - A new table or column states its purpose, its nullability, its default, its indexes and how

@@ -363,6 +363,73 @@ ok("NOT eligible" in fwrite(rule="ARCH-CYCLE", cat="B.11", sev="advisory", conf=
                             extra=["--repair", "invert it", "--repro", "n/a"]).stdout,
    "an advisory finding is never automatically fixed, whatever the confidence")
 
+print("findings: the rule table's 'never' column outranks the severity matrix")
+# Found by the readiness gate: autofix_eligible consulted only severity x confidence, so a
+# TEST-SUITE-WEAKENED finding at critical/high came back "eligible for automatic fix" — the
+# pipeline authorising an unattended repair of a disarmed test suite. The matrix was right
+# and incomplete; the table's never column has to win.
+r = fwrite(rule="TEST-SUITE-WEAKENED", cat="X4", sev="critical", conf="high",
+           f="tests/t.py", line="3", summary="a skip marker was added to silence a failure",
+           extra=["--repair", "remove the marker", "--repro", "sdlc tests audit"])
+ok("NOT eligible" in r.stdout,
+   "a rule marked never autofixable is never autofixable, at any severity or confidence")
+r = fwrite(rule="GIT-WORK-DESTROYED", cat="X3", sev="critical", conf="high",
+           f="bin/x.sh", line="1", summary="the script discards uncommitted work",
+           extra=["--repair", "remove it"])
+ok("NOT eligible" in r.stdout, "and so is the other one the table marks never")
+r = fwrite(rule="TYPE-ERROR", cat="C.20", sev="high", conf="high",
+           f="src/t.ts", line="9", summary="the argument type does not match the signature",
+           extra=["--repair", "correct the type"])
+ok("eligible for automatic fix" in r.stdout,
+   "a rule the table does not restrict still follows the matrix")
+
+print("findings: the record validates against the published schema")
+# The tool wrote component: null and exploitability: null while the schema typed them string
+# and a bare enum, so every finding it produced was invalid against its own contract. For a
+# library-profile project that schema is a published shape.
+import glob as _glob
+sch = json.load(open(os.path.join(os.path.dirname(HERE), "schema", "finding.schema.json")))
+recs = [json.load(open(f)) for f in _glob.glob(os.path.join(df, ".sdlc/findings/*.json"))]
+ok(bool(recs), "there are records to check")
+bad = []
+for rec in recs:
+    for key, spec in sch["properties"].items():
+        if key not in rec:
+            continue
+        t = spec.get("type")
+        if t == "string" and not isinstance(rec[key], str):
+            bad.append(f"{key}={rec[key]!r} is not a string")
+    expl = (rec.get("classification") or {}).get("exploitability")
+    allowed = sch["properties"]["classification"]["properties"]["exploitability"]["enum"]
+    if expl is not None and expl not in allowed:
+        bad.append(f"exploitability={expl!r} not in enum")
+ok(not bad, f"every written record matches the schema's declared types ({bad[:2]})")
+
+print("findings: a defect that comes back is not still closed")
+r = fwrite(rule="CODE-ERROR-SWALLOWED", cat="C.25", sev="high", conf="high",
+           f="src/reopen.ts", line="5", summary="the error path is swallowed on retry")
+rid = r.stdout.split()[0]
+finding("close", rid, "--outcome", "fixed", "--by", "sdlc-remediator")
+ok(rid not in run(["finding", "list", "--open"], df).stdout, "closing removes it from open")
+r = fwrite(rule="CODE-ERROR-SWALLOWED", cat="C.25", sev="high", conf="high",
+           f="src/reopen.ts", line="5", summary="the error path is swallowed on retry")
+ok("REOPENED" in r.stdout, "re-detecting it says so out loud")
+ok(rid in run(["finding", "list", "--open"], df).stdout,
+   "and it is open again — a bad fix must not leave the finding reading as fixed")
+
+print("findings: who closed it is recorded")
+r2 = fwrite(rule="SEC-SECRET-PRESENT", cat="D.36", sev="critical", conf="high",
+            f="src/cfg.ts", line="2", summary="an API token is committed in the config",
+            extra=["--by", "sdlc-security-reviewer"])
+rid2 = r2.stdout.split()[0]
+r = finding("close", rid2, "--outcome", "fixed", "--by", "sdlc-remediator")
+ok("sdlc-security-reviewer raised this" in r.stdout,
+   "closing another agent's finding is recorded, not silent")
+rec = json.load(open(os.path.join(df, ".sdlc/findings", rid2 + ".json")))
+ok(rec.get("closedByActor") == "sdlc-remediator", "the closing actor is on the record")
+ok("by sdlc-remediator" in open(os.path.join(df, ".sdlc/audit.log")).read(),
+   "and in the audit log")
+
 print("findings: closing says what actually happened")
 ok(finding("close", fid, "--outcome", "fixed", "--detail", "test q.spec.ts").returncode == 0,
    "a finding closes as fixed")
@@ -493,10 +560,12 @@ spec = open(os.path.join(root, "docs", "control-spec.md"), encoding="utf-8").rea
 table = set(re.findall(r"^\|\s*`([A-Z][A-Z0-9-]*)`\s*\|", spec, re.M))
 ok(len(table) > 40, f"the rule table has {len(table)} rules")
 cited = set()
-for sub in ("agents", "profiles", "commands"):
+# schema/ and docs/ were not walked, so schema/finding.schema.json could cite a rule the
+# table did not have — and did. A rule cited anywhere is a rule that must resolve.
+for sub in ("agents", "profiles", "commands", "schema", "docs"):
     for dirpath, _, names in os.walk(os.path.join(root, sub)):
         for n in names:
-            if n.endswith(".md"):
+            if n.endswith((".md", ".json")) and n != "control-spec.md":
                 body = open(os.path.join(dirpath, n), encoding="utf-8").read()
                 cited |= set(re.findall(r"--rule ([A-Z][A-Z0-9-]*)", body))
                 cited |= set(re.findall(r"`((?:ARCH|PERF|MEM|CONC|DATA|PLAT|SEC|TEST|IMPACT|SPEC|CODE|ENV|BUDGET|GIT|QUALITY|BUILD|TYPE)-[A-Z0-9-]+)`", body))
@@ -554,8 +623,55 @@ r = weaken({"tests/test_core.py": "def test_a():\n    assert f(1) == 2\n\n"
                                   "def test_c():\n    assert k() == 9\n"})
 ok(r.returncode == 0, "adding a test and an assertion is not a weakening")
 
+print("suite integrity: the bypasses a readiness gate found in this very check")
+# Every case below was a working bypass of this control, found by running the pipeline's own
+# gate against the branch that added it. Each one made `tests audit` report a clean pass on a
+# diff that disarmed the suite. They are regression tests now because a control with a known
+# hole is worse than none: it is a hole with a green tick over it.
+
+r = weaken({"tests/test_core.py": "def test_a():\n    assert f(1) == 2\n"
+                                  "    assert 1 == 1  # don't lint  # noqa\n"})
+ok(r.returncode != 0, "an apostrophe before a marker does not disarm the line")
+
+r = weaken({"tests/test_core.py": 'DOC = """\n++ b/README.md\n"""\n\n'
+                                  "def test_a():\n    pass  # noqa\n"})
+ok(r.returncode != 0, "content posing as a diff header cannot reattribute the rest of a file")
+
+r = weaken({"commands/run.md": "Run the gate:\n\n```sh\nnpm test || true\n```\n"})
+ok(r.returncode != 0,
+   "markdown is scanned — in this plugin the instructions ARE markdown")
+
+r = weaken({"docs/guide.md": "Never do this:\n\n```diff\n+@pytest.mark.skip\n```\n"})
+ok(r.returncode == 0, "but a diff shown as an example in documentation is not a change")
+
+r = run(["tests", "audit", "--base", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"], dt)
+ok(r.returncode != 0 and "UNEXECUTED" in (r.stdout + r.stderr),
+   "a diff git could not produce is unexecuted, never a pass")
+
+weaken({"tests/test_core.py": "def test_a():\n    assert f(1) == 2\n"
+                              "    assert g(2) == 3\n    assert h(3) == 4\n"},
+       "restore assertions")
+subprocess.run(["git", "config", "diff.noprefix", "true"], cwd=dt)
+r = weaken({"tests/test_core.py": "def test_a():\n    assert f(1) == 2\n"})
+ok(r.returncode != 0, "a developer's diff.noprefix setting does not disable the check")
+subprocess.run(["git", "config", "--unset", "diff.noprefix"], cwd=dt)
+
+weaken({"tests/test_core.py": "def test_a():\n    assert f(1) == 2\n"
+                              "    assert g(2) == 3\n"}, "restore two")
+r = weaken({"tests/test_core.py": "def test_a():\n    assert f(1) == 2\n"})
+ok(r.returncode != 0, "removing exactly ONE assertion is reported, not just two or more")
+
+print("suite integrity: an acknowledgement needs somebody behind it")
+r = weaken({"tests/test_core.py": "def test_a():\n    pass  # noqa\n"})
+ok(r.returncode != 0, "a real weakening to acknowledge")
 r = run(["tests", "audit", "--base", "HEAD~1", "--acknowledge"], dt)
-ok(r.returncode == 0, "--acknowledge lets a justified change through")
+ok(r.returncode != 0 and "--as" in r.stderr,
+   "--acknowledge without an actor is refused: it would record nothing")
+r = run(["tests", "audit", "--base", "HEAD~1", "--acknowledge", "--as", "A Person"], dt)
+ok(r.returncode == 0, "--acknowledge with an actor lets a justified change through")
+ok("not waived" in r.stdout, "and says plainly that it recorded rather than waived")
+ok("suite.acknowledged" in open(os.path.join(dt, ".sdlc/audit.log")).read(),
+   "the acknowledgement is its own audit event, not the same line as a plain run")
 
 # Found by running this check against its own repository: the detector's own patterns, its
 # test fixtures and the evals that quote a suppression were all reported. A marker inside a
@@ -579,8 +695,13 @@ for _ in range(3):
 r = guard(dbg, "git status")
 ok(r.returncode == 2 and "budget" in r.stderr, "the hook refuses once the ceiling is passed")
 ok("sdlc budget reset" in r.stderr, "and it names the allowed route")
+ok(run(["budget", "reset"], dbg).returncode != 0,
+   "an agent cannot reset its own ceiling — that would make it a pause, not a ceiling")
+ok(guard(dbg, "git status").returncode == 2, "and the refusal still stands after trying")
 run(["budget", "reset", "--as", "a person"], dbg)
-ok(guard(dbg, "git status").returncode == 0, "a person can reset it")
+ok(guard(dbg, "git status").returncode == 0, "a named person can reset it")
+ok("by a person" in open(os.path.join(dbg, ".sdlc/audit.log")).read(),
+   "and the audit log says who accepted the extra cost")
 
 dnb = newrepo(config={"trunk": "main", "spec": {"engine": "prd-frd"}})
 for _ in range(12):

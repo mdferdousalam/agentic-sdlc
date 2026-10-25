@@ -32,7 +32,7 @@
       "type": "string",
       "pattern": "^[A-Z][A-Z0-9]*(-[A-Z0-9]+)*$",
       "description": "The rule in docs/control-spec.md this finding was raised under, e.g. SEC-INJECTION-SQL. Stable across versions; a renamed rule is a new rule.",
-      "examples": ["SEC-INJECTION-SQL", "TEST-ASSERTION-WEAKENED", "ARCH-LAYER-DIRECTION"]
+      "examples": ["SEC-INJECTION-SQL", "TEST-SUITE-WEAKENED", "ARCH-LAYER-DIRECTION"]
     },
     "component": {
       "type": "string",

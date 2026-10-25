@@ -8,6 +8,13 @@ Enable with `"concerns": ["platform"]`. Checked by `sdlc-code-reviewer`.
 For anything that runs somewhere other than the machine it was written on — which, once there
 is CI, is everything.
 
+## What this concern can and cannot do
+
+Almost everything here is settled by running the code somewhere else, and almost nothing by
+reading it on the machine it was written on. A `PLAT-*` finding from the diff is `medium`
+confidence; a CI matrix that actually fails on another operating system, architecture or
+locale makes it `high`. One failing matrix leg is worth more than this whole file.
+
 ## Assumptions about the host
 
 - Path separators, case sensitivity, maximum path length, permitted filename characters. A test

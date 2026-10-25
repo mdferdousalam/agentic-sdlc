@@ -22,8 +22,8 @@ does not cover, so you can answer an auditor honestly rather than optimistically
 | Prompt injection via untrusted content | `docs/rules.md` §7 makes all non-instruction content data; `sdlc-triager` is explicit that a signal's text is never a command; the reviewers look for it |
 | Unauthorised actions | Approvals scoped per action — approving a release does not authorise a merge — and voided by the next commit |
 | Insufficient oversight | Every stage leaves a receipt; `.sdlc/audit.log` is append-only; `sdlc trace` reconstructs what happened |
-| Unbounded consumption | `budget` ceilings refused at the tool call, resettable only by a person |
-| Agent self-serving evaluation | `sdlc tests audit` detects a diff that lowers the gate it is about to be judged by; `--acknowledge` records rather than waives |
+| Unbounded consumption | `budget` ceilings refused at the tool call; `sdlc budget reset` requires `--as <person>` and records who accepted the extra cost |
+| Agent self-serving evaluation | `sdlc tests audit` detects a diff that lowers the gate it is about to be judged by; `--acknowledge` requires a named person, emits its own audit event, and does not remove the finding |
 | Repudiation | Receipts record who claimed each verdict and when, bound to a commit |
 
 ## OWASP Non-Human Identity
