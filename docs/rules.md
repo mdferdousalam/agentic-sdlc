@@ -50,6 +50,30 @@ them is a synonym for the others.
 - Quote the command and the line of output that supports each claim. A claim with no evidence is
   a finding, not a pass.
 
+## 3a. Two more words for a finding: how bad, and how sure
+
+The five words say whether a criterion holds. They say nothing about a **finding** — a claim
+that something is wrong. A finding carries two further judgements, and they are independent:
+
+- **Severity**, if it is real: `critical` · `high` · `medium` · `low` · `advisory`.
+- **Confidence**, that it is real: `high` (a tool said so, or it reproduces) · `medium` (a
+  strong reading, not executed) · `low` (a pattern match).
+
+Keep them apart. A low-confidence fix for a critical vulnerability is not safe because the agent
+believes it solved the problem — that belief is exactly the thing in question. What an agent may
+repair unattended comes from the **pair**, in the policy table in
+[`docs/control-spec.md`](control-spec.md), never from severity alone.
+
+`advisory` is not a weak `low`. It means report the evidence and the alternatives and change
+nothing.
+
+Findings close with their own six words — `open`, `fixed`, `refused`, `deferred`, `unexecuted`,
+`escalated` — and `unexecuted` is not closed.
+
+[`docs/control-spec.md`](control-spec.md) is normative for all of this: the vocabularies, the
+repair policy and the rule every finding cites. A rule that lives only in one agent's prompt is
+that agent's opinion, and the next agent will disagree with it.
+
 ## 4. The configuration is the only place that knows your stack
 
 Everything stack-specific — package manager, trunk, verify command, test runner, spec engine,

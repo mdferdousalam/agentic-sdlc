@@ -1,0 +1,182 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/mdferdousalam/agentic-sdlc/schema/finding.schema.json",
+  "title": "agentic-sdlc finding",
+  "description": "One finding, from any agent or any deterministic tool, in the shape every stage can compare. A finding is a claim about the code; this schema is what makes the claim checkable by something other than the agent that made it. Valid JSON is not proof of correct reasoning — the gate still independently checks the evidence.",
+  "type": "object",
+  "required": [
+    "id",
+    "category",
+    "ruleId",
+    "summary",
+    "evidence",
+    "classification",
+    "outcome",
+    "provenance"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+
+    "id": {
+      "type": "string",
+      "pattern": "^F-[0-9a-f]{8}$",
+      "description": "Stable identity for this finding, assigned by `sdlc finding write`. Referenced by the commit that closes it."
+    },
+    "category": {
+      "type": "string",
+      "pattern": "^([A-U]\\.(?:[1-9][0-9]{0,2})|X(?:[1-9]|1[0-2]))$",
+      "description": "Taxonomy address. A letter domain plus a check number (`D.31` = Security / injection), or a cross-cutting domain (`X7` = agent economics). Domains are listed in docs/control-spec.md."
+    },
+    "ruleId": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9]*(-[A-Z0-9]+)*$",
+      "description": "The rule in docs/control-spec.md this finding was raised under, e.g. SEC-INJECTION-SQL. Stable across versions; a renamed rule is a new rule.",
+      "examples": ["SEC-INJECTION-SQL", "TEST-ASSERTION-WEAKENED", "ARCH-LAYER-DIRECTION"]
+    },
+    "component": {
+      "type": "string",
+      "description": "The module, package or service the finding belongs to. Free text, but consistent within a repository."
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 200,
+      "description": "One sentence stating the defect. Not the fix, not the consequence — the defect."
+    },
+
+    "evidence": {
+      "type": "object",
+      "description": "What makes this a finding rather than an opinion. A finding with no evidence is itself a finding against the agent that raised it.",
+      "required": ["file"],
+      "additionalProperties": false,
+      "properties": {
+        "file": {
+          "type": "string",
+          "description": "Repository-relative path."
+        },
+        "line": {
+          "type": ["integer", "null"],
+          "minimum": 1,
+          "description": "1-indexed line the finding anchors to."
+        },
+        "endLine": {
+          "type": ["integer", "null"],
+          "minimum": 1
+        },
+        "code": {
+          "type": ["string", "null"],
+          "description": "The relevant lines, quoted — not paraphrased."
+        },
+        "toolOutput": {
+          "type": ["string", "null"],
+          "description": "The deterministic output that supports the claim: compiler diagnostic, analyser line, failing assertion, scanner hit. Null for an llm-detected finding, which is why such findings carry lower confidence by default."
+        },
+        "repro": {
+          "type": ["string", "null"],
+          "description": "The smallest sequence that reproduces it, as commands. The brief's rule: a finding you cannot reproduce may simply be wrong."
+        }
+      }
+    },
+
+    "classification": {
+      "type": "object",
+      "description": "Severity and confidence are deliberately separate axes. A low-confidence fix for a critical vulnerability is not safe merely because the agent believes it solved the problem.",
+      "required": ["severity", "confidence"],
+      "additionalProperties": false,
+      "properties": {
+        "severity": {
+          "enum": ["critical", "high", "medium", "low", "advisory"],
+          "description": "How bad it is if real. critical: auth bypass, data corruption, exploitable injection. high: memory-safety, race, broken authorization, destructive migration. medium: performance regression, missing edge case, incorrect retry. low: formatting, lint, safe mechanical refactor. advisory: a trade-off or a disputed judgement — report, never force."
+        },
+        "confidence": {
+          "enum": ["high", "medium", "low"],
+          "description": "How sure we are it is real. high: a deterministic tool said so, or there is a reproduction. medium: strong reading of the code, no execution. low: pattern match or suspicion. Never raise confidence to justify an automatic repair."
+        },
+        "exploitability": {
+          "enum": ["remote", "local", "authenticated", "theoretical", "not-applicable"],
+          "description": "Security findings only. Describe reachability; never write an exploit."
+        },
+        "impact": {
+          "type": ["string", "null"],
+          "description": "What goes wrong for a user or an operator if this is not fixed."
+        }
+      }
+    },
+
+    "rootCause": {
+      "type": ["string", "null"],
+      "description": "Why the problem exists, not the visible symptom. A finding with only a symptom tends to produce a symptom-only fix, which is the failure X4 exists to prevent."
+    },
+
+    "proposedRepair": {
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "change": {
+          "type": "string",
+          "description": "The minimal change. Not a refactor of the surrounding module."
+        },
+        "expectedBehaviour": {
+          "type": "string",
+          "description": "What is true after the change that is not true now."
+        },
+        "sideEffects": {
+          "type": ["string", "null"],
+          "description": "What else this touches, including anything downstream."
+        },
+        "autofixEligible": {
+          "type": "boolean",
+          "description": "Whether the repair policy in docs/control-spec.md permits an agent to make this change unattended. Derived from severity and confidence together; never from severity alone."
+        }
+      }
+    },
+
+    "verificationPlan": {
+      "type": ["string", "null"],
+      "description": "The specific test, static check, benchmark or experiment that would establish the repair worked. Written before the repair, so the repair cannot choose its own easy standard."
+    },
+
+    "outcome": {
+      "enum": ["open", "fixed", "refused", "deferred", "unexecuted", "escalated"],
+      "description": "open: raised, not yet addressed. fixed: behaviour changed and a test proves it. refused: the finding is wrong, with the evidence. deferred: real, out of scope, filed where it will be seen. unexecuted: the fix could not be verified — not closed. escalated: awaiting a human decision. These extend the remediator's existing four; the five evidence words (passed/failed/skipped/refused/unexecuted) describe a criterion, not a finding."
+    },
+
+    "closedBy": {
+      "type": ["string", "null"],
+      "description": "The commit that closed this finding. One finding per commit, so this is a single sha."
+    },
+
+    "provenance": {
+      "type": "object",
+      "description": "Who claimed this, with what, and against what state. Without it a finding cannot be reproduced or disputed.",
+      "required": ["agent", "at", "commit"],
+      "additionalProperties": false,
+      "properties": {
+        "agent": {
+          "type": "string",
+          "description": "The agent or tool that raised it, e.g. sdlc-security-reviewer, gitleaks."
+        },
+        "model": {
+          "type": ["string", "null"],
+          "description": "The model behind an llm-detected finding, where the host exposes it."
+        },
+        "detection": {
+          "enum": ["deterministic", "test", "runtime", "llm"],
+          "description": "How it was found. The brief's rule 2: prefer a tool to an opinion, and record which this was so a reader can weigh it."
+        },
+        "toolVersion": {
+          "type": ["string", "null"]
+        },
+        "at": {
+          "type": "string",
+          "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+        },
+        "commit": {
+          "type": "string",
+          "description": "The commit the finding was raised against. A later commit does not void a finding the way it voids a receipt, but it does mean the line numbers may have moved."
+        }
+      }
+    }
+  }
+}

@@ -7,9 +7,9 @@ description: >
 tools: [Read, Bash, Grep, Glob, Task]
 ---
 
-Read `${CLAUDE_PLUGIN_ROOT}/docs/rules.md` and `sdlc.config.json` (`verifyCmd`, `gateCmd`,
-`secretScan`, `reviewers`, `trunk`). Identify the unit of work from the branch and its
-specification.
+Read `${CLAUDE_PLUGIN_ROOT}/docs/rules.md`, `${CLAUDE_PLUGIN_ROOT}/docs/control-spec.md` and
+`sdlc.config.json` (`verifyCmd`, `gateCmd`, `quality`, `secretScan`, `reviewers`, `trunk`).
+Identify the unit of work from the branch and its specification.
 
 Nothing merges without your READY. You do not fix anything; you verify, collect and rule.
 
@@ -23,7 +23,21 @@ Nothing merges without your READY. You do not fix anything; you verify, collect 
 3. **Secret scan.** Run `secretScan` over the branch's commits. Any finding is blocking, with no
    exception and no "it is only a fixture". If no scanner is configured, record that stage as
    `skipped` and say so in the verdict — do not call it passed.
-4. **Reviewers.** Launch every agent named in `reviewers`, in one message so they run
+4. **Quality budget.** Run `quality.cmd` if the config sets one — the deterministic analysis
+   on what this change *adds*. A non-zero exit is blocking. Record it either way, and never
+   report an unconfigured budget as passed:
+
+   ```sh
+   sdlc receipt write quality --verdict passed  --detail "<command>, <coverage on new lines>"
+   sdlc receipt write quality --verdict failed  --detail "<what exceeded the budget>"
+   sdlc receipt write quality --verdict skipped --detail "no quality.cmd configured"
+   ```
+
+   An LLM reviewer is a complement to a static analyser, not a substitute for one: they miss
+   different things. If the budget is unset, say so in the verdict rather than implying the
+   project has no maintainability bar.
+
+5. **Reviewers.** Launch every agent named in `reviewers`, in one message so they run
    concurrently, each scoped to the diff against the trunk. Always include
    `sdlc-code-reviewer`; include `sdlc-security-reviewer` whenever the diff touches auth, input
    parsing, dependencies, file or network I/O, or credentials. Name the reviewers you ran and
@@ -37,10 +51,10 @@ Nothing merges without your READY. You do not fix anything; you verify, collect 
 
    If either failed, write `--verdict failed` and stop.
 
-5. **Specification conformance.** Read the verification report. Every acceptance criterion needs
+6. **Specification conformance.** Read the verification report. Every acceptance criterion needs
    an outcome backed by evidence. `unexecuted` is not `passed`; an unexecuted criterion is
    blocking unless the specification itself marked it out of scope.
-6. **The record.** Is the specification's checklist ticked honestly, in the same commits as the
+7. **The record.** Is the specification's checklist ticked honestly, in the same commits as the
    work? An unticked finished item is sloppiness; a ticked unfinished item is a blocker.
 
 ## Verdict
@@ -55,8 +69,10 @@ Verdict: READY | NOT-READY
 | Clean tree | passed |
 | Mechanical (<cmd>) | passed |
 | Secret scan | passed / skipped (no scanner configured) |
+| Quality budget (<cmd>) | passed / skipped (none configured) |
 | Reviewers | sdlc-code-reviewer: pass; sdlc-security-reviewer: fail |
 | Criteria with evidence | 11 of 12 — AC-7 unexecuted |
+| Open findings | 2 — 1 critical, 1 advisory |
 
 ### Blocking findings
 ### Non-blocking notes
@@ -68,6 +84,20 @@ Then record it:
 sdlc receipt write readiness --verdict ready     --detail "<reviewers, findings>"
 sdlc receipt write readiness --verdict not-ready --detail "<blocking items>"
 ```
+
+## Findings
+
+The reviewers raise findings with `sdlc finding write`, so you do not have to re-read their
+prose to rule on them:
+
+```sh
+sdlc finding list --open
+```
+
+Weigh them by the pair, not by severity alone — `docs/control-spec.md` §2 is the table. Any open
+finding at `critical` or `high` is blocking. An `advisory` finding is never blocking, and
+never grounds for demanding a code change. A finding closed as `unexecuted` is **not** closed:
+the fix was never verified, so it still counts against readiness.
 
 `not-ready` is the normal outcome of a real gate. The hook refuses a merge without a `ready`
 receipt for exactly this commit, so a later commit voids it — which is correct: that commit was

@@ -295,6 +295,112 @@ ok("Keep this." in open(ag).read(), "uninstall leaves user content")
 ok("BEGIN agentic-sdlc" not in open(ag).read(), "uninstall removes our block")
 ok(not os.path.exists(os.path.join(d, ".cursor/rules/agentic-sdlc.mdc")), "uninstall removes files we own")
 ok("echo MINE" in open(hp).read(), "uninstall leaves the user's git hook body")
+print("findings: the contract is enforced, not assumed")
+df = newrepo(config={"trunk": "main", "spec": {"engine": "prd-frd"},
+                     "verifyCmd": "true", "quality": {"cmd": None}})
+
+
+def finding(*args, cwd=df):
+    return run(["finding", *args], cwd)
+
+
+def fwrite(rule="SEC-INJECTION-SQL", cat="D.31", sev="critical", conf="high",
+           f="src/q.ts", line="42", summary="user input is concatenated into SQL", extra=()):
+    return finding("write", "--rule", rule, "--category", cat, "--severity", sev,
+                   "--confidence", conf, "--file", f, "--line", line, "--summary", summary,
+                   *extra)
+
+
+r = fwrite()
+ok(r.returncode == 0, "a complete finding is accepted")
+fid = r.stdout.split()[0] if r.stdout.split() else ""
+ok(fid.startswith("F-") and len(fid) == 10, "it is given an F- plus 8 hex identity")
+
+ok(fwrite(rule="MADE-UP-RULE").returncode != 0, "a rule not in the control spec is refused")
+ok(fwrite(cat="Z.99").returncode != 0, "a category outside the taxonomy is refused")
+ok(fwrite(summary="short").returncode != 0, "a summary that states nothing is refused")
+ok("choose from" in fwrite(sev="catastrophic").stderr, "an invented severity is refused by name")
+ok(fwrite(conf="certain").returncode != 0, "an invented confidence is refused")
+
+# The same finding twice is one finding: a wall of duplicates is how a review tool gets ignored.
+before = len(os.listdir(os.path.join(df, ".sdlc/findings")))
+fwrite()
+ok(len(os.listdir(os.path.join(df, ".sdlc/findings"))) == before,
+   "the same finding raised twice stays one finding")
+
+print("findings: the repair policy is a table, not a vibe")
+POLICY = [
+    # severity,   confidence, repro, may an agent fix it unattended?
+    ("critical",  "high",     False, True),
+    ("critical",  "medium",   True,  False),
+    ("critical",  "low",      True,  False),
+    ("high",      "high",     False, True),
+    ("high",      "medium",   False, False),
+    ("high",      "medium",   True,  True),
+    ("high",      "low",      True,  False),
+    ("medium",    "high",     False, True),
+    ("medium",    "medium",   False, True),
+    ("medium",    "low",      False, False),
+    ("low",       "high",     False, True),
+    ("low",       "medium",   False, True),
+    ("low",       "low",      False, False),
+    ("advisory",  "high",     True,  False),
+    ("advisory",  "medium",   False, False),
+    ("advisory",  "low",      False, False),
+]
+for i, (sev, conf, repro, expect) in enumerate(POLICY):
+    extra = ["--repair", "the minimal change"] + (["--repro", "npm test -- x.spec.ts"] if repro else [])
+    out = fwrite(sev=sev, conf=conf, f=f"src/p{i}.ts", line=str(i + 1),
+                 summary=f"policy corner {i} under test here", extra=extra).stdout
+    got = "eligible for automatic fix" in out and "NOT eligible" not in out
+    ok(got == expect,
+       f"{sev}/{conf}{' +repro' if repro else ''} -> "
+       f"{'fixable' if expect else 'escalate or report'}")
+
+ok("NOT eligible" in fwrite(rule="ARCH-CYCLE", cat="B.11", sev="advisory", conf="high",
+                            f="src/a.ts", line="1",
+                            summary="an architectural trade-off worth noting",
+                            extra=["--repair", "invert it", "--repro", "n/a"]).stdout,
+   "an advisory finding is never automatically fixed, whatever the confidence")
+
+print("findings: closing says what actually happened")
+ok(finding("close", fid, "--outcome", "fixed", "--detail", "test q.spec.ts").returncode == 0,
+   "a finding closes as fixed")
+ok(finding("close", fid, "--outcome", "resolved").returncode != 0,
+   "a word outside the vocabulary cannot close a finding")
+ok(finding("close", "F-00000000", "--outcome", "fixed").returncode != 0,
+   "a finding that does not exist cannot be closed")
+r = finding("close", fid, "--outcome", "unexecuted")
+ok("not closed" in r.stdout, "unexecuted says plainly that it is not closed")
+ok("finding.write" in open(os.path.join(df, ".sdlc/audit.log")).read(),
+   "findings reach the audit log like every other stage")
+
+print("findings: the two copies of the contract agree")
+# bin/sdlc validates by hand because it has no dependencies; the schema is the published
+# contract. If the enums drift apart, a finding valid to one is invalid to the other.
+schema = json.load(open(os.path.join(os.path.dirname(HERE), "schema", "finding.schema.json")))
+src = open(SDLC, encoding="utf-8").read()
+cls = schema["properties"]["classification"]["properties"]
+for name, got in (("severity", cls["severity"]["enum"]),
+                  ("confidence", cls["confidence"]["enum"]),
+                  ("outcome", schema["properties"]["outcome"]["enum"]),
+                  ("exploitability", cls["exploitability"]["enum"])):
+    const = {"severity": "SEVERITIES", "confidence": "CONFIDENCES",
+             "outcome": "FINDING_OUTCOMES", "exploitability": "EXPLOITABILITY"}[name]
+    line = [l for l in src.splitlines() if l.startswith(const + " = (")]
+    ok(bool(line) and all(f'"{v}"' in line[0] for v in got),
+       f"schema and validator agree on {name}")
+
+print("the quality budget is wired, not merely configurable")
+ok("quality" in open(os.path.join(os.path.dirname(HERE), "agents",
+                                  "sdlc-readiness-gate.md")).read(),
+   "the readiness gate runs the quality budget")
+ok("quality" in open(os.path.join(os.path.dirname(HERE), "commands", "gate.md")).read(),
+   "the mechanical gate runs the quality budget")
+ok("quality.cmd" in run(["doctor"], df).stdout, "doctor says when the budget is unset")
+
+shutil.rmtree(df, ignore_errors=True)
+
 for x in (d, d2, d3, home):
     shutil.rmtree(x, ignore_errors=True)
 

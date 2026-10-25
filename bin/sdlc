@@ -39,6 +39,27 @@ RECEIPT_KINDS = ("spec", "verification", "review", "security", "quality", "gate"
 AUDIT_LOG = ".sdlc/audit.log"
 FEEDBACK = ".sdlc/feedback.json"
 DEFAULT_MAX_AGE_MIN = 180
+FINDING_DIR = ".sdlc/findings"
+
+# The finding vocabularies. Severity is how bad it is if real; confidence is how sure we are
+# that it is real. They are separate axes on purpose — see docs/control-spec.md §1.
+SEVERITIES = ("critical", "high", "medium", "low", "advisory")
+CONFIDENCES = ("high", "medium", "low")
+DETECTIONS = ("deterministic", "test", "runtime", "llm")
+FINDING_OUTCOMES = ("open", "fixed", "refused", "deferred", "unexecuted", "escalated")
+EXPLOITABILITY = ("remote", "local", "authenticated", "theoretical", "not-applicable")
+
+# The repair policy, as a table rather than as a paragraph an agent can reinterpret.
+# True: an agent may repair it unattended. False: report or escalate. "repro": only once the
+# finding has a reproduction, because at medium confidence the finding itself is in question.
+# docs/control-spec.md §2 is the readable copy; a test keeps the two from drifting.
+AUTOFIX = {
+    ("critical", "high"): True,   ("critical", "medium"): False, ("critical", "low"): False,
+    ("high", "high"): True,       ("high", "medium"): "repro",   ("high", "low"): False,
+    ("medium", "high"): True,     ("medium", "medium"): True,    ("medium", "low"): False,
+    ("low", "high"): True,        ("low", "medium"): True,       ("low", "low"): False,
+    ("advisory", "high"): False,  ("advisory", "medium"): False, ("advisory", "low"): False,
+}
 
 # --------------------------------------------------------------------------------------- git
 
@@ -605,6 +626,11 @@ def cmd_doctor(_args) -> int:
             problems.append('"verifyCmd" is not set — nothing can be gated')
         if not cfg.get("secretScan"):
             notes.append('"secretScan" is not set — install gitleaks and re-run `sdlc init`')
+        if not (cfg.get("quality") or {}).get("cmd"):
+            notes.append('"quality.cmd" is not set — the gate has no deterministic analysis on '
+                         "new code, so maintainability and complexity are reviewed by reading "
+                         "only. An LLM reviewer is a complement to a static analyser, not a "
+                         "substitute for one.")
         engine = (cfg.get("spec") or {}).get("engine")
         if engine == "openspec":
             if not which("openspec"):
@@ -648,6 +674,14 @@ def cmd_doctor(_args) -> int:
                      "tool hook (Cursor, Copilot, Windsurf). Run `sdlc install git-hooks`")
     if not os.path.exists(os.path.join(root, ".github/workflows/sdlc-gate.yml")):
         notes.append("no CI gate — the only layer an agent cannot reach. Run `sdlc install ci`")
+
+    openf = [f for f in finding_load_all(root) if f.get("outcome") in ("open", "unexecuted")]
+    if openf:
+        crit = sum(1 for f in openf
+                   if (f.get("classification") or {}).get("severity") in ("critical", "high"))
+        notes.append(f"{len(openf)} finding(s) still open or unexecuted"
+                     + (f", {crit} of them critical or high" if crit else "")
+                     + " — see `sdlc finding list --open`")
 
     hooks = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hooks", "hooks.json")
     if os.path.exists(hooks):
@@ -1285,6 +1319,248 @@ def cmd_feedback(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------------------------- findings
+#
+# A finding is a claim about the code. Prose carries the argument; this carries the parts that
+# have to be compared, counted and audited: what rule, how bad, how sure, on what evidence, by
+# whom. Validation here mirrors schema/finding.schema.json — two expressions of one contract,
+# because bin/sdlc has no dependencies and cannot run a JSON Schema validator. A test feeds the
+# same values through both so they cannot drift.
+
+
+def known_rules() -> set:
+    """Rule IDs from the control specification's table — the one source of truth.
+
+    Parsed rather than duplicated, so adding a row to docs/control-spec.md is all it takes to
+    make a rule usable. An unreadable table means we skip the check rather than block work.
+    """
+    try:
+        body = read_plugin("docs", "control-spec.md")
+    except Exception:
+        return set()
+    return set(re.findall(r"^\|\s*`([A-Z][A-Z0-9-]*)`\s*\|", body, re.M))
+
+
+def finding_id(rule: str, file: str, line, summary: str) -> str:
+    """Stable identity, so the same finding raised twice is one finding and not two.
+
+    Deduplication is not cosmetic: a wall of repeated comments is how a review tool gets turned
+    off (the brief's X9).
+    """
+    key = f"{rule}|{file}|{line or ''}|{summary}".encode()
+    return "F-" + hashlib.sha256(key).hexdigest()[:8]
+
+
+def autofix_eligible(severity: str, confidence: str, has_repro: bool) -> bool:
+    policy = AUTOFIX.get((severity, confidence), False)
+    if policy == "repro":
+        return bool(has_repro)
+    return bool(policy)
+
+
+def finding_problems(rec: dict) -> list:
+    """Why this record is not a valid finding. Empty list means it is."""
+    out = []
+    for field in ("id", "category", "ruleId", "summary", "evidence", "classification",
+                  "outcome", "provenance"):
+        if not rec.get(field):
+            out.append(f'missing required field "{field}"')
+    if out:
+        return out
+
+    if not re.fullmatch(r"F-[0-9a-f]{8}", rec["id"]):
+        out.append(f'id "{rec["id"]}" is not F- plus 8 hex digits')
+    if not re.fullmatch(r"([A-U]\.(?:[1-9][0-9]{0,2})|X(?:[1-9]|1[0-2]))", rec["category"]):
+        out.append(f'category "{rec["category"]}" is not a taxonomy address '
+                   f'(a domain letter and a check number, like D.31, or X1 to X12)')
+    if not re.fullmatch(r"[A-Z][A-Z0-9]*(-[A-Z0-9]+)*", rec["ruleId"]):
+        out.append(f'ruleId "{rec["ruleId"]}" is not an upper-case rule identifier')
+    else:
+        rules = known_rules()
+        if rules and rec["ruleId"] not in rules:
+            out.append(f'ruleId "{rec["ruleId"]}" is not in the rule table in '
+                       f'docs/control-spec.md — add the row before raising findings under it')
+    if not (8 <= len(rec["summary"]) <= 200):
+        out.append("summary must be between 8 and 200 characters: one sentence, the defect")
+    if rec["outcome"] not in FINDING_OUTCOMES:
+        out.append(f'outcome "{rec["outcome"]}" is not one of: {", ".join(FINDING_OUTCOMES)}')
+
+    ev = rec.get("evidence") or {}
+    if not ev.get("file"):
+        out.append("evidence.file is required — a finding with no location is an opinion")
+    if ev.get("line") is not None and not (isinstance(ev["line"], int) and ev["line"] >= 1):
+        out.append("evidence.line must be a positive integer")
+
+    cl = rec.get("classification") or {}
+    if cl.get("severity") not in SEVERITIES:
+        out.append(f'severity "{cl.get("severity")}" is not one of: {", ".join(SEVERITIES)}')
+    if cl.get("confidence") not in CONFIDENCES:
+        out.append(f'confidence "{cl.get("confidence")}" is not one of: {", ".join(CONFIDENCES)}')
+    if cl.get("exploitability") and cl["exploitability"] not in EXPLOITABILITY:
+        out.append(f'exploitability "{cl["exploitability"]}" is not one of: '
+                   f'{", ".join(EXPLOITABILITY)}')
+
+    pr = rec.get("provenance") or {}
+    if not pr.get("agent"):
+        out.append("provenance.agent is required — a finding with no author cannot be disputed")
+    if pr.get("detection") and pr["detection"] not in DETECTIONS:
+        out.append(f'detection "{pr["detection"]}" is not one of: {", ".join(DETECTIONS)}')
+    return out
+
+
+def finding_load_all(root: str) -> list:
+    d = os.path.join(root, FINDING_DIR)
+    if not os.path.isdir(d):
+        return []
+    out = []
+    for name in sorted(os.listdir(d)):
+        if name.endswith(".json"):
+            try:
+                out.append(json.load(open(os.path.join(d, name))))
+            except Exception:
+                pass
+    return out
+
+
+def cmd_finding(args) -> int:
+    root = repo_root()
+
+    if args.finding_action == "write":
+        severity, confidence = args.severity, args.confidence
+        rid = finding_id(args.rule, args.file, args.line, args.summary)
+        rec = {
+            "id": rid,
+            "category": args.category,
+            "ruleId": args.rule,
+            "component": args.component or None,
+            "summary": args.summary,
+            "evidence": {
+                "file": args.file,
+                "line": args.line,
+                "endLine": None,
+                "code": args.code or None,
+                "toolOutput": args.tool_output or None,
+                "repro": args.repro or None,
+            },
+            "classification": {
+                "severity": severity,
+                "confidence": confidence,
+                "exploitability": args.exploitability or None,
+                "impact": args.impact or None,
+            },
+            "rootCause": args.root_cause or None,
+            "proposedRepair": None,
+            "verificationPlan": args.verification_plan or None,
+            "outcome": "open",
+            "closedBy": None,
+            "provenance": {
+                "agent": args.by,
+                "model": os.environ.get("CLAUDE_MODEL") or None,
+                "detection": args.detection,
+                "toolVersion": args.tool_version or None,
+                "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "commit": head(root),
+            },
+        }
+        if args.repair:
+            # The agent proposes the change; the policy table decides whether it may make it.
+            rec["proposedRepair"] = {
+                "change": args.repair,
+                "expectedBehaviour": args.expected or "",
+                "sideEffects": args.side_effects or None,
+                "autofixEligible": autofix_eligible(severity, confidence, bool(args.repro)),
+            }
+        problems = finding_problems(rec)
+        if problems:
+            for why in problems:
+                print(f"invalid finding: {why}", file=sys.stderr)
+            return 3
+        d = os.path.join(root, FINDING_DIR)
+        os.makedirs(d, exist_ok=True)
+        existing = os.path.join(d, rid + ".json")
+        if os.path.exists(existing):
+            try:  # the same finding raised again keeps its outcome; it is one finding
+                prev = json.load(open(existing))
+                rec["outcome"] = prev.get("outcome", "open")
+                rec["closedBy"] = prev.get("closedBy")
+            except Exception:
+                pass
+        with open(existing, "w") as fh:
+            json.dump(rec, fh, indent=2)
+            fh.write("\n")
+        audit(root, "finding.write", f"{rid} {args.rule} {severity}/{confidence} by {args.by}")
+        auto = (rec.get("proposedRepair") or {}).get("autofixEligible")
+        print(f"{rid}  {args.rule}  {severity}/{confidence}  {args.file}"
+              f"{':' + str(args.line) if args.line else ''}")
+        if args.repair:
+            print("  repair: " + ("eligible for automatic fix"
+                                  if auto else "NOT eligible — report or escalate"))
+        return 0
+
+    if args.finding_action == "list":
+        rows = finding_load_all(root)
+        total = len(rows)
+        if args.open_only:
+            rows = [r for r in rows if r.get("outcome") == "open"]
+        if args.severity:
+            rows = [r for r in rows
+                    if (r.get("classification") or {}).get("severity") == args.severity]
+        if args.json:
+            print(json.dumps(rows, indent=2))
+            return 0
+        if not rows:
+            print("no findings" + (" open" if args.open_only else ""))
+            return 0
+        order = {s: i for i, s in enumerate(SEVERITIES)}
+        rows.sort(key=lambda r: order.get((r.get("classification") or {}).get("severity"), 9))
+        for r in rows:
+            cl = r.get("classification") or {}
+            ev = r.get("evidence") or {}
+            loc = ev.get("file", "?") + (f":{ev['line']}" if ev.get("line") else "")
+            print(f"  {r['id']}  {cl.get('severity','?'):<8} {cl.get('confidence','?'):<6} "
+                  f"{r.get('outcome','?'):<10} {r.get('ruleId','?'):<26} {loc}")
+            print(f"            {r.get('summary','')}")
+        allrows = finding_load_all(root)
+        openn = sum(1 for r in allrows if r.get("outcome") == "open")
+        unex = sum(1 for r in allrows if r.get("outcome") == "unexecuted")
+        shown = f"showing {len(rows)} of {total}" if len(rows) != total else f"{total} finding(s)"
+        print(f"\n{shown}; {openn} open, {unex} unexecuted, of {total} raised.")
+        if unex:
+            print("An unexecuted finding is not closed — the fix was never verified.")
+        return 0
+
+    if args.finding_action == "show":
+        p = os.path.join(root, FINDING_DIR, args.id + ".json")
+        if not os.path.exists(p):
+            print(f"no finding {args.id}", file=sys.stderr)
+            return 1
+        print(open(p).read().rstrip())
+        return 0
+
+    # close
+    p = os.path.join(root, FINDING_DIR, args.id + ".json")
+    if not os.path.exists(p):
+        print(f"no finding {args.id}", file=sys.stderr)
+        return 1
+    if args.outcome not in FINDING_OUTCOMES or args.outcome == "open":
+        print(f'outcome must be one of: {", ".join(w for w in FINDING_OUTCOMES if w != "open")}',
+              file=sys.stderr)
+        return 3
+    rec = json.load(open(p))
+    rec["outcome"] = args.outcome
+    rec["closedBy"] = args.commit or head(root)
+    if args.detail:
+        rec["verificationPlan"] = rec.get("verificationPlan") or args.detail
+    with open(p, "w") as fh:
+        json.dump(rec, fh, indent=2)
+        fh.write("\n")
+    audit(root, "finding.close", f"{args.id} {args.outcome}: {args.detail or ''}")
+    print(f"{args.id}: {args.outcome}")
+    if args.outcome == "unexecuted":
+        print("unexecuted is not closed — the fix was not verified. It stays on the gate's list.")
+    return 0
+
+
 # ------------------------------------------------------------------------------- governance
 
 def cmd_metrics(args) -> int:
@@ -1489,6 +1765,49 @@ def main() -> int:
         q.add_argument("--any-commit", action="store_true",
                        help="do not require the receipt to name the current HEAD")
     r.set_defaults(fn=cmd_receipt)
+
+    fd = sub.add_parser("finding", help="raise, list and close a structured finding")
+    fds = fd.add_subparsers(dest="finding_action", required=True)
+
+    fw = fds.add_parser("write", help="raise a finding (validated against the contract)")
+    fw.add_argument("--rule", required=True, help="a ruleId from docs/control-spec.md")
+    fw.add_argument("--category", required=True, help="taxonomy address, e.g. D.31 or X7")
+    fw.add_argument("--summary", required=True, help="one sentence: the defect")
+    fw.add_argument("--file", required=True)
+    fw.add_argument("--line", type=int)
+    fw.add_argument("--severity", required=True, choices=SEVERITIES)
+    fw.add_argument("--confidence", required=True, choices=CONFIDENCES)
+    fw.add_argument("--detection", default="llm", choices=DETECTIONS)
+    fw.add_argument("--exploitability", choices=EXPLOITABILITY)
+    fw.add_argument("--component", default="")
+    fw.add_argument("--code", default="", help="the relevant lines, quoted")
+    fw.add_argument("--tool-output", default="", help="the deterministic output behind the claim")
+    fw.add_argument("--repro", default="", help="the smallest reproduction, as commands")
+    fw.add_argument("--impact", default="")
+    fw.add_argument("--root-cause", default="", help="why it exists, not the symptom")
+    fw.add_argument("--repair", default="", help="the minimal proposed change")
+    fw.add_argument("--expected", default="", help="what is true after the repair")
+    fw.add_argument("--side-effects", default="")
+    fw.add_argument("--verification-plan", default="",
+                    help="the check that would establish the repair worked")
+    fw.add_argument("--tool-version", default="")
+    fw.add_argument("--by", default=os.environ.get("CLAUDE_AGENT", "agent"))
+
+    fl = fds.add_parser("list", help="what has been found")
+    fl.add_argument("--open", dest="open_only", action="store_true")
+    fl.add_argument("--severity", choices=SEVERITIES)
+    fl.add_argument("--json", action="store_true")
+
+    fsh = fds.add_parser("show")
+    fsh.add_argument("id")
+
+    fc = fds.add_parser("close", help="record what became of a finding")
+    fc.add_argument("id")
+    fc.add_argument("--outcome", required=True,
+                    choices=[w for w in FINDING_OUTCOMES if w != "open"])
+    fc.add_argument("--commit", default="")
+    fc.add_argument("--detail", default="")
+    fd.set_defaults(fn=cmd_finding)
 
     args = ap.parse_args()
     return args.fn(args)
