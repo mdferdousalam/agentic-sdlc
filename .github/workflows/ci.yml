@@ -48,9 +48,12 @@ jobs:
         run: node .github/scripts/validate-plugin.mjs
       - name: A generated config satisfies the schema
         run: |
+          # A real file, not process substitution: ajv opens the path by name and
+          # /dev/fd pipes are gone by the time it does.
+          python3 bin/sdlc init > /tmp/sdlc.config.generated.json
           npx --yes ajv-cli@5 validate \
             -s schema/sdlc.config.schema.json \
-            -d <(python3 bin/sdlc init) --spec=draft2020 --strict=false
+            -d /tmp/sdlc.config.generated.json --spec=draft2020 --strict=false
 
   shell:
     name: Shell and Python lint
