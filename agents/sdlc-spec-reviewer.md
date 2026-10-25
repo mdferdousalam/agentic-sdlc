@@ -16,7 +16,7 @@ The specification for the unit of work, plus the adjacent ones — duplication a
 between specs is the failure this stage exists to catch. With OpenSpec, start with:
 
 ```sh
-openspec change validate <change-id> --strict --json
+openspec validate <change-id> --strict --json
 openspec list
 ```
 

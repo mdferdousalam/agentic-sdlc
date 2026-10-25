@@ -21,7 +21,7 @@ that fails on a malformed spec, and an archive step that keeps "what is proposed
 | What was chosen, and over what | `<id>/design.md` |
 | The acceptance criteria | `<id>/tasks.md` — one checklist item per deliverable |
 | Requirements on a published capability | `<id>/specs/<capability>/spec.md` |
-| The spec is well-formed | `openspec change validate <id> --strict` |
+| The spec is well-formed | `openspec validate <id> --strict` |
 | The work is done | every `tasks.md` item ticked, in the commit that did it |
 | The change is history | `openspec archive <id>` |
 
@@ -30,12 +30,12 @@ that fails on a malformed spec, and an archive step that keeps "what is proposed
 ```sh
 openspec list                              # active changes — check before proposing
 openspec list --specs                      # published capabilities
-openspec change show <id>                  # read one
-openspec change validate <id> --strict     # the spec reviewer runs this first
+openspec show <id>                  # read one
+openspec validate <id> --strict     # the spec reviewer runs this first
 openspec archive <id>                      # the reporter runs this after landing
 ```
 
-`openspec change validate --strict --json` is machine-readable: a failure is an automatic
+`openspec validate --strict --json` is machine-readable: a failure is an automatic
 `changes-requested` and the reviewer quotes it rather than paraphrasing.
 
 ## Writing tasks.md so the rest of the pipeline works

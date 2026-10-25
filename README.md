@@ -142,7 +142,7 @@ Writing your own is one markdown file. Keep it to what a reviewer can check.
 When OpenSpec is present the specification *is* an OpenSpec change, and the pipeline uses the
 parts of it that are machine-checkable:
 
-- `openspec change validate <id> --strict` — a malformed spec is an automatic
+- `openspec validate <id> --strict` — a malformed spec is an automatic
   changes-requested, quoted rather than paraphrased;
 - `tasks.md` is the acceptance criteria: the implementer ticks each item in the commit that did
   it, the verifier maps each to `file:line` plus a test outcome, the gate treats a ticked

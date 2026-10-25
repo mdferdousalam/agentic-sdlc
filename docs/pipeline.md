@@ -17,7 +17,7 @@ Turns a request into a specification: an OpenSpec change (`proposal.md`, `design
 `tasks.md`, delta specs) or a PRD + FRD with numbered requirements.
 
 **Exit:** every requirement falsifiable, every refusal specified, scope stated both ways, open
-questions named — and with OpenSpec, `openspec change validate --strict` passing.
+questions named — and with OpenSpec, `openspec validate --strict` passing.
 
 ## 2 · Review the spec — `sdlc-spec-reviewer`
 
