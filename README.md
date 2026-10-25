@@ -155,15 +155,30 @@ only them. A test that did not run is `unexecuted` — not `passed`, and not `fa
 distinction is what stops a green summary hiding an unrun check, and it is why the gate asks for
 `file:line` and a command output behind every claim.
 
-## Also works with opencode
+## Runs on whatever agent you use
 
 ```sh
-bin/sdlc-install-opencode        # agents, commands and the same enforcement
-opencode reload
+sdlc install            # detect your agents, install for all of them, plus git hooks
+sdlc install --list     # what is supported and what is detected here
 ```
 
-The rules live in one Python CLI, so both hosts refuse exactly the same things.
-[Details](docs/opencode.md).
+| Host | Can it refuse a skipped stage? |
+| --- | --- |
+| Claude Code, opencode, Codex CLI, Cline | **Yes** — at the tool call, with a reason |
+| Gemini CLI | Static patterns only, via its policy engine |
+| Cursor, Copilot, Windsurf, Roo, Kilo, Continue, Aider | No tool hook — instructions, plus the layers below |
+| Zed, Amp, Warp, Junie, Factory, Devin, Jules | `AGENTS.md` |
+
+Two layers cover the hosts that cannot refuse anything:
+
+- **git hooks**, installed by default — every agent shells out to `git`, so a push to a
+  protected branch without a gate receipt is refused even from Cursor or a bare terminal.
+  Bypassable with `--no-verify`, which is why the next one exists.
+- **CI** — `sdlc install ci` writes a workflow that re-runs the gate where no agent can reach
+  it. On a host without a native hook, this is your real enforcement.
+
+The rules live in one Python CLI with no dependencies, so every host refuses exactly the same
+things. **[The full capability matrix, with what is verified and what is not](docs/platforms.md).**
 
 ## Requirements
 
@@ -179,6 +194,7 @@ engine. `/agentic-sdlc:doctor` tells you what is missing and what it costs you.
 - [Standards mapping](docs/compliance.md) — NIST AI RMF, OWASP, and the honest limits
 - [Configuration reference](docs/configuration.md)
 - [OpenSpec integration](docs/openspec.md)
+- [Platforms — what each host can enforce](docs/platforms.md)
 - [Using it with opencode](docs/opencode.md)
 - [The rules every agent obeys](docs/rules.md)
 - [Contributing](CONTRIBUTING.md) · [Changelog](CHANGELOG.md) · [Security](SECURITY.md)

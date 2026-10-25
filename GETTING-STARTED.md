@@ -13,10 +13,23 @@ The pipeline stops a confident agent from quietly skipping the step that would h
 
 ## Part 1 — install and look around (10 minutes)
 
+**Using Claude Code?**
+
 ```sh
 /plugin marketplace add mdferdousalam/agentic-sdlc
 /plugin install agentic-sdlc
 ```
+
+**Using anything else** — Cursor, Codex, Copilot, Gemini, Cline, Windsurf, Zed, Aider:
+
+```sh
+git clone https://github.com/mdferdousalam/agentic-sdlc
+agentic-sdlc/bin/sdlc install        # detects your agents and sets each one up
+```
+
+It installs git hooks too, because on most hosts that is the only thing that can actually stop
+a mistake. [What each host can and cannot enforce](docs/platforms.md) — worth two minutes
+before you trust it.
 
 Then, inside a project you work on:
 
@@ -148,7 +161,7 @@ Start with whichever subset you will actually use.
 **Does this work without OpenSpec?** Yes — the spec becomes a PRD and an FRD, and everything
 downstream is identical. OpenSpec adds a validator and an archive if you want them.
 
-**Does it work outside Claude Code?** Yes: `bin/sdlc-install-opencode` for opencode, same rules.
+**Does it work outside Claude Code?** Yes — `sdlc install` covers Codex, Cline, Cursor, Copilot, Gemini, Windsurf, Roo, Kilo, Continue, Aider and every AGENTS.md host. Four of them can refuse a tool call outright; the rest rely on the git hooks and CI. The [matrix](docs/platforms.md) is explicit about which is which.
 
 **What if my team does not use agents yet?** The gates work on human changes too, and most
 teams find the specification review is where the value shows up first.

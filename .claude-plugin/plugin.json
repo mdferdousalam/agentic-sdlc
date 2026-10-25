@@ -1,8 +1,25 @@
 {
   "name": "agentic-sdlc",
-  "version": "2.0.0",
-  "description": "An agent-based SDLC pipeline that is enforced, not suggested: specify, review the spec, branch, implement, verify, review, gate, land, report. Each stage has one owning agent and leaves a receipt bound to a commit; a PreToolUse hook refuses a branch without an approved spec, a push to the trunk without a passed gate, and a merge without a READY verdict. Stack-agnostic through one detected adapter file; speaks OpenSpec or PRD/FRD. Run /agentic-sdlc:init in any repo.",
-  "keywords": ["sdlc", "pipeline", "agents", "openspec", "code-review", "quality-gate", "spec-driven", "hooks", "governance"],
+  "version": "2.1.0",
+  "description": "An enforced agent-based SDLC pipeline that runs on any coding agent: specify, review, branch, implement, verify, review, gate, land, release. Each stage is owned by one agent and closed by a receipt bound to a commit. Claude Code, opencode, Codex and Cline refuse a skipped stage at the tool call; Gemini denies by policy; Cursor, Copilot, Windsurf and 20+ AGENTS.md hosts get the pipeline plus git-hook and CI enforcement. One adapter file per project; speaks OpenSpec or PRD/FRD.",
+  "keywords": [
+    "sdlc",
+    "pipeline",
+    "agents",
+    "openspec",
+    "code-review",
+    "quality-gate",
+    "spec-driven",
+    "hooks",
+    "governance",
+    "cursor",
+    "codex",
+    "gemini",
+    "copilot",
+    "cline",
+    "opencode",
+    "agents-md"
+  ],
   "author": {
     "name": "Engr Md Ferdous Alam",
     "email": "mdferdousalam1989@yahoo.com",

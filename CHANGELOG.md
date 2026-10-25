@@ -3,6 +3,62 @@
 All notable changes to this plugin. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the versioning is [semantic](https://semver.org/).
 
+## [2.1.0] — 2026-10-25
+
+The pipeline stops being a Claude Code feature.
+
+### Added
+
+- **`sdlc install [targets…]`** — one generator, fifteen targets, from the same canonical
+  `agents/`, `commands/` and `docs/rules.md`. With no arguments it detects the agents on the
+  machine and installs for all of them. `--list` shows what is supported and what each host can
+  actually enforce; `--dry-run` writes nothing; `sdlc uninstall` removes only our blocks and the
+  files we own.
+- **Three more hosts that genuinely refuse a skipped stage**, not just instruct:
+  - **Codex CLI** — a `PreToolUse` entry merged into `~/.codex/hooks.json`, preserving every
+    other event already configured there. Codex uses the same hook wire contract as Claude Code.
+  - **Cline** — an executable `.clinerules/hooks/PreToolUse`, exit 2 blocks.
+  - **Gemini CLI** — no pre-tool hook exists, so the static refusals become
+    `.gemini/policies/agentic-sdlc.toml` rules (`decision = "deny"`), with the
+    receipt-dependent gates left to the git hooks. Commands ship as `.gemini/commands/sdlc/*.toml`.
+- **Instruction and command adapters** for Cursor (`.cursor/rules/*.mdc` with `alwaysApply`,
+  `.cursor/commands/`), GitHub Copilot (`copilot-instructions.md`, `.github/prompts/*.prompt.md`),
+  Windsurf, Roo, Kilo, Continue and Aider — plus `AGENTS.md` everywhere, which the agents.md
+  adopter list says is read by 20+ tools.
+- **Git hooks, installed by default** (`--no-git-hooks` to opt out). Every agent shells out to
+  git, so this is the only local enforcement that reaches Cursor, Copilot and a bare terminal
+  alike. An existing hook is appended to inside a marked block, never replaced.
+- **`sdlc install ci`** — a GitHub Actions gate that re-runs the verify command, secret scan and
+  quality budget where no agent can reach them. It does not read receipts; it re-does the work.
+- **`sdlc guard --command "<cmd>"`** — the same rules without a hook payload, which is how the
+  git hooks call it. Tested to agree with the stdin path rule for rule.
+- **`docs/platforms.md`** — the capability matrix, saying for each host whether it can refuse a
+  tool call, how the format was verified, and which three are only conventional and unverified.
+- **`sdlc doctor` is platform-aware** — which hosts are present, which are installed here, and
+  the exact command for each gap.
+
+### Changed
+
+- Everything written into a file we share with you is a marked block, so re-running updates only
+  our section and `uninstall` leaves your content. This applies to `AGENTS.md`, `GEMINI.md`,
+  `CONVENTIONS.md`, Copilot instructions, every rules file and both git hooks.
+- The hook command resolves `python3` or `python` at install time rather than assuming a
+  shebang works, which is a prerequisite for Windows.
+- `bin/sdlc-install-opencode` is **deprecated** — it now calls `sdlc install opencode`. Removal
+  in 3.0.0.
+
+### Verified
+
+Live: the git `pre-push` hook refuses an ungated push to `main` from a plain terminal, allows a
+feature branch, and is bypassed by `--no-verify` exactly as the documentation says. The Codex
+`hooks.json` merge preserves an existing `Stop` hook and does not stack duplicates on re-install.
+The guard understands Codex's exact payload shape.
+
+**Not verified:** the live refusal inside Codex and Cline sessions (Codex could not
+authenticate on this machine), and the Kilo, Windsurf and Continue paths, which are conventional
+rather than confirmed — those adapters also write `AGENTS.md`, so the rules land either way.
+Windows remains untested.
+
 ## [2.0.0] — 2026-10-25
 
 A rewrite. v0.1.0 was a document pipeline that asked a model to be careful; this is a pipeline

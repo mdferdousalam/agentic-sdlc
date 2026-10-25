@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import glob
 import hashlib
 import json
 import os
@@ -455,8 +456,20 @@ def guard_problem(root: str, command: str, cfg: dict) -> str | None:
     return None
 
 
-def cmd_guard(_args) -> int:
-    """PreToolUse hook. Reads Claude Code's tool JSON on stdin; exit 2 blocks the call."""
+def cmd_guard(args) -> int:
+    """The refusal point. Reads a host's tool JSON on stdin, or one command with --command.
+
+    The same rules serve every host: Claude Code, Codex and Cline send the same wire shape,
+    opencode's plugin reshapes into it, and the git hooks pass --command.
+    """
+    if getattr(args, "command", None):
+        root = repo_root()
+        problem = guard_problem(root, args.command, load_config(root))
+        if problem:
+            audit(root, "blocked", f"{problem.splitlines()[0]} :: {args.command}")
+            print(f"BLOCKED by agentic-sdlc: {problem}", file=sys.stderr)
+            return 2
+        return 0
     try:
         payload = json.load(sys.stdin)
     except Exception:
@@ -473,6 +486,7 @@ def cmd_guard(_args) -> int:
             return 0
         problem = guard_problem(root, command, cfg)
         if problem:
+            audit(root, "blocked", f"{problem.splitlines()[0]} :: {command}")
             print(f"BLOCKED by agentic-sdlc: {problem}\n"
                   f"This is a pipeline rule, not a preference. Do not work around it — choose "
                   f"another route or stop and report.", file=sys.stderr)
@@ -600,6 +614,41 @@ def cmd_doctor(_args) -> int:
         if cfg.get("trunk") and cfg["trunk"] != detect_trunk(root):
             notes.append(f'config says trunk "{cfg["trunk"]}" but git says "{detect_trunk(root)}"')
 
+    present = detect_platforms()
+    here = [k for k, v in present.items() if v]
+    print(f"hosts detected  {', '.join(here) if here else 'none'}")
+    installed = []
+    for rel, label in ((".cursor/rules/agentic-sdlc.mdc", "cursor"),
+                       (".github/copilot-instructions.md", "copilot"),
+                       (".clinerules/agentic-sdlc.md", "cline"),
+                       (".roo/rules/agentic-sdlc.md", "roo"),
+                       (".kilocode/rules/agentic-sdlc.md", "kilo"),
+                       (".windsurf/rules/agentic-sdlc.md", "windsurf"),
+                       (".continue/rules/agentic-sdlc.md", "continue"),
+                       (".gemini/policies/agentic-sdlc.toml", "gemini"),
+                       ("AGENTS.md", "agents.md"),
+                       (".github/workflows/sdlc-gate.yml", "ci")):
+        if os.path.exists(os.path.join(root, rel)):
+            installed.append(label)
+    hooks_dir = git("rev-parse", "--git-path", "hooks", cwd=root) or ".git/hooks"
+    if not os.path.isabs(hooks_dir):
+        hooks_dir = os.path.join(root, hooks_dir)
+    hooked = [n for n in ("pre-commit", "pre-push")
+              if os.path.exists(os.path.join(hooks_dir, n))
+              and "agentic-sdlc" in open(os.path.join(hooks_dir, n), errors="replace").read()]
+    if hooked:
+        installed.append("git-hooks(" + ",".join(hooked) + ")")
+    print(f"installed here  {', '.join(installed) if installed else 'nothing yet — run: sdlc install'}")
+    missing = [h for h in here if h in TARGETS and TARGETS[h][0] and h not in " ".join(installed)]
+    if missing:
+        notes.append(f"detected but not installed: {', '.join(missing)} — run `sdlc install "
+                     f"{' '.join(missing)}`")
+    if not hooked:
+        notes.append("no git hooks — they are the only local enforcement on hosts without a "
+                     "tool hook (Cursor, Copilot, Windsurf). Run `sdlc install git-hooks`")
+    if not os.path.exists(os.path.join(root, ".github/workflows/sdlc-gate.yml")):
+        notes.append("no CI gate — the only layer an agent cannot reach. Run `sdlc install ci`")
+
     hooks = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hooks", "hooks.json")
     if os.path.exists(hooks):
         notes.append(f"hooks shipped at {hooks} — enforcement is active when the plugin is installed")
@@ -618,6 +667,569 @@ def cmd_doctor(_args) -> int:
     print("doctor: ok" if not problems else f"doctor: {len(problems)} problem(s)")
     return 0 if not problems else 1
 
+
+
+
+# ============================================================================== install
+#
+# One pipeline, many hosts. The canonical sources are agents/, commands/ and docs/rules.md;
+# every adapter below is a pure mapping from those into one platform's layout. Nothing is
+# authored twice, so nothing can drift.
+#
+# Three enforcement layers, because platforms differ in what they allow:
+#   1. a native tool hook  — Claude Code, Codex, Cline, opencode: refuses before the action
+#   2. git hooks           — everywhere, because every agent shells out to git
+#   3. CI                  — the only layer an agent cannot reach at all
+# What a platform cannot do is written down in docs/platforms.md rather than implied away.
+
+BEGIN = "BEGIN agentic-sdlc (generated — edit docs/rules.md or sdlc.config.json, then re-run)"
+END = "END agentic-sdlc"
+
+
+def plugin_root() -> str:
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def read_plugin(*parts: str) -> str:
+    try:
+        return open(os.path.join(plugin_root(), *parts), errors="replace").read()
+    except OSError:
+        return ""
+
+
+class Writer:
+    """Collects writes so --dry-run can show them and nothing is half-applied."""
+
+    def __init__(self, dry: bool):
+        self.dry, self.written, self.skipped = dry, [], []
+        self.pending = {}   # several adapters write AGENTS.md; it is one file, not five
+
+    def put(self, path: str, content: str, mode: int = 0o644) -> None:
+        if path in self.pending:
+            self.skipped.append(path)
+            return
+        try:
+            old = open(path, errors="replace").read()
+        except OSError:
+            old = None
+        self.pending[path] = content
+        if old == content:
+            self.skipped.append(path)
+            return
+        self.written.append(path)
+        if self.dry:
+            return
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w") as fh:
+            fh.write(content)
+        os.chmod(path, mode)
+
+    def block(self, path: str, body: str, comment: str = "<!-- {} -->") -> None:
+        """Write our section into a file we do not own, leaving everything else alone."""
+        begin, end = comment.format(BEGIN), comment.format(END)
+        section = f"{begin}\n{body.strip()}\n{end}\n"
+        if path in self.pending:
+            old = self.pending[path]
+        else:
+            try:
+                old = open(path, errors="replace").read()
+            except OSError:
+                old = ""
+        if begin in old and end in old:
+            head, _, rest = old.partition(begin)
+            _, _, tail = rest.partition(end)
+            new = head + section + tail.lstrip("\n")
+        elif old.strip():
+            new = old.rstrip("\n") + "\n\n" + section
+        else:
+            new = section
+        self.put(path, new)
+
+    def report(self) -> None:
+        verb = "would write" if self.dry else "wrote"
+        for p in self.written:
+            print(f"  {verb} {p}")
+        if self.skipped:
+            print(f"  ({len(self.skipped)} already current)")
+
+
+def detect_platforms() -> dict:
+    """Which hosts are present. A binary on PATH or a config directory both count."""
+    home = os.path.expanduser("~")
+    checks = {
+        "claude-code": which("claude") or os.path.isdir(f"{home}/.claude"),
+        "opencode": which("opencode") or os.path.isdir(f"{home}/.config/opencode"),
+        "codex": which("codex") or os.path.isdir(f"{home}/.codex"),
+        "gemini": which("gemini") or os.path.isdir(f"{home}/.gemini"),
+        "cursor": which("cursor-agent") or which("cursor") or os.path.isdir(f"{home}/.cursor"),
+        "copilot": os.path.isdir(f"{home}/.vscode") or which("code"),
+        "cline": bool(glob.glob(f"{home}/.vscode/extensions/saoudrizwan.claude-dev-*")),
+        "roo": bool(glob.glob(f"{home}/.vscode/extensions/rooveterinaryinc.roo-cline-*")),
+        "kilo": bool(glob.glob(f"{home}/.vscode/extensions/kilocode.kilo-code-*")),
+        "windsurf": os.path.isdir("/Applications/Windsurf.app") or os.path.isdir(f"{home}/.codeium"),
+        "continue": os.path.isdir(f"{home}/.continue"),
+        "aider": which("aider"),
+        "zed": which("zed") or os.path.isdir(f"{home}/.config/zed"),
+        "amp": which("amp"),
+        "warp": os.path.isdir("/Applications/Warp.app"),
+        "factory": which("droid"),
+    }
+    return {k: bool(v) for k, v in checks.items()}
+
+
+def interpreter() -> str:
+    """The command that will run this CLI from a hook. Windows often lacks `python3`."""
+    for cand in ("python3", "python"):
+        if which(cand):
+            return cand
+    return sys.executable or "python3"
+
+
+def cli_path() -> str:
+    return os.path.join(plugin_root(), "bin", "sdlc")
+
+
+def guard_command() -> str:
+    return f'{interpreter()} "{cli_path()}" guard'
+
+
+
+# ---------------------------------------------------------------- what each platform is told
+
+def rules_body(cfg: dict) -> str:
+    """The pipeline's rules, plus this project's bindings. One source: docs/rules.md."""
+    rules = read_plugin("docs", "rules.md")
+    rules = re.sub(r"^# .*\n+", "", rules, count=1)  # the host file supplies the title
+    lines = ["## The agentic SDLC pipeline", "",
+             "This project uses the agentic-sdlc pipeline. Work moves through stages, each owned",
+             "by one agent and closed by a receipt bound to a commit. Do not skip a stage: on some",
+             "hosts the skip is refused outright, and on all of them a git hook and CI will catch",
+             "it later, more expensively.", ""]
+    if cfg:
+        lines += ["### This project", "",
+                  f"- trunk: `{cfg.get('trunk', 'main')}`",
+                  f"- verify: `{cfg.get('verifyCmd') or '(not set — set verifyCmd in sdlc.config.json)'}`"]
+        if cfg.get("gateCmd"):
+            lines.append(f"- gate: `{cfg['gateCmd']}`")
+        spec = cfg.get("spec") or {}
+        lines.append(f"- specifications: {spec.get('engine', 'prd-frd')} in `{spec.get('docsRoot', 'docs/specs')}`")
+        if cfg.get("profile"):
+            lines.append(f"- profile: `{cfg['profile']}` — its standards apply to reviews")
+        if cfg.get("heavy"):
+            lines.append(f"- heavy work: {cfg['heavy']}")
+        lines.append("")
+    lines += ["### Commands", "",
+              "```sh",
+              "sdlc status            # which stages have left evidence, which have not",
+              "sdlc trace             # requirement -> commit -> test -> receipts",
+              "sdlc receipt check readiness --verdict ready",
+              "sdlc feedback read     # why the last attempt failed, before you retry",
+              "```", ""]
+    return "\n".join(lines) + "\n" + rules.strip() + "\n"
+
+
+def stage_prompts() -> list:
+    """(name, description, body) for each pipeline stage, from commands/."""
+    out = []
+    for f in sorted(glob.glob(os.path.join(plugin_root(), "commands", "*.md"))):
+        text = open(f, errors="replace").read()
+        m = re.match(r"^---\n([\s\S]*?)\n---\n?", text)
+        fm, body = (m.group(1), text[m.end():]) if m else ("", text)
+        desc = ""
+        d = re.search(r"^description:\s*(.+)$", fm, re.M)
+        if d:
+            desc = d.group(1).strip()
+        # Shell injections and plugin-root paths mean nothing outside Claude Code.
+        body = re.sub(r"^!`.*`\s*$", "", body, flags=re.M)
+        body = body.replace("${CLAUDE_PLUGIN_ROOT}/bin/sdlc", "sdlc")
+        body = re.sub(r"\n{3,}", "\n\n", body).strip()
+        out.append((os.path.basename(f)[:-3], desc, body))
+    return out
+
+
+def agent_summary() -> str:
+    """Who owns what — so a host without subagents still knows the division of labour."""
+    rows = []
+    for f in sorted(glob.glob(os.path.join(plugin_root(), "agents", "*.md"))):
+        text = open(f, errors="replace").read()
+        m = re.search(r"^description:\s*>?\s*\n?([\s\S]*?)(?=^\w+:|^---)", text, re.M)
+        desc = re.sub(r"\s+", " ", m.group(1)).strip() if m else ""
+        rows.append(f"- **{os.path.basename(f)[:-3]}** — {desc[:160]}")
+    return "\n".join(rows)
+
+
+
+# ------------------------------------------------------------------------------- adapters
+#
+# Each adapter takes (root, cfg, w: Writer) and writes that platform's files. Every path is
+# verified against the real tool on 2026-10-25 — see docs/platforms.md for the evidence.
+
+def _agents_md(root: str, cfg: dict, w: Writer, name: str = "AGENTS.md") -> None:
+    """The universal layer: agents.md is read by 20+ hosts, so this is most tools' whole story."""
+    w.block(os.path.join(root, name), rules_body(cfg))
+
+
+def _rules_file(root: str, cfg: dict, w: Writer, relpath: str) -> None:
+    w.block(os.path.join(root, relpath), rules_body(cfg))
+
+
+def _prompt_files(root: str, w: Writer, directory: str, suffix: str = ".md",
+                  prefix: str = "sdlc-", frontmatter=None) -> None:
+    for name, desc, body in stage_prompts():
+        head = frontmatter(name, desc) if frontmatter else ""
+        w.put(os.path.join(root, directory, f"{prefix}{name}{suffix}"), head + body + "\n")
+
+
+def adapt_opencode(root: str, cfg: dict, w: Writer) -> None:
+    """opencode: agents with real permissions, commands, and a plugin that calls the guard."""
+    prefix = os.path.expanduser("~/.config/opencode")
+    for f in sorted(glob.glob(os.path.join(plugin_root(), "agents", "*.md"))):
+        text = open(f, errors="replace").read().replace("${CLAUDE_PLUGIN_ROOT}", plugin_root())
+        m = re.match(r"^---\n([\s\S]*?)\n---", text)
+        if m:
+            fm = m.group(1)
+            tools = re.search(r"^tools:\s*\[(.*?)\]\s*$", fm, re.M)
+            edits = True
+            if tools:
+                listed = [t.strip() for t in tools.group(1).split(",")]
+                edits = any(t in ("Write", "Edit", "NotebookEdit") for t in listed)
+                fm = re.sub(r"^tools:.*$\n?", "", fm, flags=re.M)
+            mode = "primary" if re.search(r"(implementer|spec-writer)", f) else "subagent"
+            text = (f"---\n{fm.rstrip()}\nmode: {mode}\ntemperature: 0.1\n"
+                    f"permission:\n  edit: {'allow' if edits else 'deny'}\n  bash: allow\n---"
+                    + text[m.end():])
+        w.put(os.path.join(prefix, "agents", os.path.basename(f)), text)
+    for f in sorted(glob.glob(os.path.join(plugin_root(), "commands", "*.md"))):
+        text = open(f, errors="replace").read().replace("${CLAUDE_PLUGIN_ROOT}", plugin_root())
+        w.put(os.path.join(prefix, "commands", "sdlc-" + os.path.basename(f)), text)
+    tpl = read_plugin("opencode", "plugin", "agentic-sdlc.ts")
+    w.put(os.path.join(prefix, "plugins", "agentic-sdlc.ts"),
+          tpl.replace("__PLUGIN_ROOT__", plugin_root()))
+    _agents_md(root, cfg, w)
+
+
+def adapt_codex(root: str, cfg: dict, w: Writer) -> None:
+    """Codex CLI: PreToolUse hooks with the same wire contract as Claude Code."""
+    hooks_path = os.path.expanduser("~/.codex/hooks.json")
+    try:
+        existing = json.load(open(hooks_path))
+    except Exception:
+        existing = {}
+    hooks = existing.setdefault("hooks", {})
+    entries = [e for e in hooks.get("PreToolUse", [])
+               if not any("sdlc" in (h.get("command") or "") for h in e.get("hooks", []))]
+    entries.append({"hooks": [{"type": "command", "command": guard_command(), "timeout": 10}]})
+    hooks["PreToolUse"] = entries          # every other event the user configured is untouched
+    w.put(hooks_path, json.dumps(existing, indent=2) + "\n")
+    _prompt_files(os.path.expanduser("~/.codex"), w, "prompts")
+    _agents_md(root, cfg, w)
+
+
+def adapt_gemini(root: str, cfg: dict, w: Writer) -> None:
+    """Gemini CLI: no PreToolUse, but a policy engine that denies static patterns."""
+    lines = ["# agentic-sdlc — generated. Gemini has no pre-tool hook, so only the static",
+             "# refusals live here; the receipt-dependent gates are enforced by the git hooks.",
+             "# Re-run `sdlc install gemini` to regenerate.", ""]
+    groups = [("destructive", DESTRUCTIVE), ("publishing", PUBLISHING), ("staging", STAGING),
+              ("credentials", CREDENTIALS)]
+    pri = 100
+    for label, rules in groups:
+        for pattern, why in rules:
+            lines += ["[[rules]]", 'toolName = "run_shell_command"',
+                      f"argsPattern = {json.dumps(pattern)}", 'decision = "deny"',
+                      f"priority = {pri}", f"# {label}: {why}", ""]
+            pri += 1
+    w.put(os.path.join(root, ".gemini", "policies", "agentic-sdlc.toml"), "\n".join(lines))
+    for name, desc, body in stage_prompts():
+        toml = (f'# agentic-sdlc — generated\ndescription = {json.dumps(desc or name)}\n'
+                f'prompt = """\n{body}\n"""\n')
+        w.put(os.path.join(root, ".gemini", "commands", "sdlc", f"{name}.toml"), toml)
+    _agents_md(root, cfg, w)
+    _agents_md(root, cfg, w, "GEMINI.md")
+
+
+def adapt_cline(root: str, cfg: dict, w: Writer) -> None:
+    """Cline: .clinerules, plus PreToolUse hooks as executables named for the event."""
+    _rules_file(root, cfg, w, os.path.join(".clinerules", "agentic-sdlc.md"))
+    hook = ("#!/bin/sh\n"
+            "# agentic-sdlc — refuses a tool call that would skip a pipeline stage.\n"
+            "# Cline runs this with the hook payload on stdin; exit 2 blocks the call.\n"
+            f'exec {interpreter()} "{cli_path()}" guard\n')
+    w.put(os.path.join(root, ".clinerules", "hooks", "PreToolUse"), hook, mode=0o755)
+    for name, desc, body in stage_prompts():
+        w.put(os.path.join(root, ".clinerules", "workflows", f"sdlc-{name}.md"),
+              f"# {desc or name}\n\n{body}\n")
+    _agents_md(root, cfg, w)
+
+
+def adapt_cursor(root: str, cfg: dict, w: Writer) -> None:
+    """Cursor: .cursor/rules/*.mdc with alwaysApply, and .cursor/commands/*.md."""
+    body = ("---\n"
+            "description: The agentic-sdlc pipeline — stages, receipts and what is refused\n"
+            "alwaysApply: true\n"
+            "---\n\n" + rules_body(cfg))
+    w.put(os.path.join(root, ".cursor", "rules", "agentic-sdlc.mdc"), body)
+    if cfg.get("profile"):
+        prof = read_plugin("profiles", f"{cfg['profile']}.md")
+        if prof:
+            w.put(os.path.join(root, ".cursor", "rules", f"agentic-sdlc-{cfg['profile']}.mdc"),
+                  f"---\ndescription: Standards for a {cfg['profile']} project\n"
+                  f"alwaysApply: true\n---\n\n{prof}")
+    _prompt_files(root, w, os.path.join(".cursor", "commands"))
+    _agents_md(root, cfg, w)
+
+
+def adapt_copilot(root: str, cfg: dict, w: Writer) -> None:
+    """GitHub Copilot: repository instructions plus prompt files."""
+    _rules_file(root, cfg, w, os.path.join(".github", "copilot-instructions.md"))
+    def fm(name, desc):
+        return f"---\nmode: agent\ndescription: {desc or name}\n---\n\n"
+    _prompt_files(root, w, os.path.join(".github", "prompts"), suffix=".prompt.md",
+                  frontmatter=fm)
+    _agents_md(root, cfg, w)
+
+
+def adapt_roo(root: str, cfg: dict, w: Writer) -> None:
+    _rules_file(root, cfg, w, os.path.join(".roo", "rules", "agentic-sdlc.md"))
+    _agents_md(root, cfg, w)
+
+
+def adapt_kilo(root: str, cfg: dict, w: Writer) -> None:
+    _rules_file(root, cfg, w, os.path.join(".kilocode", "rules", "agentic-sdlc.md"))
+    _agents_md(root, cfg, w)
+
+
+def adapt_windsurf(root: str, cfg: dict, w: Writer) -> None:
+    _rules_file(root, cfg, w, os.path.join(".windsurf", "rules", "agentic-sdlc.md"))
+    for name, desc, body in stage_prompts():
+        w.put(os.path.join(root, ".windsurf", "workflows", f"sdlc-{name}.md"),
+              f"---\ndescription: {desc or name}\n---\n\n{body}\n")
+    _agents_md(root, cfg, w)
+
+
+def adapt_continue(root: str, cfg: dict, w: Writer) -> None:
+    _rules_file(root, cfg, w, os.path.join(".continue", "rules", "agentic-sdlc.md"))
+    _agents_md(root, cfg, w)
+
+
+def adapt_aider(root: str, cfg: dict, w: Writer) -> None:
+    _rules_file(root, cfg, w, "CONVENTIONS.md")
+    _agents_md(root, cfg, w)
+
+
+def adapt_generic(root: str, cfg: dict, w: Writer) -> None:
+    """Zed, Amp, Warp, Junie, Factory, Devin, Jules and anything else that reads AGENTS.md."""
+    _agents_md(root, cfg, w)
+
+
+
+def adapt_git_hooks(root: str, cfg: dict, w: Writer) -> None:
+    """The only local enforcement every platform shares: every agent shells out to git.
+
+    An existing hook is never destroyed — our part goes in a guarded block, so a repo that
+    already uses husky or pre-commit keeps working.
+    """
+    hooks_dir = git("rev-parse", "--git-path", "hooks", cwd=root) or ".git/hooks"
+    if not os.path.isabs(hooks_dir):
+        hooks_dir = os.path.join(root, hooks_dir)
+    marker_begin = "# >>> agentic-sdlc >>>"
+    marker_end = "# <<< agentic-sdlc <<<"
+
+    bodies = {
+        "pre-commit": (
+            f'{marker_begin}\n'
+            f'# Staging hygiene and a secret scan on what is actually staged.\n'
+            f'staged=$(git diff --cached --name-only)\n'
+            f'[ -z "$staged" ] || {interpreter()} "{cli_path()}" guard --command '
+            f'"git commit" || exit 2\n'
+            f'{marker_end}\n'),
+        "pre-push": (
+            f'{marker_begin}\n'
+            f'# git feeds "<local ref> <local sha> <remote ref> <remote sha>" on stdin.\n'
+            f'while read -r _ _ remote_ref _; do\n'
+            f'  [ -n "$remote_ref" ] || continue\n'
+            f'  {interpreter()} "{cli_path()}" guard --command "git push origin ${{remote_ref##*/}}" '
+            f'|| exit 2\n'
+            f'done\n'
+            f'{marker_end}\n'),
+    }
+
+    for name, block in bodies.items():
+        path = os.path.join(hooks_dir, name)
+        try:
+            old = open(path, errors="replace").read()
+        except OSError:
+            old = ""
+        if marker_begin in old and marker_end in old:
+            head, _, rest = old.partition(marker_begin)
+            _, _, tail = rest.partition(marker_end)
+            new = head + block.rstrip("\n") + tail
+        elif old.strip():
+            new = old.rstrip("\n") + "\n\n" + block      # keep whatever was already there
+        else:
+            new = "#!/bin/sh\n" + block
+        w.put(path, new, mode=0o755)
+
+
+def adapt_ci(root: str, cfg: dict, w: Writer) -> None:
+    """The layer an agent cannot reach. It re-runs the checks rather than trusting receipts."""
+    verify = cfg.get("gateCmd") or cfg.get("verifyCmd") or "echo 'set verifyCmd in sdlc.config.json' && false"
+    secret = cfg.get("secretScan") or ""
+    quality = (cfg.get("quality") or {}).get("cmd") or ""
+    y = ["# agentic-sdlc — generated by `sdlc install ci`. The authoritative gate: it runs",
+         "# where no agent can reach it, and it re-runs the checks rather than trusting a",
+         "# receipt, because receipts are local to a working copy by design.",
+         "name: SDLC gate", "",
+         "on:", "  pull_request:", "  workflow_dispatch:", "",
+         "permissions:", "  contents: read", "",
+         "jobs:", "  gate:", "    runs-on: ubuntu-latest", "    steps:",
+         "      - uses: actions/checkout@v6", "        with:", "          fetch-depth: 0",
+         "      - name: Verify", f"        run: {verify}"]
+    if secret:
+        y += ["      - name: Secret scan", f"        run: {secret}"]
+    if quality:
+        y += ["      - name: Quality budget on new code", f"        run: {quality}"]
+    y += ["      - name: Traceability",
+          "        run: |",
+          '          python3 "$GITHUB_WORKSPACE/bin/sdlc" trace >> "$GITHUB_STEP_SUMMARY" 2>/dev/null \\',
+          '            || echo "sdlc not vendored in this repo; skipping the trace summary" >> "$GITHUB_STEP_SUMMARY"']
+    w.put(os.path.join(root, ".github", "workflows", "sdlc-gate.yml"), "\n".join(y) + "\n")
+
+
+TARGETS = {
+    "claude-code": (None, "the plugin itself — install it with /plugin install"),
+    "opencode": (adapt_opencode, "agents, commands and a plugin that calls the guard"),
+    "codex": (adapt_codex, "PreToolUse hook, prompts, AGENTS.md"),
+    "gemini": (adapt_gemini, "policy denies, TOML commands, GEMINI.md"),
+    "cline": (adapt_cline, "rules, PreToolUse hook, workflows"),
+    "cursor": (adapt_cursor, "always-on .mdc rules and commands"),
+    "copilot": (adapt_copilot, "repository instructions and prompt files"),
+    "roo": (adapt_roo, ".roo/rules"),
+    "kilo": (adapt_kilo, ".kilocode/rules"),
+    "windsurf": (adapt_windsurf, "rules and workflows"),
+    "continue": (adapt_continue, ".continue/rules"),
+    "aider": (adapt_aider, "CONVENTIONS.md and AGENTS.md"),
+    "generic": (adapt_generic, "AGENTS.md — Zed, Amp, Warp, Junie, Factory, Devin, Jules"),
+    "git-hooks": (adapt_git_hooks, "pre-commit and pre-push — the universal local floor"),
+    "ci": (adapt_ci, "a GitHub Actions gate that no agent can reach"),
+}
+
+# What each host can actually do. Stated here so --list cannot drift from the documentation.
+ENFORCEMENT = {
+    "claude-code": "refuses the tool call", "opencode": "refuses the tool call",
+    "codex": "refuses the tool call", "cline": "refuses the tool call",
+    "gemini": "static policy denies only", "git-hooks": "refuses the git command",
+    "ci": "fails the pull request",
+}
+
+
+def cmd_install(args) -> int:
+    root = repo_root()
+    cfg = load_config(root)
+    present = detect_platforms()
+
+    if args.list:
+        print("target        enforcement                  what it writes")
+        for name, (fn, what) in TARGETS.items():
+            mark = "·" if not present.get(name, name in ("generic", "git-hooks", "ci")) else "✓"
+            print(f"{mark} {name:<12} {ENFORCEMENT.get(name, 'instructions only'):<28} {what}")
+        print("\n✓ = detected on this machine. Enforcement differs by host — see docs/platforms.md.")
+        return 0
+
+    targets = list(args.targets)
+    if not targets:
+        targets = [k for k, v in present.items() if v and k in TARGETS and TARGETS[k][0]]
+        if not targets:
+            targets = ["generic"]
+        print(f"detected: {', '.join(targets)}")
+    unknown = [t for t in targets if t not in TARGETS]
+    if unknown:
+        print(f"unknown target(s): {', '.join(unknown)}. Try `sdlc install --list`.", file=sys.stderr)
+        return 3
+    if not args.no_git_hooks and "git-hooks" not in targets:
+        targets.append("git-hooks")
+
+    w = Writer(args.dry_run)
+    for t in targets:
+        fn = TARGETS[t][0]
+        if fn is None:
+            print(f"{t}: nothing to install — {TARGETS[t][1]}")
+            continue
+        print(f"{t}:")
+        fn(root, cfg, w)
+    w.report()
+    if not args.dry_run:
+        audit(root, "install", ", ".join(targets))
+    if args.dry_run:
+        print("\nnothing was written — drop --dry-run to apply")
+    else:
+        print("\nNext: `sdlc doctor`, then read docs/platforms.md for what each host can "
+              "actually enforce.")
+    return 0
+
+
+def cmd_uninstall(args) -> int:
+    """Remove only our marker blocks and only files we own. Never a whole file we share."""
+    root = repo_root()
+    removed = []
+    owned = [".cursor/rules/agentic-sdlc.mdc", ".gemini/policies/agentic-sdlc.toml",
+             ".clinerules/hooks/PreToolUse", ".github/workflows/sdlc-gate.yml"]
+    for rel in owned:
+        p = os.path.join(root, rel)
+        if os.path.exists(p):
+            removed.append(rel)
+            if not args.dry_run:
+                os.remove(p)
+    for pattern in (".cursor/commands/sdlc-*", ".github/prompts/sdlc-*", ".gemini/commands/sdlc/*",
+                    ".clinerules/workflows/sdlc-*", ".windsurf/workflows/sdlc-*"):
+        for p in glob.glob(os.path.join(root, pattern)):
+            removed.append(os.path.relpath(p, root))
+            if not args.dry_run:
+                os.remove(p)
+    shared = ["AGENTS.md", "GEMINI.md", "CONVENTIONS.md", ".github/copilot-instructions.md",
+              ".clinerules/agentic-sdlc.md", ".roo/rules/agentic-sdlc.md",
+              ".kilocode/rules/agentic-sdlc.md", ".windsurf/rules/agentic-sdlc.md",
+              ".continue/rules/agentic-sdlc.md"]
+    for rel in shared:
+        p = os.path.join(root, rel)
+        if not os.path.exists(p):
+            continue
+        text = open(p, errors="replace").read()
+        if BEGIN not in text:
+            continue
+        head, _, rest = text.partition(f"<!-- {BEGIN} -->")
+        _, _, tail = rest.partition(f"<!-- {END} -->")
+        new = (head.rstrip() + "\n" + tail.lstrip("\n")).strip()
+        removed.append(f"{rel} (our block)")
+        if not args.dry_run:
+            if new:
+                open(p, "w").write(new + "\n")
+            else:
+                os.remove(p)
+    hooks_dir = git("rev-parse", "--git-path", "hooks", cwd=root) or ".git/hooks"
+    if not os.path.isabs(hooks_dir):
+        hooks_dir = os.path.join(root, hooks_dir)
+    for name in ("pre-commit", "pre-push"):
+        p = os.path.join(hooks_dir, name)
+        if not os.path.exists(p):
+            continue
+        text = open(p, errors="replace").read()
+        if "# >>> agentic-sdlc >>>" not in text:
+            continue
+        head, _, rest = text.partition("# >>> agentic-sdlc >>>")
+        _, _, tail = rest.partition("# <<< agentic-sdlc <<<")
+        new = (head.rstrip() + "\n" + tail.lstrip("\n")).strip()
+        removed.append(f".git/hooks/{name} (our block)")
+        if not args.dry_run:
+            if new.replace("#!/bin/sh", "").strip():
+                open(p, "w").write(new + "\n")
+            else:
+                os.remove(p)
+    verb = "would remove" if args.dry_run else "removed"
+    for r in removed:
+        print(f"  {verb} {r}")
+    print(f"{verb} {len(removed)} item(s)")
+    return 0
 
 
 # ------------------------------------------------------------------- the hybrid retry loop
@@ -822,8 +1434,23 @@ def main() -> int:
 
     sub.add_parser("config", help="print the effective configuration").set_defaults(fn=cmd_config)
     sub.add_parser("status", help="where this unit of work stands").set_defaults(fn=cmd_status)
-    sub.add_parser("guard", help="PreToolUse hook (stdin JSON; exit 2 blocks)").set_defaults(fn=cmd_guard)
+    g = sub.add_parser("guard", help="PreToolUse hook (stdin JSON; exit 2 blocks)")
+    g.add_argument("--command", help="evaluate one shell command instead of reading stdin "
+                                     "— this is how the git hooks call it")
+    g.set_defaults(fn=cmd_guard)
     sub.add_parser("doctor", help="check the install, the config and the repo").set_defaults(fn=cmd_doctor)
+
+    i = sub.add_parser("install", help="install the pipeline for one or more platforms")
+    i.add_argument("targets", nargs="*", help="omit to install for every detected platform")
+    i.add_argument("--list", action="store_true", help="what is supported, and what each gets")
+    i.add_argument("--dry-run", action="store_true")
+    i.add_argument("--no-git-hooks", action="store_true",
+                   help="skip the universal git-hook layer (it is installed by default)")
+    i.set_defaults(fn=cmd_install)
+
+    u = sub.add_parser("uninstall", help="remove our blocks and the files we own")
+    u.add_argument("--dry-run", action="store_true")
+    u.set_defaults(fn=cmd_uninstall)
 
     a = sub.add_parser("approve", help="a person records an approval (merge, release, exception)")
     a.add_argument("what", choices=("merge", "release", "exception"))

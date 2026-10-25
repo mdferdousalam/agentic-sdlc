@@ -199,6 +199,103 @@ ok("receipts" in tj and "commits" in tj, "trace emits machine-readable json")
 ok(run(["trace"], d).returncode == 0, "trace renders for a human")
 shutil.rmtree(d)
 
+print("install: every adapter writes where its host actually looks")
+import tempfile as _tf
+home = _tf.mkdtemp(prefix="sdlc-home-")
+env = dict(os.environ, HOME=home)
+def run_env(args, cwd):
+    return subprocess.run([sys.executable, SDLC, *args], cwd=cwd, env=env,
+                          capture_output=True, text=True)
+
+d = newrepo({"package.json": json.dumps({"scripts": {"lint": "x", "test": "y"}}),
+             "pnpm-lock.yaml": ""})
+run_env(["init", "--write"], d)
+r = run_env(["install", "cursor", "copilot", "cline", "roo", "kilo", "windsurf",
+             "continue", "aider", "gemini", "generic", "ci"], d)
+ok(r.returncode == 0, "install runs clean")
+expected = [
+    ".cursor/rules/agentic-sdlc.mdc", ".cursor/commands/sdlc-gate.md",
+    ".github/copilot-instructions.md", ".github/prompts/sdlc-gate.prompt.md",
+    ".clinerules/agentic-sdlc.md", ".clinerules/hooks/PreToolUse",
+    ".roo/rules/agentic-sdlc.md", ".kilocode/rules/agentic-sdlc.md",
+    ".windsurf/rules/agentic-sdlc.md", ".continue/rules/agentic-sdlc.md",
+    "CONVENTIONS.md", "AGENTS.md", "GEMINI.md",
+    ".gemini/policies/agentic-sdlc.toml", ".gemini/commands/sdlc/gate.toml",
+    ".github/workflows/sdlc-gate.yml", ".git/hooks/pre-push", ".git/hooks/pre-commit",
+]
+for rel in expected:
+    ok(os.path.exists(os.path.join(d, rel)), f"wrote {rel}")
+ok(os.access(os.path.join(d, ".clinerules/hooks/PreToolUse"), os.X_OK),
+   "the cline hook is executable (it is not a hook otherwise)")
+ok("alwaysApply: true" in open(os.path.join(d, ".cursor/rules/agentic-sdlc.mdc")).read(),
+   "cursor rule is always-on")
+ok('toolName = "run_shell_command"' in open(os.path.join(d, ".gemini/policies/agentic-sdlc.toml")).read(),
+   "gemini policy names the real shell tool")
+
+print("install is idempotent and never clobbers what it does not own")
+before = {f: open(os.path.join(d, f), errors="replace").read() for f in expected}
+run_env(["install", "cursor", "copilot", "cline", "roo", "kilo", "windsurf",
+         "continue", "aider", "gemini", "generic", "ci"], d)
+ok(all(open(os.path.join(d, f), errors="replace").read() == before[f] for f in expected),
+   "a second run changes nothing")
+ag = os.path.join(d, "AGENTS.md")
+open(ag, "w").write("# My own notes\n\nKeep this.\n\n" + before["AGENTS.md"])
+run_env(["install", "generic"], d)
+ok("Keep this." in open(ag).read(), "user content above our block survives")
+ok(open(ag).read().count("BEGIN agentic-sdlc") == 1, "our block is not duplicated")
+
+print("an existing git hook is never destroyed")
+hp = os.path.join(d, ".git/hooks/pre-commit")
+open(hp, "w").write("#!/bin/sh\necho MINE\n")
+run_env(["install", "git-hooks"], d)
+body = open(hp).read()
+ok("echo MINE" in body and "agentic-sdlc" in body, "our block is appended, theirs is kept")
+
+print("dry-run writes nothing")
+d2 = newrepo()
+r = run_env(["install", "cursor", "generic", "--dry-run"], d2)
+ok("would write" in r.stdout, "dry-run says what it would do")
+ok(not os.path.exists(os.path.join(d2, "AGENTS.md")), "dry-run wrote nothing")
+
+print("guard --command agrees with the stdin payload, rule for rule")
+d3 = newrepo()
+for cmd in ["git stash", "cargo publish", "cat .env", "git push origin main"]:
+    a = guard(d3, cmd).returncode
+    b = run(["guard", "--command", cmd], d3).returncode
+    ok(a == b == 2, f"both paths refuse: {cmd}")
+for cmd in ["git status", "git add src/x.rs", "cargo test"]:
+    a = guard(d3, cmd).returncode
+    b = run(["guard", "--command", cmd], d3).returncode
+    ok(a == b == 0, f"both paths allow: {cmd}")
+
+print("codex payload shape (no cwd field, its own metadata)")
+codex_payload = json.dumps({"session_id": "s", "turn_id": "t", "agent_type": "codex",
+                            "hook_event_name": "PreToolUse", "tool_name": "Bash",
+                            "tool_input": {"command": "git stash"}, "tool_use_id": "x"})
+ok(run(["guard"], d3, stdin=codex_payload).returncode == 2, "codex payload is understood")
+
+print("codex hooks.json merge keeps other events")
+ch = os.path.join(home, ".codex")
+os.makedirs(ch, exist_ok=True)
+json.dump({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "mine.sh"}]}]}},
+          open(os.path.join(ch, "hooks.json"), "w"))
+run_env(["install", "codex"], d3)
+merged = json.load(open(os.path.join(ch, "hooks.json")))
+ok("mine.sh" in json.dumps(merged.get("hooks", {}).get("Stop", [])), "existing Stop hook survives")
+ok("sdlc" in json.dumps(merged.get("hooks", {}).get("PreToolUse", [])), "PreToolUse added")
+run_env(["install", "codex"], d3)
+ok(len(json.load(open(os.path.join(ch, "hooks.json")))["hooks"]["PreToolUse"]) == 1,
+   "re-installing does not stack duplicate hooks")
+
+print("uninstall removes our blocks and nothing else")
+run_env(["uninstall"], d)
+ok("Keep this." in open(ag).read(), "uninstall leaves user content")
+ok("BEGIN agentic-sdlc" not in open(ag).read(), "uninstall removes our block")
+ok(not os.path.exists(os.path.join(d, ".cursor/rules/agentic-sdlc.mdc")), "uninstall removes files we own")
+ok("echo MINE" in open(hp).read(), "uninstall leaves the user's git hook body")
+for x in (d, d2, d3, home):
+    shutil.rmtree(x, ignore_errors=True)
+
 print()
 print(f"FAILED: {len(fails)}" if fails else "all tests passed")
 sys.exit(1 if fails else 0)
