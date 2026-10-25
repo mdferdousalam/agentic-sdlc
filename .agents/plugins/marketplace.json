@@ -1,0 +1,19 @@
+{
+  "name": "agentic-sdlc",
+  "interface": {
+    "displayName": "Agentic SDLC"
+  },
+  "plugins": [
+    {
+      "name": "agentic-sdlc",
+      "source": {
+        "source": "local",
+        "path": "."
+      },
+      "policy": {
+        "installation": "AVAILABLE"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

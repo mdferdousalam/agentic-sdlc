@@ -21,9 +21,25 @@ rather than any missing adapter, was what would have stopped other developers ad
   depending on a shebang npm cannot honour there; it tries `python`, `py`, `python3` on Windows
   and `python3`, `python` elsewhere, and says exactly what is missing if none works.
 
+- **More ways in.** `packaging/build-pypi.sh` builds a PyPI distribution
+  (`agentic-sdlc-cli` — the unscoped `agentic-sdlc` is taken on PyPI too), staging the agents,
+  commands, docs and profiles into the wheel so the plugin root resolves the same way it does
+  from a checkout. `packaging/homebrew/agentic-sdlc.rb` is a tap-ready formula with the real
+  release checksum. `.codex-plugin/plugin.json` and `.agents/plugins/marketplace.json` make the
+  repository installable as a **Codex plugin**, and `gemini-extension.json` as a **Gemini
+  extension** — both straight from the git URL, no registry involved.
+- **`docs/install.md`** — all eight routes in one table, what each needs, and how to uninstall.
+
 ### Verified
 
-Installing the packed tarball into a clean project and pushing: the generated `pre-push` hook
+The Codex plugin route was tested both ways, and the result is worth knowing: a plugin's hook
+is **not run until Codex has been asked to trust it**. Untrusted, only `Stop` fired and
+`git stash` went through; trusted, the same command was refused. `sdlc install codex` avoids
+the prompt because a hook in your own `~/.codex/hooks.json` is already your configuration —
+that path is verified working, receipt-dependent push gate included.
+
+The PyPI wheel was installed into a clean virtualenv and run. Installing the packed npm
+tarball into a clean project and pushing: the generated `pre-push` hook
 refused an ungated push to `main`, and allowed it once a gate receipt existed. CI now checks
 the installer with `shellcheck`, that `package.json` and `plugin.json` agree on the version,
 and that the packed tarball's CLI actually runs.

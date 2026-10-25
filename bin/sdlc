@@ -184,7 +184,7 @@ def detect(root: str) -> dict:
         root, "commitlint.config.js", "commitlint.config.cjs", "commitlint.config.mjs",
         ".commitlintrc", ".commitlintrc.json", ".husky") else "descriptive"
 
-    secret_scan = ("gitleaks git --no-banner --redact -n 50" if which("gitleaks")
+    secret_scan = ('gitleaks git --no-banner --redact --log-opts="-n 50"' if which("gitleaks")
                    else "trufflehog git file://. --since-commit HEAD~50 --fail" if which("trufflehog")
                    else None)
 

@@ -61,6 +61,8 @@ d = newrepo({"Cargo.toml": "[package]\nname='t'\n"})
 cfg = json.loads(run(["init"], d).stdout)
 ok(cfg["stack"] == "rust" and cfg["pm"] == "cargo", "rust stack detected")
 ok("clippy" in cfg["verifyCmd"], "clippy in the rust verify command")
+ok("-n 50" not in (cfg.get("secretScan") or "") or "--log-opts" in (cfg.get("secretScan") or ""),
+   "the gitleaks default uses --log-opts, not a -n shorthand it does not have")
 shutil.rmtree(d)
 
 d = newrepo({"go.mod": "module t\n"})

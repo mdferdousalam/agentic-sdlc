@@ -1,0 +1,6 @@
+{
+  "name": "agentic-sdlc",
+  "version": "2.2.0",
+  "description": "An enforced agent-based SDLC pipeline that runs on any coding agent: specify, review, branch, implement, verify, review, gate, land, release. Each stage is owned by one agent and closed by a receipt b",
+  "contextFileName": "AGENTS.md"
+}

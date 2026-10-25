@@ -24,14 +24,23 @@ It is stack-agnostic through a single detected adapter file, and it speaks
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/mdferdousalam/agentic-sdlc/main/install.sh | sh
-#  or, if you prefer npm:   npx @mdferdousalam/agentic-sdlc install
-
 sdlc install     # detects your agents, sets each one up, adds the git hooks
 sdlc doctor      # what is configured and what is missing
 ```
 
-Needs `git` and Python 3.8+. No Python dependencies, no account, no sudo. Prefer to read
-before you pipe? [`install.sh`](install.sh) is 60 lines and touches nothing in your repository.
+Or via whichever package manager you already use:
+
+```sh
+npx @mdferdousalam/agentic-sdlc install        # npm
+uvx --from agentic-sdlc-cli sdlc install       # PyPI (or: pipx install agentic-sdlc-cli)
+brew install mdferdousalam/tap/agentic-sdlc    # Homebrew
+codex plugin marketplace add mdferdousalam/agentic-sdlc   # Codex, as a plugin
+gemini extensions install https://github.com/mdferdousalam/agentic-sdlc
+```
+
+Needs `git` and Python 3.8+. No Python dependencies, no account, no sudo.
+**[All routes, and how to uninstall](docs/install.md)** — including why the Codex plugin asks
+you to trust its hook once, and what `install.sh` actually does before you pipe it anywhere.
 
 ## The pipeline
 
@@ -203,6 +212,7 @@ engine. `/agentic-sdlc:doctor` tells you what is missing and what it costs you.
 ## Documentation
 
 - **[Getting started](GETTING-STARTED.md) — start here if this is new to you**
+- [Installing](docs/install.md) — every route, and uninstalling
 - [The pipeline in detail](docs/pipeline.md) — every stage, its inputs, its exit condition
 - [Maturity levels](docs/maturity.md) — what to configure at each stage of adoption
 - [Standards mapping](docs/compliance.md) — NIST AI RMF, OWASP, and the honest limits

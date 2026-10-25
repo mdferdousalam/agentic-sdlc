@@ -1,0 +1,64 @@
+{
+  "$schema": "./schema/sdlc.config.schema.json",
+  "version": 2,
+  "trunk": "main",
+  "stack": "node",
+  "pm": "npm",
+  "monorepo": null,
+  "commits": "descriptive",
+  "test": {},
+  "spec": {
+    "engine": "openspec",
+    "docsRoot": "openspec/changes",
+    "strict": true
+  },
+  "branchScheme": "{kind}/{slug}",
+  "verifyCmd": "python3 tests/test_sdlc.py && node .github/scripts/validate-plugin.mjs && npx --yes markdownlint-cli2",
+  "gateCmd": null,
+  "secretScan": "gitleaks git --no-banner --redact --log-opts=\"-n 50\"",
+  "heavy": null,
+  "profile": "library",
+  "quality": {
+    "cmd": null,
+    "coverageNewPct": null,
+    "note": "Deterministic analysis on NEW code. Research on agent-written code reports rising warnings and complexity, so the budget is on what this change adds, not on the whole repository."
+  },
+  "release": {
+    "deployCmd": null,
+    "smokeCmd": null,
+    "rollbackCmd": null,
+    "environments": []
+  },
+  "approvals": {
+    "merge": "agent",
+    "release": "human"
+  },
+  "attributeCommits": true,
+  "reviewers": [
+    "sdlc-code-reviewer",
+    "sdlc-security-reviewer"
+  ],
+  "protected": [
+    "main",
+    "master",
+    "release/*"
+  ],
+  "receipts": {
+    "maxAgeMin": 180
+  },
+  "enforce": {
+    "pushToTrunkNeedsGate": true,
+    "mergeNeedsReadiness": true,
+    "branchNeedsApprovedSpec": true,
+    "blockDestructiveGit": true,
+    "blockPublishing": true,
+    "blockCredentialReads": true
+  },
+  "neverByAgent": [
+    "tag",
+    "release",
+    "publish",
+    "force-push",
+    "deploy"
+  ]
+}

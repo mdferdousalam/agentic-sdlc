@@ -11,3 +11,7 @@ __pycache__/
 
 # npm pack output
 *.tgz
+
+# Build output.
+build/
+dist/
