@@ -61,7 +61,7 @@ you to trust its hook once, and what `install.sh` actually does before you pipe 
 Also `:gate` (the mechanical half on its own), `:status` (which receipts hold right now), `:doctor` (is the install sane), and
 `sdlc-test-author` for the tests a review finds missing.
 
-Eleven agents, each with one job and no permission to do another's. The reviewers cannot edit.
+Sixteen agents, each with one job and no permission to do another's. The reviewers cannot edit.
 The gate cannot push. Only the lander touches the remote, and it cannot tag, release or publish
 at all.
 
@@ -182,13 +182,27 @@ behaviour. [How it fits](docs/openspec.md).
 ## Governance you can show someone
 
 ```sh
-sdlc metrics      # stage outcomes, first-pass rates, which refusals fire, who acted
+sdlc metrics      # stage outcomes, findings by severity and domain, repair and false-fix rates
 sdlc trace        # requirement → commit → test → receipts, as markdown or JSON
 sdlc status       # which receipts hold right now, which are stale
+sdlc finding list --open      # what is outstanding, worst first
 ```
 
 Everything lands in an append-only `.sdlc/audit.log`. A first-pass gate rate of 100% is
 reported as a finding, not a success — it usually means the gate is not checking anything.
+
+**Findings are records, not prose.** Each carries a rule from
+[`docs/control-spec.md`](docs/control-spec.md), a taxonomy address, evidence, a root cause and
+a provenance — and two independent judgements: **severity** (how bad if real) and
+**confidence** (how sure it is real). What an agent may repair unattended comes from the pair.
+A critical finding at low confidence escalates to a person, because the agent's belief that it
+found an auth bypass is exactly the thing in question. An `advisory` finding is never committed
+at any confidence.
+
+What is deliberately *not* reported: detection precision and recall. Those need a corpus of
+seeded defects with known answers, which no repository has about itself.
+[`docs/maturity.md`](docs/maturity.md) says how to measure them, and what else this does not
+give you.
 [Standards mapping](docs/compliance.md) for NIST AI RMF, OWASP Agentic AI and OWASP NHI,
 including what this does **not** give you.
 

@@ -2201,8 +2201,74 @@ def cmd_metrics(args) -> int:
         print("\nactors")
         for a, n in sorted(agents.items(), key=lambda x: -x[1]):
             print(f"  {a:<24} {n} events")
+    findings = finding_load_all(root)
+    if findings:
+        sev, cat, outcome = {}, {}, {}
+        for f in findings:
+            cl = f.get("classification") or {}
+            sev[cl.get("severity", "?")] = sev.get(cl.get("severity", "?"), 0) + 1
+            dom = str(f.get("category", "?")).split(".")[0]
+            cat[dom] = cat.get(dom, 0) + 1
+            outcome[f.get("outcome", "?")] = outcome.get(f.get("outcome", "?"), 0) + 1
+        print("\nfindings by severity")
+        for k in SEVERITIES:
+            if k in sev:
+                print(f"  {k:<10} {sev[k]}")
+        print("findings by taxonomy domain")
+        for k, v in sorted(cat.items(), key=lambda x: -x[1])[:12]:
+            print(f"  {k:<10} {v}")
+
+        # The outcome measures the brief asks for, computed only from what is recorded.
+        # Each is labelled with what it actually counts, because a metric whose definition is
+        # unstated is how a dashboard starts lying.
+        closed = sum(outcome.get(w, 0) for w in ("fixed", "refused", "deferred", "escalated"))
+        attempted = outcome.get("fixed", 0) + outcome.get("unexecuted", 0)
+        print("\noutcomes")
+        print(f"  verified repair rate   "
+              f"{100 * outcome.get('fixed', 0) // max(attempted, 1)}%  "
+              f"({outcome.get('fixed', 0)} fixed with proof / {attempted} repairs attempted)")
+        print(f"  human intervention     "
+              f"{100 * outcome.get('escalated', 0) // max(len(findings), 1)}%  "
+              f"({outcome.get('escalated', 0)} escalated / {len(findings)} findings)")
+        repro = sum(1 for f in findings if (f.get("evidence") or {}).get("repro"))
+        print(f"  reproducible           "
+              f"{100 * repro // max(len(findings), 1)}%  "
+              f"({repro} carry a reproduction)")
+        unex = outcome.get("unexecuted", 0)
+        if unex:
+            print(f"  UNVERIFIED             {unex} finding(s) closed as unexecuted — the fix "
+                  f"was never proved. These are not closed.")
+        if outcome.get("open"):
+            print(f"  still open             {outcome['open']}")
+
+        # A finding re-raised after being closed as fixed did not stay fixed.
+        fixed_then, refixed = set(), 0
+        for r in rows:
+            if r["event"] == "finding.close" and " fixed" in r["detail"]:
+                fixed_then.add(r["detail"].split()[0])
+            elif r["event"] == "finding.write" and r["detail"].split()[0] in fixed_then:
+                refixed += 1
+        if fixed_then:
+            print(f"  false-fix rate         "
+                  f"{100 * refixed // max(len(fixed_then), 1)}%  "
+                  f"({refixed} of {len(fixed_then)} came back after being closed fixed)")
+
+    regress = [r for r in rows if r["event"] == "baseline.compare"]
+    if regress:
+        withnew = sum(1 for r in regress if not r["detail"].startswith("0 new"))
+        print(f"\nattribution ({len(regress)} comparisons)")
+        print(f"  changes that introduced a new failure  "
+              f"{100 * withnew // max(len(regress), 1)}%  ({withnew} of {len(regress)})")
+    weakened = [r for r in rows if r["event"] == "suite.weakened"]
+    if weakened:
+        print(f"  diffs that weakened a check            {len(weakened)}")
+
     print("\nA low first-pass rate is not a problem by itself — it is the gate doing its job.\n"
           "A first-pass rate of 100% means the gate is not checking anything.")
+    if findings:
+        print("Detection precision and recall are NOT here: they need a corpus of seeded\n"
+              "defects with known answers, which no repository has about itself. See\n"
+              "docs/maturity.md for how to measure them if you need to.")
     return 0
 
 
