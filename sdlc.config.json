@@ -19,7 +19,8 @@
   "suiteAudit": {
     "exclude": [
       "bin/sdlc",
-      "tests/test_sdlc.py"
+      "tests/test_sdlc.py",
+      "evals/*/prompt.md"
     ]
   },
   "heavy": null,

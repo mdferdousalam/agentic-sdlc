@@ -27,7 +27,7 @@ Also read from `.opencode/sdlc.json` if you prefer to keep it out of the reposit
 | `receipts.maxAgeMin` | integer | How long a receipt stays valid. Default 180. |
 | `enforce.*` | boolean | What the hook refuses. See below. |
 | `neverByAgent` | string[] | Actions reserved to a human, stated for the agents to read. |
-| `suiteAudit.exclude` | string[] | Paths `sdlc tests audit` does not scan. Adding one is itself reported — the hatch is visible, not quiet. |
+| `suiteAudit.exclude` | string[] | Paths exempt from the **suppression-marker** half of `sdlc tests audit`. Deleted tests, removed assertions and lowered thresholds still fire on them. Adding a glob is itself reported — the hatch is visible, not quiet. |
 | `budget.*` | object | Ceilings an agent cannot raise for itself: `maxToolCalls`, `maxWallClockMin`, `maxRetries`, `stopPolicy`. Unset means nothing stops a runaway task. |
 
 ## `enforce`

@@ -414,13 +414,13 @@ DESTRUCTIVE = [
     (r"\bgit\s+reset\s+(--hard|--merge|--keep)\b", "git reset --hard destroys uncommitted work"),
     (r"\bgit\s+clean\b", "git clean deletes untracked files"),
     (r"\bgit\s+(checkout|restore)\s+(--\s+)?\.(\s|$)", "this discards every uncommitted change"),
-    (r"\bgit\s+(push|branch)\b[^|;&]*--force(-with-lease)?\b", "force-push rewrites published history"),
+    (r"\bgit\s+(push|branch)\b[^|;&\n]*--force(-with-lease)?\b", "force-push rewrites published history"),
     (r"\bgit\s+filter-(branch|repo)\b", "history rewriting is the maintainer's decision"),
     (r"\brm\s+(-[a-zA-Z]*\s+)*(-rf|-fr)\s+(/|~|\$HOME)(\s|$)", "refusing rm -rf of a root or home path"),
 ]
 PUBLISHING = [
     (r"\bgit\s+tag\b(?!\s+(-l|--list|-n))", "a tag is a public promise — the maintainer's call"),
-    (r"\bgit\s+push\b[^|;&]*(--tags|\brefs/tags/)", "pushing tags is the maintainer's call"),
+    (r"\bgit\s+push\b[^|;&\n]*(--tags|\brefs/tags/)", "pushing tags is the maintainer's call"),
     (r"\b(npm|pnpm|yarn|bun)\s+publish\b", "publishing is the maintainer's call"),
     (r"\bcargo\s+publish\b", "publishing is the maintainer's call"),
     (r"\b(twine|poetry)\s+(upload|publish)\b", "publishing is the maintainer's call"),
@@ -441,16 +441,27 @@ DEPLOY_PATTERNS = [
     r"\baws\s+(deploy|ecs|lambda|cloudformation|s3\s+sync)\b",
     r"\b(gcloud|az)\s+\w+\s+deploy\b",
     r"\b(flyctl|fly|vercel|netlify|heroku|railway|render)\s+(deploy|releases?)\b",
-    r"\bdocker\s+(compose\s+)?(up|stack\s+deploy)\b[^|;&]*(prod|production)",
+    r"\bdocker\s+(compose\s+)?(up|stack\s+deploy)\b[^|;&\n]*(prod|production)",
     r"\bansible-playbook\b",
-    r"\bgh\s+workflow\s+run\b[^|;&]*(deploy|release|prod)",
+    r"\bgh\s+workflow\s+run\b[^|;&\n]*(deploy|release|prod)",
 ]
 
 CREDENTIALS = [
-    (r"(^|[\s;|&(])(cat|bat|less|more|head|tail|strings|xxd|od|cp|scp|rsync|curl)\b[^|;&]*"
-     r"(\.env(\.(?!example|sample|template)[\w.-]+)?|/\.ssh/|/\.aws/|id_rsa|id_ed25519|\.pem|\.p12|"
-     r"credentials\.json|secrets\.ya?ml)(\s|$|['\")])",
+    # [^|;&\n] rather than [^|;&]: the negated class matched newlines, so in a multi-line
+    # command a reader verb on line 1 paired with a credential word forty lines later. The
+    # verb list stays to tools whose whole job is to emit a file's contents -- adding
+    # interpreters made it fire on any script that merely mentions one.
+    (r"(^|[\s;|&(])(cat|bat|less|more|head|tail|strings|xxd|od|cp|scp|rsync|curl)\b[^|;&\n]*"
+     r"(\.env(?!\.(?:example|sample|template|dist))[\w.-]*|/\.ssh/|/\.aws/|/\.gnupg/|/\.kube/|"
+     r"/\.docker/|\.npmrc|\.pypirc|\.netrc|id_rsa|id_ed25519|\.pem|\.p12|\.kdbx|"
+     r"credentials(\.json)?|secrets?\.ya?ml|service[-_]account[\w.-]*\.json)",
      "reading a credential file is forbidden"),
+    (r"(^|[\s;|&(])(printenv|env)\b[^|;&\n]*\b\w*(SECRET|TOKEN|PASSWORD|PASSWD|"
+     r"API[-_]?KEY|PRIVATE[-_]?KEY|CREDENTIAL)\w*",
+     "printing a secret from the environment is forbidden"),
+    (r"(^|[\s;|&(])echo\s+\"?\$\{?\w*(SECRET|TOKEN|PASSWORD|API[-_]?KEY|"
+     r"PRIVATE[-_]?KEY)\w*",
+     "echoing a secret from the environment is forbidden"),
     (r"\b(sk-[A-Za-z0-9]{12,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{12,})",
      "a credential appears in this command line"),
 ]
@@ -1626,13 +1637,14 @@ SUPPRESS_ADDED = (
 
 NUM_SETTING = re.compile(r"([A-Za-z_][\w.\- ]{2,40})\s*[:=]\s*(\d{1,3})(?:\.\d+)?\s*%?\s*$")
 
-# Markdown is NOT excluded. In a plugin whose executable instructions are markdown, appending
-# `|| true` to a command in commands/gate.md is a real weakening, and skipping .md hid it.
-# Only a diff *illustration* inside documentation is skipped: a line whose own content begins
-# with + or -, which is an example of a change rather than a change.
-DOC_RE = re.compile(r"\.(md|markdown|rst|adoc)$", re.I)
-
-DIFF_ILLUSTRATION = re.compile(r"^\s*[+-]")
+# Markdown is scanned like anything else. In a plugin whose executable instructions ARE
+# markdown, `|| true` appended to a command in commands/gate.md is a real weakening.
+#
+# There is no content-based exemption left in this function. Three were tried — quote parity,
+# quotes on both sides, and "a line starting with + or - is a diff illustration" — and each
+# was defeated by editing the line: an apostrophe, a trailing quote, and a two-character list
+# prefix. A file that contains these patterns as subject matter rather than as behaviour
+# declares itself in suiteAudit.exclude, where a reviewer sees it.
 
 
 def diff_files(root: str, base: str):
@@ -1646,14 +1658,17 @@ def diff_files(root: str, base: str):
     def run(*args):
         return subprocess.run(["git", *args], cwd=root, capture_output=True, text=True)
 
-    r = run("diff", "--name-only", f"{base}...HEAD")
+    # -z: NUL-separated and never C-quoted. With git's default core.quotePath a non-ASCII
+    # name came back quoted, matched no pathspec, and produced an empty diff with returncode
+    # 0 — so gutting that file reported nothing. Failing OPEN, the mode B1d removed.
+    r = run("diff", "--name-only", "-z", f"{base}...HEAD")
     if r.returncode != 0:
-        r = run("diff", "--name-only", base)
+        r = run("diff", "--name-only", "-z", base)
     if r.returncode != 0:
         return None  # fail closed; the caller reports unexecuted, never "nothing found"
 
     out = []
-    for path in [l for l in r.stdout.splitlines() if l.strip()]:
+    for path in [x for x in r.stdout.split("\0") if x.strip()]:
         d = run("diff", "--no-color", "--unified=0", "--src-prefix=a/", "--dst-prefix=b/",
                 f"{base}...HEAD", "--", path)
         if d.returncode != 0:
@@ -1669,6 +1684,8 @@ def diff_files(root: str, base: str):
                 added.append(line[1:])
             elif in_body and line.startswith("-"):
                 removed.append(line[1:])
+        if not d.stdout.strip():
+            return None  # named as changed but produced no diff; that is not "clean"
         out.append((path, added, removed))
     return out
 
@@ -1697,11 +1714,11 @@ def suite_findings(root: str, base: str, cfg: dict = None):
     cfg = cfg if cfg is not None else load_config(root)
     found = []
 
-    r = subprocess.run(["git", "diff", "--name-only", "--diff-filter=D", f"{base}...HEAD"],
-                       cwd=root, capture_output=True, text=True)
+    r = subprocess.run(["git", "diff", "--name-only", "-z", "--diff-filter=D",
+                        f"{base}...HEAD"], cwd=root, capture_output=True, text=True)
     if r.returncode != 0:
         return None
-    for path in r.stdout.splitlines():
+    for path in r.stdout.split("\0"):
         if path and TEST_PATH_RE.search(path):
             found.append((path, "a test file was deleted", path))
 
@@ -1729,8 +1746,8 @@ def suite_findings(root: str, base: str, cfg: dict = None):
         except Exception:
             after = set()
         for added_glob in sorted(after - before):
-            found.append((name, "a path was newly exempted from the suite audit — the audit "
-                                "no longer looks at it at all",
+            found.append((name, "a path was newly exempted from the suite audit's "
+                                "suppression-marker checks",
                           f'suiteAudit.exclude += "{added_glob}"'))
 
     for path, added, removed in files:
@@ -1750,11 +1767,8 @@ def suite_findings(root: str, base: str, cfg: dict = None):
                                     f"may now prove less",
                               next(l.strip() for l in removed if ASSERT_RE.search(l))))
 
-        is_doc = bool(DOC_RE.search(path or ""))
         exempt = audit_excluded(cfg, path or "")
         for line in added:
-            if is_doc and DIFF_ILLUSTRATION.search(line):
-                continue  # a diff shown as an example in documentation
             if not exempt:
                 for pat, why in SKIP_ADDED + SUPPRESS_ADDED:
                     if pat.search(line):
@@ -2040,6 +2054,12 @@ def cmd_baseline(args) -> int:
     if gone:
         print(f"\nFixed ({len(gone)}) — present at the baseline, gone now.")
     audit(root, "baseline.compare", f"{len(new)} new, {len(kept)} pre-existing, {len(gone)} fixed")
+    if code in (124, 126):
+        print(f"\nVerdict: UNEXECUTED. The verify command did not run, so this says nothing "
+              f"about the change — in either direction.\n{out.strip()[:600]}")
+        audit(root, "baseline.unexecuted", f"verify exit {code}")
+        return 1
+
     if new or (code != 0 and b["exit"] == 0):
         print("\nVerdict: this change introduced failures. Fix those; leave the pre-existing "
               "ones alone unless the specification asked for them.")
@@ -2061,16 +2081,37 @@ def cmd_baseline(args) -> int:
 # same values through both so they cannot drift.
 
 
+def control_spec_body() -> str:
+    """The control specification's text, or stop.
+
+    This used to swallow a read error and return nothing, which meant a missing or renamed
+    docs/control-spec.md silently emptied both the rule table and the never-autofix set: any
+    invented rule validated, and TEST-SUITE-WEAKENED came back autofixable. A control whose
+    off-switch is an absent file is not a control, so this fails closed and loudly.
+    """
+    try:
+        body = read_plugin("docs", "control-spec.md")
+    except Exception:
+        body = ""
+    # read_plugin returns "" on a read error rather than raising, so checking for the
+    # exception alone was dead code: a missing file produced an empty policy in silence.
+    if not body.strip() or "| Rule ID |" not in body:
+        e = "missing, empty, or has no rule table"
+        print(f"agentic-sdlc: cannot read docs/control-spec.md ({e}).\n"
+              f"It is the normative rule table: without it no rule can be validated and no "
+              f"rule can be known to be un-autofixable. Refusing rather than proceeding with "
+              f"an empty policy.", file=sys.stderr)
+        raise SystemExit(3)
+    return body
+
+
 def known_rules() -> set:
     """Rule IDs from the control specification's table — the one source of truth.
 
     Parsed rather than duplicated, so adding a row to docs/control-spec.md is all it takes to
     make a rule usable. An unreadable table means we skip the check rather than block work.
     """
-    try:
-        body = read_plugin("docs", "control-spec.md")
-    except Exception:
-        return set()
+    body = control_spec_body()
     return set(re.findall(r"^\|\s*`([A-Z][A-Z0-9-]*)`\s*\|", body, re.M))
 
 
@@ -2085,21 +2126,24 @@ def finding_id(rule: str, file: str, line, summary: str) -> str:
 
 
 def never_autofix_rules() -> set:
-    """Rules the control spec marks **never** autofixable, whatever the severity pair says.
+    """Rules the control spec does not mark autofixable, whatever the severity pair says.
 
     Parsed from the same table as the rule IDs. Without this the matrix alone decided, and a
     TEST-SUITE-WEAKENED finding at critical/high came back "eligible for automatic fix" — an
     agent authorised to repair a disarmed test suite unattended, which is the exact thing the
     rule exists to stop.
     """
-    try:
-        body = read_plugin("docs", "control-spec.md")
-    except Exception:
-        return set()
+    body = control_spec_body()
     out = set()
-    for row in re.findall(r"^\|\s*`([A-Z][A-Z0-9-]*)`\s*\|(.*)$", body, re.M):
-        rule, rest = row
-        if re.search(r"\*\*never\*\*", rest, re.I):
+    for rule, rest in re.findall(r"^\|\s*`([A-Z][A-Z0-9-]*)`\s*\|(.*)$", body, re.M):
+        cols = [c.strip() for c in rest.split("|")]
+        # columns: domain | detection | default severity | autofix | evidence
+        autofix = cols[3].lower() if len(cols) > 3 else ""
+        # Only an explicit "yes" defers to the severity x confidence matrix. Reading only
+        # **never** let the 53 rows that say plain "no" — SEC-INJECTION-SQL, SEC-AUTHORITY,
+        # MEM-SAFETY among them — come back autofixable at critical/high, which is the
+        # permissive half of a document that contradicted itself.
+        if not autofix.startswith("yes"):
             out.add(rule)
     return out
 

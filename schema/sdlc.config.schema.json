@@ -316,7 +316,7 @@
           "items": {
             "type": "string"
           },
-          "description": "Paths or globs the audit does not scan. For files that genuinely DEFINE these patterns \u2014 a detector, its fixtures \u2014 not for files that merely trip it."
+          "description": "Paths or globs exempt from the suppression-marker half of the audit. Deleted tests, removed assertions and lowered thresholds still fire on them. For files that genuinely DEFINE these patterns \u2014 a detector, its fixtures, an adversarial eval prompt \u2014 not for files that merely trip it."
         }
       }
     }

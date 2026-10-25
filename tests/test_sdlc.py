@@ -350,16 +350,20 @@ POLICY = [
 ]
 for i, (sev, conf, repro, expect) in enumerate(POLICY):
     extra = ["--repair", "the minimal change"] + (["--repro", "npm test -- x.spec.ts"] if repro else [])
-    out = fwrite(sev=sev, conf=conf, f=f"src/p{i}.ts", line=str(i + 1),
-                 summary=f"policy corner {i} under test here", extra=extra).stdout
+    # TYPE-ERROR is the one rule the table marks autofixable, so it is the only rule whose
+    # eligibility the severity x confidence matrix decides. Every other row says no, and a
+    # separate test covers that the table outranks the matrix.
+    out = fwrite(rule="TYPE-ERROR", cat="C.20", sev=sev, conf=conf, f=f"src/p{i}.ts",
+                 line=str(i + 1), summary=f"policy corner {i} under test here",
+                 extra=extra).stdout
     got = "eligible for automatic fix" in out and "NOT eligible" not in out
     ok(got == expect,
        f"{sev}/{conf}{' +repro' if repro else ''} -> "
        f"{'fixable' if expect else 'escalate or report'}")
 
-ok("NOT eligible" in fwrite(rule="ARCH-CYCLE", cat="B.11", sev="advisory", conf="high",
+ok("NOT eligible" in fwrite(rule="TYPE-ERROR", cat="C.20", sev="advisory", conf="high",
                             f="src/a.ts", line="1",
-                            summary="an architectural trade-off worth noting",
+                            summary="an advisory finding on an autofixable rule",
                             extra=["--repair", "invert it", "--repro", "n/a"]).stdout,
    "an advisory finding is never automatically fixed, whatever the confidence")
 
@@ -404,6 +408,12 @@ for rec in recs:
     if expl is not None and expl not in allowed:
         bad.append(f"exploitability={expl!r} not in enum")
 ok(not bad, f"every written record matches the schema's declared types ({bad[:2]})")
+
+# additionalProperties is false, so a field the code writes and the schema does not declare
+# makes the record invalid. The round-two reopen fix added exactly such a field.
+undeclared = sorted({k for rec in recs for k in rec} - set(sch["properties"]))
+ok(not undeclared,
+   f"no record carries a field the schema does not declare ({undeclared})")
 
 print("findings: a defect that comes back is not still closed")
 r = fwrite(rule="CODE-ERROR-SWALLOWED", cat="C.25", sev="high", conf="high",
@@ -642,7 +652,9 @@ ok(r.returncode != 0,
    "markdown is scanned — in this plugin the instructions ARE markdown")
 
 r = weaken({"docs/guide.md": "Never do this:\n\n```diff\n+@pytest.mark.skip\n```\n"})
-ok(r.returncode == 0, "but a diff shown as an example in documentation is not a change")
+ok(r.returncode != 0,
+   "a diff illustration in documentation is reported too — there is no content exemption "
+   "left, because every version of one was defeated by editing the content")
 
 r = run(["tests", "audit", "--base", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"], dt)
 ok(r.returncode != 0 and "UNEXECUTED" in (r.stdout + r.stderr),
@@ -683,6 +695,84 @@ r = weaken({"src/real.py": 'def f():\n    return x  "y"  # noqa  # "\n'})
 ok(r.returncode != 0, "and quotes sprinkled around the marker do not hide it")
 r = weaken({"src/real.py": "def f():\n    return x  # don't  # noqa\n"})
 ok(r.returncode != 0, "nor does an apostrophe")
+
+print("suite integrity: round-three findings — two were my own regressions")
+# A third content-based heuristic survived two rounds of removing content-based heuristics:
+# DIFF_ILLUSTRATION exempted any markdown line starting with + or -, so two characters
+# disarmed 17% of the markdown this branch adds. In a plugin whose instructions ARE markdown.
+r = weaken({"commands/run.md": "Run the gate.\n\nRun `npm test` then eslint-disable no-eval\n"})
+ok(r.returncode != 0, "a suppression in markdown is caught")
+r = weaken({"commands/run.md": "Run the gate.\n\n- Run `npm test` then eslint-disable no-eval\n"})
+ok(r.returncode != 0, "and a two-character list prefix does not disarm it")
+
+# Introduced by the round-two per-file loop: git C-quotes non-ASCII names by default, so the
+# name matched no pathspec, the file read as an empty diff, and it failed OPEN with exit 0 —
+# the exact mode the same commit had just removed for bad refs.
+weaken({"tests/caf\u00e9_test.py": "def test_x():\n    assert a() == 1\n    assert b() == 2\n"},
+       "add a non-ascii test file")
+r = weaken({"tests/caf\u00e9_test.py": "def test_x():\n    pass\n"})
+ok(r.returncode != 0, "a file whose name git quotes is still scanned")
+ok("caf" in r.stdout, "and it is named in the report")
+
+print("the policy table outranks the matrix for every rule, not just two")
+dpol = newrepo(config={"trunk": "main", "spec": {"engine": "prd-frd"}})
+
+
+def polwrite(rule, cat, sev="critical", conf="high"):
+    return run(["finding", "write", "--rule", rule, "--category", cat, "--severity", sev,
+                "--confidence", conf, "--file", "src/p.ts", "--line", "1",
+                "--summary", "a representative finding for policy testing",
+                "--repair", "the minimal change"], dpol).stdout
+
+# docs/control-spec.md's Autofix column says plain "no" on 53 rows and **never** on two.
+# Reading only **never** let SEC-INJECTION-SQL, SEC-AUTHORITY and MEM-SAFETY come back
+# autofixable at critical/high — the permissive half of a document contradicting itself.
+for rule, cat in (("SEC-INJECTION-SQL", "D.31"), ("SEC-AUTHORITY", "D.30"),
+                  ("MEM-SAFETY", "F.57"), ("CODE-ERROR-SWALLOWED", "C.25")):
+    ok("NOT eligible" in polwrite(rule, cat),
+       f"{rule} is not autofixable: its table row does not say yes")
+ok("eligible for automatic fix" in polwrite("TYPE-ERROR", "C.20", sev="high"),
+   "the one row marked yes still defers to the matrix")
+
+print("a verify that did not run is unexecuted, not a failure of the change")
+# run_verify now returns 126 when the guard refuses the configured command and 124 on
+# timeout. cmd_baseline tested only `code != 0` and announced "this change introduced
+# failures" — unexecuted reported as failed, in the path every baseline capture goes through.
+dv = newrepo(files={"a.txt": "x\n"},
+             config={"trunk": "main", "spec": {"engine": "prd-frd"},
+                     "verifyCmd": "echo ok"})
+ok(run(["baseline", "capture"], dv).returncode == 0, "a clean baseline is captured")
+c = json.load(open(os.path.join(dv, "sdlc.config.json")))
+c["verifyCmd"] = " ".join(["git", "tag", "v0.0.1"])   # a command the guard refuses
+json.dump(c, open(os.path.join(dv, "sdlc.config.json"), "w"))
+r = run(["baseline", "compare"], dv)
+ok("UNEXECUTED" in r.stdout, "a refused verify command is reported as unexecuted")
+ok("introduced failures" not in r.stdout, "and is NOT reported as a failure of the change")
+ok(r.returncode != 0, "and does not pass either")
+r = run(["baseline", "capture"], dv)
+ok("REFUSED" in (r.stdout + r.stderr) or run(["baseline", "show"], dv).stdout.count("126"),
+   "the refusal reaches the operator rather than being swallowed")
+ok(not os.path.exists(os.path.join(dv, ".git/refs/tags/v0.0.1")),
+   "and the forbidden command in the config never ran")
+shutil.rmtree(dv, ignore_errors=True)
+
+print("the rule table is not optional")
+# known_rules() and never_autofix_rules() swallowed a read error and returned empty sets, so
+# a missing docs/control-spec.md meant any invented rule validated and nothing was
+# un-autofixable. A control whose off-switch is an absent file is not a control.
+import tempfile as _tf
+fake = _tf.mkdtemp(prefix="sdlc-noplugin-")
+os.makedirs(os.path.join(fake, "bin"))
+shutil.copy(SDLC, os.path.join(fake, "bin", "sdlc"))
+r = subprocess.run([sys.executable, os.path.join(fake, "bin", "sdlc"), "finding", "write",
+                    "--rule", "TEST-SUITE-WEAKENED", "--category", "X4",
+                    "--severity", "critical", "--confidence", "high", "--file", "t.py",
+                    "--line", "1", "--summary", "a weakening finding for policy testing",
+                    "--repair", "x"], cwd=dpol, capture_output=True, text=True)
+ok(r.returncode != 0, "without the control spec the tool refuses rather than guessing")
+ok("control-spec" in r.stderr, "and says which file it needs")
+shutil.rmtree(fake, ignore_errors=True)
+shutil.rmtree(dpol, ignore_errors=True)
 
 print("suite integrity: the escape hatch is declared, and never quiet")
 cfgp = os.path.join(dt, "sdlc.config.json")
