@@ -8,3 +8,6 @@ node_modules/
 # Python bytecode from running the tests.
 __pycache__/
 *.pyc
+
+# npm pack output
+*.tgz

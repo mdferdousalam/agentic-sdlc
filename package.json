@@ -1,0 +1,22 @@
+{
+  "name": "@mdferdousalam/agentic-sdlc",
+  "version": "2.1.0",
+  "description": "An enforced agent-based SDLC pipeline for any coding agent: specify, review, branch, implement, verify, review, gate, land, release. Claude Code, opencode, Codex and Cline refuse a skipped stage at the tool call; Cursor, Copilot, Windsurf and every AGENTS.md host get the pipeline plus git-hook and CI enforcement.",
+  "keywords": ["sdlc", "agents", "ai", "code-review", "quality-gate", "spec-driven", "openspec",
+               "claude-code", "codex", "cursor", "copilot", "cline", "opencode", "gemini", "agents-md"],
+  "homepage": "https://github.com/mdferdousalam/agentic-sdlc#readme",
+  "repository": { "type": "git", "url": "git+https://github.com/mdferdousalam/agentic-sdlc.git" },
+  "bugs": { "url": "https://github.com/mdferdousalam/agentic-sdlc/issues" },
+  "license": "MIT",
+  "author": "Engr Md Ferdous Alam <mdferdousalam1989@yahoo.com> (https://github.com/mdferdousalam)",
+  "bin": { "sdlc": "npm/cli.js" },
+  "engines": { "node": ">=16" },
+  "files": [
+    "npm/cli.js", "bin/", "agents/", "commands/", "skills/", "profiles/", "docs/",
+    "hooks/", "schema/", "opencode/", "evals/", "examples/",
+    ".claude-plugin/", "README.md", "GETTING-STARTED.md", "CHANGELOG.md", "LICENSE", "SECURITY.md"
+  ],
+  "scripts": {
+    "test": "python3 tests/test_sdlc.py && node .github/scripts/validate-plugin.mjs"
+  }
+}

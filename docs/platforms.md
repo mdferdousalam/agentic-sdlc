@@ -17,9 +17,9 @@ sdlc uninstall          # removes only our blocks and the files we own
 | --- | --- | --- | --- | --- |
 | **Claude Code** | **yes** | yes | `PreToolUse` hook, exit 2 | live: `git stash` and an ungated `git push` both refused in a real session |
 | **opencode** | **yes** | yes | plugin, `tool.execute.before` | live in a real session |
-| **Codex CLI** | **yes** | yes | `PreToolUse` in `~/.codex/hooks.json` | hook installed and merged; the wire payload understood (contract test). The live refusal is **untested** — the account here could not authenticate |
+| **Codex CLI** | **yes** | yes | `PreToolUse` in `~/.codex/hooks.json` | live: `git stash` refused, and an ungated `git push origin main` refused by the receipt rule — the dynamic gates work there, not just the static ones. The user's existing `Stop` hook still fired in the same session |
 | **Cline** | **yes** | yes (workflows) | executable `.clinerules/hooks/PreToolUse`, exit 2 | format read from the installed extension v4.1.25; live refusal untested |
-| **Gemini CLI** | **static patterns only** | yes (TOML) | `.gemini/policies/*.toml`, `decision = "deny"` | policy keys and `run_shell_command` read from the 0.65.0 bundle |
+| **Gemini CLI** | **static patterns only** | yes (TOML) | `.gemini/policies/*.toml`, `decision = "deny"` | policy keys and `run_shell_command` read from the 0.65.0 bundle. **Live test not possible**: Google now returns `UNSUPPORTED_CLIENT` for this client's free tier and points at Antigravity |
 | **Cursor** | no | yes | `.cursor/rules/*.mdc` (`alwaysApply`), `.cursor/commands/` | paths read from the installed Cursor CLI |
 | **GitHub Copilot** | no | yes (prompt files) | `.github/copilot-instructions.md`, `.github/prompts/*.prompt.md` | read from the Copilot extension shipped in VS Code |
 | **Roo Code** | no | — | `.roo/rules/` | read from the installed extension v3.54.0 |

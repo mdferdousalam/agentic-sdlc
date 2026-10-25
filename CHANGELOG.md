@@ -47,17 +47,34 @@ The pipeline stops being a Claude Code feature.
 - `bin/sdlc-install-opencode` is **deprecated** — it now calls `sdlc install opencode`. Removal
   in 3.0.0.
 
+### Distribution
+
+- **`install.sh`** — `curl -fsSL .../install.sh | sh`. Downloads a release into
+  `~/.agentic-sdlc`, links `sdlc` into a bin directory already on your PATH, and touches
+  nothing in your repository. No account, no sudo, no Python dependencies. It refuses to
+  proceed on Python older than 3.8 rather than failing later with something cryptic.
+- **npm package `@mdferdousalam/agentic-sdlc`** — `npx @mdferdousalam/agentic-sdlc install`.
+  Scoped because the unscoped name belongs to an unrelated project. The `bin` is a small Node
+  launcher rather than the Python file directly, so Windows gets a real shim instead of
+  depending on a shebang npm cannot honour there; it tries `python`, `py`, `python3` on Windows
+  and `python3`, `python` elsewhere, and says exactly what is missing if none works.
+
 ### Verified
 
-Live: the git `pre-push` hook refuses an ungated push to `main` from a plain terminal, allows a
-feature branch, and is bypassed by `--no-verify` exactly as the documentation says. The Codex
-`hooks.json` merge preserves an existing `Stop` hook and does not stack duplicates on re-install.
-The guard understands Codex's exact payload shape.
+Live, in real sessions:
 
-**Not verified:** the live refusal inside Codex and Cline sessions (Codex could not
-authenticate on this machine), and the Kilo, Windsurf and Continue paths, which are conventional
-rather than confirmed — those adapters also write `AGENTS.md`, so the rules land either way.
-Windows remains untested.
+- **Codex CLI** — `git stash` refused, and `git push origin main` refused for want of a gate
+  receipt. The second one matters: it proves the *receipt-dependent* gates work on Codex, not
+  only the static pattern rules. The user's pre-existing `Stop` hook fired in the same session,
+  so the `hooks.json` merge is safe in practice and not just in the unit test.
+- **git hooks** — an ungated push to `main` refused from a plain terminal with no agent
+  involved; a feature branch allowed; `--no-verify` bypasses it exactly as documented.
+
+**Not verified:** the live refusal inside a Cline session, and the Cursor, Copilot and Roo
+pickup, which need interactive IDE sessions. Gemini could not be tested at all — Google now
+returns `UNSUPPORTED_CLIENT` for this client's free tier. Kilo, Windsurf and Continue use
+conventional paths that are not confirmed against a real tool; those adapters also write
+`AGENTS.md`, so the rules land either way. Windows remains untested.
 
 ## [2.0.0] — 2026-10-25
 

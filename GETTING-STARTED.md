@@ -23,9 +23,12 @@ The pipeline stops a confident agent from quietly skipping the step that would h
 **Using anything else** — Cursor, Codex, Copilot, Gemini, Cline, Windsurf, Zed, Aider:
 
 ```sh
-git clone https://github.com/mdferdousalam/agentic-sdlc
-agentic-sdlc/bin/sdlc install        # detects your agents and sets each one up
+curl -fsSL https://raw.githubusercontent.com/mdferdousalam/agentic-sdlc/main/install.sh | sh
+sdlc install        # detects your agents and sets each one up
 ```
+
+Or with npm, if that is more your habit: `npx @mdferdousalam/agentic-sdlc install`.
+Either way you need `git` and Python 3.8 or newer — nothing else.
 
 It installs git hooks too, because on most hosts that is the only thing that can actually stop
 a mistake. [What each host can and cannot enforce](docs/platforms.md) — worth two minutes

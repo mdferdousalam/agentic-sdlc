@@ -11,13 +11,27 @@ prompt; they are a `PreToolUse` hook that exits non-zero.
 It is stack-agnostic through a single detected adapter file, and it speaks
 [OpenSpec](https://github.com/Fission-AI/OpenSpec) or plain PRD/FRD.
 
+**Claude Code**
+
 ```sh
 /plugin marketplace add mdferdousalam/agentic-sdlc
 /plugin install agentic-sdlc
-
 /agentic-sdlc:init --write          # detect the stack, write sdlc.config.json
 /agentic-sdlc:feature "2FA for the admin login"
 ```
+
+**Any other agent** — Cursor, Codex, Copilot, Gemini, Cline, Windsurf, Zed, Aider:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/mdferdousalam/agentic-sdlc/main/install.sh | sh
+#  or, if you prefer npm:   npx @mdferdousalam/agentic-sdlc install
+
+sdlc install     # detects your agents, sets each one up, adds the git hooks
+sdlc doctor      # what is configured and what is missing
+```
+
+Needs `git` and Python 3.8+. No Python dependencies, no account, no sudo. Prefer to read
+before you pipe? [`install.sh`](install.sh) is 60 lines and touches nothing in your repository.
 
 ## The pipeline
 
