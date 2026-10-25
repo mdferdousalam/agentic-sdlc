@@ -3,23 +3,11 @@
 All notable changes to this plugin. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the versioning is [semantic](https://semver.org/).
 
-## [2.2.0] — 2026-10-25
+## [2.3.0] — 2026-10-25
 
-A front door for everyone who is not using Claude Code. Until now the only one-command install
-was `/plugin install`; everybody else had to clone a repository and run a Python script. That,
-rather than any missing adapter, was what would have stopped other developers adopting this.
+Published through every package manager a developer is likely to already have.
 
 ### Added
-
-- **`install.sh`** — `curl -fsSL .../install.sh | sh`. Downloads a release into
-  `~/.agentic-sdlc`, links `sdlc` into a bin directory already on your PATH, and touches
-  nothing in your repository. No account, no sudo, no Python dependencies. It refuses to
-  proceed on Python older than 3.8 rather than failing later with something cryptic.
-- **npm package `@mdferdousalam/agentic-sdlc`** — `npx @mdferdousalam/agentic-sdlc install`.
-  Scoped because the unscoped name belongs to an unrelated project. The `bin` is a small Node
-  launcher rather than the Python file directly, so Windows gets a real shim instead of
-  depending on a shebang npm cannot honour there; it tries `python`, `py`, `python3` on Windows
-  and `python3`, `python` elsewhere, and says exactly what is missing if none works.
 
 - **More ways in.** `packaging/build-pypi.sh` builds a PyPI distribution
   (`agentic-sdlc-cli` — the unscoped `agentic-sdlc` is taken on PyPI too), staging the agents,
@@ -38,7 +26,37 @@ is **not run until Codex has been asked to trust it**. Untrusted, only `Stop` fi
 the prompt because a hook in your own `~/.codex/hooks.json` is already your configuration —
 that path is verified working, receipt-dependent push gate included.
 
-The PyPI wheel was installed into a clean virtualenv and run. Installing the packed npm
+The PyPI wheel was installed into a clean virtualenv and run. The Homebrew formula carries the
+real `v2.2.0` tarball checksum and is syntax-checked.
+
+### Fixed
+
+- The detected `secretScan` default used `gitleaks git … -n 50`, and gitleaks 8.x has no `-n`
+  shorthand on that subcommand — the gate's secret stage failed to run at all. It is now
+  `--log-opts="-n 50"`, with a regression test. Found by running this repository's own gate
+  against itself.
+
+## [2.2.0] — 2026-10-25
+
+A front door for everyone who is not using Claude Code. Until now the only one-command install
+was `/plugin install`; everybody else had to clone a repository and run a Python script. That,
+rather than any missing adapter, was what would have stopped other developers adopting this.
+
+### Added
+
+- **`install.sh`** — `curl -fsSL .../install.sh | sh`. Downloads a release into
+  `~/.agentic-sdlc`, links `sdlc` into a bin directory already on your PATH, and touches
+  nothing in your repository. No account, no sudo, no Python dependencies. It refuses to
+  proceed on Python older than 3.8 rather than failing later with something cryptic.
+- **npm package `@mdferdousalam/agentic-sdlc`** — `npx @mdferdousalam/agentic-sdlc install`.
+  Scoped because the unscoped name belongs to an unrelated project. The `bin` is a small Node
+  launcher rather than the Python file directly, so Windows gets a real shim instead of
+  depending on a shebang npm cannot honour there; it tries `python`, `py`, `python3` on Windows
+  and `python3`, `python` elsewhere, and says exactly what is missing if none works.
+
+### Verified
+
+Installing the packed npm
 tarball into a clean project and pushing: the generated `pre-push` hook
 refused an ungated push to `main`, and allowed it once a gate receipt existed. CI now checks
 the installer with `shellcheck`, that `package.json` and `plugin.json` agree on the version,

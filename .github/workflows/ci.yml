@@ -74,9 +74,11 @@ jobs:
           node -e "const p=require('./package.json');
             const fs=require('fs');
             if(!fs.existsSync(p.bin.sdlc)) throw new Error('bin path missing: '+p.bin.sdlc);
-            const pl=require('./.claude-plugin/plugin.json');
-            if(p.version!==pl.version) throw new Error('package.json '+p.version+' != plugin.json '+pl.version);
-            console.log('npm package ok, version '+p.version);"
+            for (const m of ['./.claude-plugin/plugin.json','./.codex-plugin/plugin.json','./gemini-extension.json']) {
+              const v=require(m).version;
+              if(v!==p.version) throw new Error(m+' is '+v+' but package.json is '+p.version);
+            }
+            console.log('all manifests agree on version '+p.version);"
       - name: the packed tarball runs
         run: |
           npm pack >/dev/null
