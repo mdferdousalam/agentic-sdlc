@@ -11,9 +11,9 @@
 class AgenticSdlc < Formula
   desc "Enforced agent-based SDLC pipeline for any coding agent"
   homepage "https://github.com/mdferdousalam/agentic-sdlc"
-  url "https://github.com/mdferdousalam/agentic-sdlc/archive/refs/tags/v2.2.0.tar.gz"
-  version "2.2.0"
-  sha256 "e497e0d12a5800d6434d6535e86905c759a07c3ce90d7ba1a43ee0b775ec735c"
+  url "https://github.com/mdferdousalam/agentic-sdlc/archive/refs/tags/v2.3.0.tar.gz"
+  version "2.3.0"
+  sha256 "ef1cdc5b1fd515c27dd27745b9653eaac4cdf5cca80eb6d2afa6f6366ce24b17"
   license "MIT"
 
   depends_on "python@3.12"
