@@ -40,6 +40,7 @@ AUDIT_LOG = ".sdlc/audit.log"
 FEEDBACK = ".sdlc/feedback.json"
 DEFAULT_MAX_AGE_MIN = 180
 FINDING_DIR = ".sdlc/findings"
+BASELINE = ".sdlc/baseline.json"
 
 # The finding vocabularies. Severity is how bad it is if real; confidence is how sure we are
 # that it is real. They are separate axes on purpose — see docs/control-spec.md §1.
@@ -320,6 +321,7 @@ def receipt_write(root: str, kind: str, verdict: str, subject: str, detail: str,
         "by": by,
         "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "treeClean": tree_clean(root),
+        "env": environment(root),
     }
     p = receipt_path(root, kind)
     os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -1319,6 +1321,210 @@ def cmd_feedback(args) -> int:
     return 0
 
 
+# ------------------------------------------------------------------- environment + baseline
+#
+# Two blind spots with one shape: the pipeline judged a change without knowing what the
+# repository looked like before it, and without knowing what produced the result. A test that
+# was already red gets blamed on the patch; a missing binary looks like a defect. Both are
+# answered by recording the starting state and comparing against it.
+
+_ENV_CACHE = None
+
+# Probed in this order; absent tools are simply not reported. Version flags differ, so each
+# names its own.
+VERSION_PROBES = (
+    ("git", ["git", "--version"]),
+    ("python", [sys.executable, "--version"]),
+    ("node", ["node", "--version"]),
+    ("npm", ["npm", "--version"]),
+    ("pnpm", ["pnpm", "--version"]),
+    ("yarn", ["yarn", "--version"]),
+    ("bun", ["bun", "--version"]),
+    ("cargo", ["cargo", "--version"]),
+    ("go", ["go", "version"]),
+    ("uv", ["uv", "--version"]),
+    ("java", ["java", "-version"]),
+)
+
+
+def environment(root: str = "") -> dict:
+    """Which toolchain produced this result. Probed once per process — these are subprocesses.
+
+    Without it, 'the tests failed' cannot be told apart from 'this machine cannot run them',
+    and an agent will spend its retries editing code to fix a missing binary.
+    """
+    global _ENV_CACHE
+    if _ENV_CACHE is not None:
+        return _ENV_CACHE
+    env = {"os": sys.platform, "arch": os.uname().machine if hasattr(os, "uname") else "?"}
+    for name, cmd in VERSION_PROBES:
+        if not which(cmd[0]) and cmd[0] != sys.executable:
+            continue
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            out = (r.stdout or r.stderr or "").strip().splitlines()
+            if out:
+                env[name] = re.sub(r"^[a-z]+ version |^v", "", out[0].strip())[:40]
+        except Exception:
+            pass
+    _ENV_CACHE = env
+    return env
+
+
+# Lines worth comparing between two runs: the ones a runner uses to say something went wrong.
+SIGNAL_RE = re.compile(
+    r"(?:^|\s)(?:error|errors?\[|fail(?:ed|ure|ures)?|warning|warn|panic|assert(?:ion)?|"
+    r"exception|traceback|FAILED|FAIL|✗|✕|×)\b", re.I)
+
+# Everything here changes between two runs of the same unchanged code, so it must not count as
+# a difference. Over-scrubbing can hide a real change, which is why the full output is kept.
+NOISE = (
+    (re.compile(r"\b\d+(\.\d+)?\s*(ms|s|sec|secs|seconds|m|min|minutes)\b", re.I), "<time>"),
+    (re.compile(r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}\S*"), "<ts>"),
+    (re.compile(r"0x[0-9a-fA-F]{4,}"), "<addr>"),
+    (re.compile(r"/(?:tmp|var/folders|private/var)/\S+"), "<tmp>"),
+    (re.compile(r":\d+:\d+"), ":<pos>"),
+    (re.compile(r"\b[0-9a-f]{7,40}\b"), "<sha>"),
+    (re.compile(r"\s+"), " "),
+)
+
+
+def signals(output: str) -> list:
+    """The normalised failure and warning lines in a command's output.
+
+    A heuristic over text, deliberately: parsing would mean a parser per test runner, and only
+    sdlc.config.json is allowed to know the stack.
+    """
+    out = []
+    for line in output.splitlines():
+        line = line.strip()
+        if not line or not SIGNAL_RE.search(line):
+            continue
+        for pat, rep in NOISE:
+            line = pat.sub(rep, line)
+        line = line.strip()
+        if line and line not in out:
+            out.append(line[:300])
+    return out
+
+
+def merge_base(root: str, cfg: dict) -> str:
+    trunk = cfg.get("trunk") or "main"
+    return (git("merge-base", "HEAD", f"origin/{trunk}", cwd=root)
+            or git("merge-base", "HEAD", trunk, cwd=root)
+            or git("rev-list", "--max-parents=0", "HEAD", cwd=root))
+
+
+def run_verify(root: str, cfg: dict):
+    cmd = cfg.get("gateCmd") or cfg.get("verifyCmd")
+    if not cmd:
+        return None, None, None
+    r = subprocess.run(cmd, shell=True, cwd=root, capture_output=True, text=True)
+    return cmd, r.returncode, (r.stdout or "") + (r.stderr or "")
+
+
+def cmd_baseline(args) -> int:
+    root = repo_root()
+    cfg = load_config(root)
+    p = os.path.join(root, BASELINE)
+
+    if args.baseline_action == "show":
+        if not os.path.exists(p):
+            print("no baseline — run `sdlc baseline capture` before starting work")
+            return 1
+        b = json.load(open(p))
+        print(f"captured {b['at']} at base {b['base'][:9]} on {b.get('branch')}")
+        print(f"  command   {b['cmd']}")
+        print(f"  exit      {b['exit']} ({'green' if b['exit'] == 0 else 'ALREADY FAILING'})")
+        print(f"  signals   {len(b['signals'])}")
+        for sig in b["signals"][:20]:
+            print(f"    {sig[:120]}")
+        return 0
+
+    if args.baseline_action == "capture":
+        cmd, code, out = run_verify(root, cfg)
+        if cmd is None:
+            print("no verifyCmd in the config — nothing to baseline. Without one nothing can "
+                  "be gated either; see `sdlc doctor`.", file=sys.stderr)
+            return 3
+        base = merge_base(root, cfg)
+        b = {
+            "base": base,
+            "branch": branch(root),
+            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "cmd": cmd,
+            "exit": code,
+            "signals": signals(out),
+            "output": out[-20000:],
+            "env": environment(root),
+        }
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as fh:
+            json.dump(b, fh, indent=2)
+            fh.write("\n")
+        audit(root, "baseline.capture", f"exit {code}, {len(b['signals'])} signals at {base[:9]}")
+        print(f"baseline captured at {base[:9]}: exit {code}, {len(b['signals'])} signal(s)")
+        if code != 0:
+            print("This repository was NOT green when the work started. That is worth knowing "
+                  "now rather than discovering it as a 'regression' later.")
+        return 0
+
+    # compare
+    if not os.path.exists(p):
+        print("no baseline: this comparison is `unexecuted`, not passed. Capture one at the "
+              "branch point with `sdlc baseline capture`.", file=sys.stderr)
+        return 1
+    b = json.load(open(p))
+    cmd, code, out = run_verify(root, cfg)
+    if cmd is None:
+        print("no verifyCmd in the config", file=sys.stderr)
+        return 3
+    now = signals(out)
+    was = b["signals"]
+    new = [x for x in now if x not in was]
+    gone = [x for x in was if x not in now]
+    kept = [x for x in now if x in was]
+
+    # A baseline goes stale when its base is no longer behind us — a rebase, or a trunk that
+    # moved under the branch. It does NOT go stale merely because we committed: that is the
+    # whole difference between a baseline and a receipt.
+    still_behind = subprocess.run(["git", "merge-base", "--is-ancestor", b["base"], "HEAD"],
+                                  cwd=root, capture_output=True).returncode == 0
+    if not still_behind:
+        print(f"note: the baseline's base {b['base'][:9]} is no longer an ancestor of HEAD — "
+              f"the branch was rebased or the trunk moved. Recapture it.")
+    env_now = environment(root)
+    drift = [k for k in env_now if k in b.get("env", {}) and env_now[k] != b["env"][k]]
+    if drift:
+        print(f"note: the toolchain changed since the baseline ({', '.join(drift)}). A failure "
+              f"may belong to the environment rather than to the change.")
+
+    print(f"baseline {b['exit']} -> now {code}   "
+          f"{len(new)} new, {len(kept)} pre-existing, {len(gone)} fixed")
+    if new:
+        print("\nNEW since the baseline — these belong to this change:")
+        for x in new[:30]:
+            print(f"  {x[:160]}")
+    if kept:
+        print(f"\nPre-existing ({len(kept)}) — already there before the work started, "
+              f"not caused by it:")
+        for x in kept[:10]:
+            print(f"  {x[:160]}")
+    if gone:
+        print(f"\nFixed ({len(gone)}) — present at the baseline, gone now.")
+    audit(root, "baseline.compare", f"{len(new)} new, {len(kept)} pre-existing, {len(gone)} fixed")
+    if new or (code != 0 and b["exit"] == 0):
+        print("\nVerdict: this change introduced failures. Fix those; leave the pre-existing "
+              "ones alone unless the specification asked for them.")
+        return 1
+    if code != 0:
+        print("\nVerdict: still failing, but with nothing new. The failures predate this work — "
+              "do not spend attempts on them, and do not report them as caused by the change.")
+        return 0
+    print("\nVerdict: nothing new.")
+    return 0
+
+
 # ---------------------------------------------------------------------------------- findings
 #
 # A finding is a claim about the code. Prose carries the argument; this carries the parts that
@@ -1808,6 +2014,13 @@ def main() -> int:
     fc.add_argument("--commit", default="")
     fc.add_argument("--detail", default="")
     fd.set_defaults(fn=cmd_finding)
+
+    bl = sub.add_parser("baseline", help="what was already broken before the work started")
+    bls = bl.add_subparsers(dest="baseline_action", required=True)
+    bls.add_parser("capture", help="record the verify result at the branch point")
+    bls.add_parser("compare", help="classify each failure as new, pre-existing or fixed")
+    bls.add_parser("show", help="what was captured, and when")
+    bl.set_defaults(fn=cmd_baseline)
 
     args = ap.parse_args()
     return args.fn(args)

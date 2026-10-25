@@ -33,7 +33,30 @@ The only component allowed to create a branch, and it checks the approval mechan
 (`sdlc receipt check spec --verdict approved`) rather than believing a transcript. Refuses on a
 dirty tree rather than stashing anything.
 
-**Exit:** a branch cut from an up-to-date trunk, and a draft pull request where a remote exists.
+It also captures the **baseline**: what `verifyCmd` said about the repository as it was found.
+This is the only moment that can be recorded honestly, and everything downstream depends on it.
+A failure afterwards is then attributable — `new`, `pre-existing` or `fixed` — instead of being
+blamed on whoever is holding the diff. A repository that was already red is a fact to report,
+not a reason to stop.
+
+Unlike a receipt, a baseline is keyed to the base commit and survives every commit on the
+branch. A receipt that outlived a commit would be a lie; a baseline that did not would be
+useless by the second commit.
+
+**Exit:** a branch cut from an up-to-date trunk, a captured baseline, and a draft pull request
+where a remote exists.
+
+## 3b · Impact — `sdlc-impact-analyst`
+
+Reads the specification, not a diff, and asks the question no other stage asks: **who else
+depends on this?** Call sites, published interfaces, schemas, consumers, the migrations they
+imply and the order those must happen in, and what is irreversible. Read-only.
+
+It also states what a textual search cannot see — dynamic dispatch, reflection, another
+repository, a consumer that only exists in production traffic — because an impact report that
+implies completeness is worse than none: the gate will trust it.
+
+**Exit:** a dependents report, and a finding for anything blocking.
 
 ## 4 · Implement — `sdlc-implementer`
 

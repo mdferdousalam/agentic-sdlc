@@ -401,6 +401,62 @@ ok("quality.cmd" in run(["doctor"], df).stdout, "doctor says when the budget is 
 
 shutil.rmtree(df, ignore_errors=True)
 
+print("baseline: a failure is attributed, not assumed")
+CHECK = """#!/bin/sh
+echo "ok   suite A"
+%s
+echo "done in 1.4s"
+exit %s
+"""
+db = newrepo(files={"check.sh": CHECK % ('echo "FAIL test_legacy: expected 3 got 4"', "1")},
+             config={"trunk": "main", "spec": {"engine": "prd-frd"}, "verifyCmd": "sh check.sh"})
+
+
+def setcheck(body, code):
+    open(os.path.join(db, "check.sh"), "w").write(CHECK % (body, code))
+
+
+ok(run(["baseline", "compare"], db).returncode != 0,
+   "no baseline is not a pass — comparing without one fails loudly")
+r = run(["baseline", "capture"], db)
+ok(r.returncode == 0 and "NOT green" in r.stdout,
+   "capture records that the repository was already failing")
+
+r = run(["baseline", "compare"], db)
+ok(r.returncode == 0 and "0 new" in r.stdout,
+   "a pre-existing failure is not blamed on the change")
+ok("not caused by it" in r.stdout, "and it says so in words, not just in a count")
+
+# Same failure, different timing and a different line:column. Neither is a change.
+setcheck('echo "FAIL test_legacy: expected 3 got 4"\necho "elapsed 88.2s at src/a.rs:99:12"', "1")
+ok("0 new" in run(["baseline", "compare"], db).stdout,
+   "timings and line positions are noise, not regressions")
+
+setcheck('echo "FAIL test_legacy: expected 3 got 4"\necho "FAIL test_new: nil at 0xabcdef12"', "1")
+r = run(["baseline", "compare"], db)
+ok(r.returncode != 0 and "1 new" in r.stdout, "a newly introduced failure is blocking")
+ok("test_new" in r.stdout, "and it is named")
+
+setcheck("", "0")
+r = run(["baseline", "compare"], db)
+ok(r.returncode == 0 and "fixed" in r.stdout.lower(), "a failure that went away is noticed")
+
+print("baseline: it survives commits, unlike a receipt")
+subprocess.run(["git", "add", "check.sh"], cwd=db)
+subprocess.run(["git", "commit", "-qm", "wip"], cwd=db)
+ok(run(["baseline", "show"], db).returncode == 0, "a commit does not void the baseline")
+ok("no longer an ancestor" not in run(["baseline", "compare"], db).stdout,
+   "committing is not mistaken for a rebase")
+
+print("environment: a verdict records what produced it")
+run(["receipt", "write", "gate", "--verdict", "passed", "--detail", "x"], db)
+rec = json.load(open(os.path.join(db, ".sdlc/receipts/gate.json")))
+ok(isinstance(rec.get("env"), dict) and "git" in rec["env"],
+   "every receipt carries the toolchain that produced it")
+ok("os" in rec["env"] and "arch" in rec["env"], "including the platform it ran on")
+
+shutil.rmtree(db, ignore_errors=True)
+
 for x in (d, d2, d3, home):
     shutil.rmtree(x, ignore_errors=True)
 

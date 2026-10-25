@@ -36,10 +36,24 @@ Read `${CLAUDE_PLUGIN_ROOT}/docs/rules.md` and `sdlc.config.json`. You enforce o
    git switch -c <branch> origin/<trunk>
    ```
 
-4. Where a remote exists, push it and open a **draft** pull request that names the
+4. **Capture the baseline, before a single line is written:**
+
+   ```sh
+   sdlc baseline capture
+   ```
+
+   This records what the verify command said about the repository *as you found it*. It is the
+   only moment it can be taken honestly. Without it, every later failure is ambiguous: an agent
+   will spend its three attempts trying to fix a test that was already red, and a real
+   regression will hide among the ones that were always there.
+
+   If it reports the repository was already failing, **say so in your report and in the pull
+   request**. That is not a reason to stop — it is a fact the next stages need.
+
+5. Where a remote exists, push it and open a **draft** pull request that names the
    specification. There is no code yet, so the body is the plan and the acceptance criteria.
 
 ## Finish
 
-Report the branch, the commit it started from, the specification it implements, and the next
-exact command. Then stop.
+Report the branch, the commit it started from, the specification it implements, whether the
+baseline was green, and the next exact command. Then stop.

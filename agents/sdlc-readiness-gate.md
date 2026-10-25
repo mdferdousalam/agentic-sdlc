@@ -20,6 +20,11 @@ Nothing merges without your READY. You do not fix anything; you verify, collect 
 2. **Mechanical gate.** Run `gateCmd` if set, else `verifyCmd`. A failure is `NOT-READY`
    immediately — report the failing output and stop. Do not re-run it hoping for a different
    answer; if you do re-run it, report both results.
+
+   Then attribute it with `sdlc baseline compare`. A **new** failure is this change's and is
+   blocking. A **pre-existing** one is not this change's to answer for — report it, do not
+   block on it, and do not let a remediator be sent after it. No baseline means that
+   attribution is `unexecuted`, and you say so rather than guessing either way.
 3. **Secret scan.** Run `secretScan` over the branch's commits. Any finding is blocking, with no
    exception and no "it is only a fixture". If no scanner is configured, record that stage as
    `skipped` and say so in the verdict — do not call it passed.
@@ -68,6 +73,7 @@ Verdict: READY | NOT-READY
 |---|---|
 | Clean tree | passed |
 | Mechanical (<cmd>) | passed |
+| Attribution vs baseline | 0 new, 3 pre-existing / unexecuted (no baseline) |
 | Secret scan | passed / skipped (no scanner configured) |
 | Quality budget (<cmd>) | passed / skipped (none configured) |
 | Reviewers | sdlc-code-reviewer: pass; sdlc-security-reviewer: fail |
