@@ -94,6 +94,17 @@ The same hook also refuses `git stash`, `reset --hard`, `clean`, `checkout -- .`
 `commit -a`, force-push, `tag`, every `publish`, `gh release`, `docker push`, and reading a
 credential file. Each refusal explains itself and names the route that is allowed.
 
+**A ceiling an agent cannot raise.** Set `budget.maxToolCalls` or `budget.maxWallClockMin` and
+the hook stops the task when it is reached. This cannot see your host's token meter — nothing
+inside your repository can — so it counts what it can observe and refuses, which is worth more
+than a number that describes the overspend afterwards.
+
+**And the gate cannot be lowered to pass itself.** `sdlc tests audit` reads the diff for
+deleted tests, removed assertions, new skip markers, new suppression comments and lowered
+thresholds. Every agent prompt already forbids these; this is the part that does not negotiate.
+The readiness gate runs it, and so does the remediator — on its own work, because it is the
+stage most tempted.
+
 This cannot make a dishonest verdict honest — nothing can. It makes a **skipped** stage
 impossible, which is the failure that actually happens.
 

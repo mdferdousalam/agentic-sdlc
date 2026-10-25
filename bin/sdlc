@@ -41,6 +41,8 @@ FEEDBACK = ".sdlc/feedback.json"
 DEFAULT_MAX_AGE_MIN = 180
 FINDING_DIR = ".sdlc/findings"
 BASELINE = ".sdlc/baseline.json"
+BUDGET = ".sdlc/budget.json"
+CHECKPOINT = ".sdlc/checkpoint.json"
 
 # The finding vocabularies. Severity is how bad it is if real; confidence is how sure we are
 # that it is real. They are separate axes on purpose — see docs/control-spec.md §1.
@@ -503,6 +505,12 @@ def guard_problem(root: str, command: str, cfg: dict) -> str | None:
                             f"A person runs:  sdlc approve merge --as '<their name>'\n"
                             f"An agent must not run it for them — the approval records who is "
                             f"accountable, and an agent approving its own work records nothing.")
+
+    # X7: a ceiling the agent cannot raise for itself. Checked last, so a destructive command
+    # is still refused for the right reason when the budget also happens to be spent.
+    over = budget_problem(root, cfg)
+    if over:
+        return over
 
     # Deployment is a separate authority from merging, and defaults to a human's.
     deploying = any(re.search(pat, command) for pat in DEPLOY_PATTERNS)
@@ -1361,6 +1369,342 @@ def cmd_feedback(args) -> int:
     return 0
 
 
+# ------------------------------------------------------------------- budget and checkpoints
+#
+# X5 and X7: an agent that cannot stop is a cost centre with a git token. X10: a long task that
+# crashes halfway must not leave a half-applied refactor nobody can reason about.
+#
+# The honest limit, stated once: this process cannot see the host's token meter. It counts what
+# it can observe — tool calls through the hook, wall-clock since the task began, and repair
+# attempts — and refuses when a ceiling is reached. A ceiling that stops the work is worth more
+# than a token count that only describes it afterwards.
+
+DEFAULT_BUDGET = {"maxToolCalls": 0, "maxWallClockMin": 0, "maxRetries": 3, "stopPolicy": "refuse"}
+
+
+def budget_config(cfg: dict) -> dict:
+    b = dict(DEFAULT_BUDGET)
+    b.update(cfg.get("budget") or {})
+    return b
+
+
+def budget_state(root: str) -> dict:
+    try:
+        return json.load(open(os.path.join(root, BUDGET)))
+    except Exception:
+        return {"toolCalls": 0, "startedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "task": branch(root)}
+
+
+def budget_save(root: str, st: dict) -> None:
+    try:
+        p = os.path.join(root, BUDGET)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as fh:
+            json.dump(st, fh, indent=2)
+    except Exception:
+        pass
+
+
+def budget_problem(root: str, cfg: dict) -> str | None:
+    """Why this task must stop now, or None. Counts one tool call as a side effect."""
+    b = budget_config(cfg)
+    if not (b.get("maxToolCalls") or b.get("maxWallClockMin")):
+        return None
+    st = budget_state(root)
+    if st.get("task") != branch(root):  # a new branch is a new task
+        st = {"toolCalls": 0, "startedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+              "task": branch(root)}
+    st["toolCalls"] = st.get("toolCalls", 0) + 1
+    budget_save(root, st)
+
+    limit = int(b.get("maxToolCalls") or 0)
+    if limit and st["toolCalls"] > limit:
+        return (f"this task has made {st['toolCalls']} tool calls and the budget is {limit}.\n"
+                f"Stop and report what is done, what is left and what it would cost. "
+                f"A person raises the ceiling in sdlc.config.json; an agent does not raise "
+                f"its own.\nReset with:  sdlc budget reset")
+    mins = int(b.get("maxWallClockMin") or 0)
+    if mins:
+        try:
+            began = calendar.timegm(time.strptime(st["startedAt"], "%Y-%m-%dT%H:%M:%SZ"))
+            spent = (time.time() - began) / 60
+            if spent > mins:
+                return (f"this task has run for {int(spent)} minutes and the budget is {mins}.\n"
+                        f"Stop and report. Reset with:  sdlc budget reset")
+        except Exception:
+            pass
+    return None
+
+
+def cmd_budget(args) -> int:
+    root = repo_root()
+    cfg = load_config(root)
+    b, st = budget_config(cfg), budget_state(root)
+    if args.budget_action == "reset":
+        budget_save(root, {"toolCalls": 0, "task": branch(root),
+                           "startedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+        audit(root, "budget.reset", f"by {args.as_person or 'agent'}")
+        print("budget reset for this task")
+        return 0
+    spent_min = ""
+    try:
+        began = calendar.timegm(time.strptime(st["startedAt"], "%Y-%m-%dT%H:%M:%SZ"))
+        spent_min = f"{int((time.time() - began) / 60)} min"
+    except Exception:
+        pass
+    print(f"task        {st.get('task')}")
+    print(f"tool calls  {st.get('toolCalls', 0)}" +
+          (f" of {b['maxToolCalls']}" if b.get("maxToolCalls") else " (no ceiling set)"))
+    print(f"elapsed     {spent_min}" +
+          (f" of {b['maxWallClockMin']} min" if b.get("maxWallClockMin") else " (no ceiling set)"))
+    print(f"retries     ceiling {b.get('maxRetries')}")
+    if not (b.get("maxToolCalls") or b.get("maxWallClockMin")):
+        print("\nNo ceiling is set, so nothing will stop a runaway task. Set budget.maxToolCalls "
+              "or budget.maxWallClockMin in sdlc.config.json.")
+    return 0
+
+
+def cmd_checkpoint(args) -> int:
+    """A resumable record of a long task.
+
+    The hard part of resuming is not storing the plan; it is knowing whether the plan still
+    applies. So a checkpoint records the repository state it assumed, and resuming re-checks it
+    — the same discipline receipts use, for the same reason.
+    """
+    root = repo_root()
+    p = os.path.join(root, CHECKPOINT)
+
+    if args.checkpoint_action == "write":
+        c = {
+            "task": args.task or branch(root),
+            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "commit": head(root),
+            "branch": branch(root),
+            "treeClean": tree_clean(root),
+            "done": args.done or [],
+            "next": args.next_step or "",
+            "note": args.note or "",
+            "files": {},
+            "env": environment(root),
+        }
+        for rel in (args.file or []):
+            d = subject_digest(root, rel)
+            if d:
+                c["files"][rel] = d
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as fh:
+            json.dump(c, fh, indent=2)
+            fh.write("\n")
+        audit(root, "checkpoint.write", f"{c['task']}: {args.next_step or ''}")
+        print(f"checkpoint at {c['commit'][:9]}: {len(c['done'])} step(s) done, "
+              f"next: {c['next'] or '(unstated)'}")
+        if not c["treeClean"]:
+            print("note: the tree was dirty when this was taken, so resuming cannot verify "
+                  "the uncommitted part. Commit before checkpointing if you can.")
+        return 0
+
+    if not os.path.exists(p):
+        print("no checkpoint — this is the first attempt at this task")
+        return 1
+    c = json.load(open(p))
+
+    if args.checkpoint_action == "show":
+        print(json.dumps(c, indent=2))
+        return 0
+
+    # resume: a checkpoint is not automatically safe to resume
+    problems = []
+    if c.get("branch") != branch(root):
+        problems.append(f"it was taken on branch {c.get('branch')}, you are on {branch(root)}")
+    if c.get("commit") != head(root):
+        behind = subprocess.run(["git", "merge-base", "--is-ancestor", c["commit"], "HEAD"],
+                                cwd=root, capture_output=True).returncode == 0
+        problems.append(f"HEAD has moved to {head(root)[:9]}" +
+                        ("" if behind else " and the checkpoint's commit is not behind it — "
+                                           "the history was rewritten"))
+    for rel, digest in (c.get("files") or {}).items():
+        now = subject_digest(root, rel)
+        if now is None:
+            problems.append(f"{rel} no longer exists")
+        elif now != digest:
+            problems.append(f"{rel} changed since the checkpoint")
+    env_now = environment(root)
+    drift = [k for k in env_now if k in c.get("env", {}) and env_now[k] != c["env"][k]]
+    if drift:
+        problems.append(f"the toolchain changed ({', '.join(drift)})")
+
+    print(f"# Resuming {c['task']} — checkpointed {c['at']} at {c['commit'][:9]}\n")
+    if c.get("done"):
+        print("Already done, do not repeat:")
+        for step in c["done"]:
+            print(f"  - {step}")
+    print(f"\nNext: {c.get('next') or '(unstated)'}")
+    if c.get("note"):
+        print(f"Note: {c['note']}")
+    if problems:
+        print("\nThe repository is NOT in the state this checkpoint assumed:")
+        for why in problems:
+            print(f"  - {why}")
+        print("\nRe-establish the facts before editing anything. A checkpoint is a record of "
+              "what was true, not a licence to carry on as if it still is.")
+        audit(root, "checkpoint.resume", f"stale: {len(problems)} mismatch(es)")
+        return 1
+    print("\nThe repository matches what this checkpoint assumed. Safe to continue.")
+    audit(root, "checkpoint.resume", "clean")
+    return 0
+
+
+# --------------------------------------------------------------------------- suite integrity
+#
+# The one failure this whole pipeline exists to prevent: making the gate pass by lowering it.
+# Every agent prompt forbids deleting a test, weakening an assertion, suppressing a warning or
+# excluding a path — and a prompt is a request. This is the check that does not negotiate.
+#
+# It reads the diff textually, so it is a heuristic and says so. It is deliberately tuned to
+# over-report: a false positive costs one sentence of explanation in the pull request, and a
+# false negative costs a silently disarmed test suite.
+
+TEST_PATH_RE = re.compile(
+    r"(^|/)(tests?|spec|specs|__tests__|testdata)/|[._-](test|spec)\.[a-z]+$|_test\.|"
+    r"(^|/)test_[^/]+\.py$", re.I)
+
+# A line that declares a test. Losing one is losing a check.
+TEST_DECL = re.compile(
+    r"\b(def\s+test_\w+|func\s+Test\w+|#\[test\]|#\[tokio::test\]|@Test\b|"
+    r"\b(it|test|describe|context)\s*\(|\bTEST(_F|_P)?\s*\()", re.I)
+
+# A line that asserts something. Losing one usually means the test now proves less.
+ASSERT_RE = re.compile(
+    r"\b(assert\w*|expect|should|require\.\w+|must\w*|verify|ok\(|t\.(Error|Fatal)\w*)\b",
+    re.I)
+
+# A marker that stops a test running, or runs only one. Added, these are how a suite goes quiet.
+SKIP_ADDED = (
+    (re.compile(r"\.(skip|only)\s*\(|\bx(it|describe|test)\s*\("), "a test is skipped or isolated"),
+    (re.compile(r"@pytest\.mark\.(skip|xfail)"), "a test is skipped or expected to fail"),
+    (re.compile(r"\bt\.Skip\w*\("), "a Go test skips itself"),
+    (re.compile(r"#\[ignore\]"), "a Rust test is ignored"),
+    (re.compile(r"@(Disabled|Ignore)\b"), "a JVM test is disabled"),
+    (re.compile(r"\breturn\s*;?\s*//\s*(TODO|FIXME|skip)", re.I), "a test returns early"),
+)
+
+# Silencing a tool rather than satisfying it.
+SUPPRESS_ADDED = (
+    (re.compile(r"eslint-disable(-next-line)?"), "an eslint rule is disabled"),
+    (re.compile(r"#\s*noqa|#\s*type:\s*ignore|#\s*pylint:\s*disable"), "a Python check is silenced"),
+    (re.compile(r"#\[allow\("), "a Rust lint is allowed"),
+    (re.compile(r"//\s*nolint|//lint:ignore"), "a Go linter is silenced"),
+    (re.compile(r"@SuppressWarnings|@ts-(ignore|expect-error|nocheck)"), "a type or compiler check is suppressed"),
+    (re.compile(r"\bcontinue-on-error:\s*true"), "a CI step is allowed to fail"),
+    (re.compile(r"\|\|\s*true\s*$"), "a command's failure is swallowed"),
+)
+
+NUM_SETTING = re.compile(r"([A-Za-z_][\w.\- ]{2,40})\s*[:=]\s*(\d{1,3})(?:\.\d+)?\s*%?\s*$")
+
+
+def diff_lines(root: str, base: str):
+    """(path, added, removed) per file in the diff against base."""
+    out, path, added, removed, oldpath = [], None, [], [], None
+    raw = git("diff", "--unified=0", f"{base}...HEAD", cwd=root) or \
+        git("diff", "--unified=0", base, cwd=root)
+    for line in raw.splitlines():
+        if line.startswith("--- "):
+            # Remembered because a deleted file's +++ is /dev/null, and its removed lines
+            # would otherwise be attributed to whichever file came before it in the diff.
+            oldpath = line[6:] if line.startswith("--- a/") else None
+        elif line.startswith("+++ "):
+            if path:
+                out.append((path, added, removed))
+            new_path = line[6:] if line.startswith("+++ b/") else None
+            path, added, removed = (new_path or oldpath), [], []
+        elif line.startswith("+") and not line.startswith("+++"):
+            added.append(line[1:])
+        elif line.startswith("-") and not line.startswith("---"):
+            removed.append(line[1:])
+    if path:
+        out.append((path, added, removed))
+    return out
+
+
+def suite_findings(root: str, base: str) -> list:
+    """Everything in this diff that makes the gate easier to pass."""
+    found = []
+
+    for path in (git("diff", "--name-only", "--diff-filter=D", f"{base}...HEAD", cwd=root)
+                 or "").splitlines():
+        if path and TEST_PATH_RE.search(path):
+            found.append((path, 0, "a test file was deleted", path))
+
+    for path, added, removed in diff_lines(root, base):
+        is_test = TEST_PATH_RE.search(path or "")
+        if is_test:
+            lost = sum(1 for l in removed if TEST_DECL.search(l))
+            gained = sum(1 for l in added if TEST_DECL.search(l))
+            if lost > gained:
+                found.append((path, 0, f"{lost - gained} test(s) removed and not replaced",
+                              next(l.strip() for l in removed if TEST_DECL.search(l))))
+            lost_a = sum(1 for l in removed if ASSERT_RE.search(l))
+            gained_a = sum(1 for l in added if ASSERT_RE.search(l))
+            if lost_a - gained_a >= 2:
+                found.append((path, 0, f"{lost_a - gained_a} assertion(s) removed and not "
+                                       f"replaced — the test may now prove less",
+                              next(l.strip() for l in removed if ASSERT_RE.search(l))))
+        for line in added:
+            for pat, why in SKIP_ADDED:
+                if pat.search(line):
+                    found.append((path, 0, why, line.strip()))
+                    break
+            for pat, why in SUPPRESS_ADDED:
+                if pat.search(line):
+                    found.append((path, 0, why, line.strip()))
+                    break
+
+        # A threshold that went down. Same key, smaller number, same file.
+        was = {}
+        for line in removed:
+            m = NUM_SETTING.search(line.strip())
+            if m:
+                was[m.group(1).strip().lower()] = int(m.group(2))
+        for line in added:
+            m = NUM_SETTING.search(line.strip())
+            if m:
+                key = m.group(1).strip().lower()
+                if key in was and int(m.group(2)) < was[key]:
+                    found.append((path, 0, f"a threshold was lowered: {key} "
+                                           f"{was[key]} -> {m.group(2)}", line.strip()))
+    return found
+
+
+def cmd_tests(args) -> int:
+    root = repo_root()
+    cfg = load_config(root)
+    base = args.base or merge_base(root, cfg)
+    found = suite_findings(root, base)
+
+    if not found:
+        print(f"suite integrity: nothing in this diff weakens a check (against {base[:9]})")
+        return 0
+
+    print(f"suite integrity: {len(found)} thing(s) in this diff make the gate easier to pass\n")
+    for path, _, why, evidence in found:
+        print(f"  {path}")
+        print(f"    {why}")
+        print(f"    > {evidence[:150]}")
+    print("\nEach of these may be correct. None of them is correct *by default*, and none may")
+    print("pass without a sentence in the commit message saying why. Deleting a failing test,")
+    print("weakening an assertion, skipping a case or lowering a threshold to make the gate")
+    print("pass is the one failure this pipeline exists to prevent.")
+    print("\nIf a suppression is genuinely the right resolution, say so in the commit and")
+    print("re-run with --acknowledge to record that a human decision was made.")
+    audit(root, "suite.weakened", f"{len(found)} weakening change(s) against {base[:9]}")
+
+    if args.acknowledge:
+        print("\nAcknowledged — recorded, not waived. The reviewers still see it.")
+        return 0
+    return 1
+
+
 # ------------------------------------------------------------------- environment + baseline
 #
 # Two blind spots with one shape: the pipeline judged a change without knowing what the
@@ -2061,6 +2405,33 @@ def main() -> int:
     bls.add_parser("compare", help="classify each failure as new, pre-existing or fixed")
     bls.add_parser("show", help="what was captured, and when")
     bl.set_defaults(fn=cmd_baseline)
+
+    ts = sub.add_parser("tests", help="has this diff made the gate easier to pass?")
+    tss = ts.add_subparsers(dest="tests_action", required=True)
+    ta = tss.add_parser("audit", help="deleted tests, weakened assertions, skips, suppressions")
+    ta.add_argument("--base", default="", help="compare against this ref instead of the merge base")
+    ta.add_argument("--acknowledge", action="store_true",
+                    help="record that a human decided each of these is correct")
+    ts.set_defaults(fn=cmd_tests)
+
+    bg = sub.add_parser("budget", help="what this task has spent, and its ceiling")
+    bgs = bg.add_subparsers(dest="budget_action", required=True)
+    bgs.add_parser("show")
+    bgr = bgs.add_parser("reset", help="a person clears the counter for this task")
+    bgr.add_argument("--as", dest="as_person", default="")
+    bg.set_defaults(fn=cmd_budget)
+
+    cp = sub.add_parser("checkpoint", help="resume a long task without assuming it is safe to")
+    cps = cp.add_subparsers(dest="checkpoint_action", required=True)
+    cw = cps.add_parser("write")
+    cw.add_argument("--task", default="")
+    cw.add_argument("--done", action="append", help="a step already finished; repeatable")
+    cw.add_argument("--next", dest="next_step", default="", help="the next step")
+    cw.add_argument("--note", default="")
+    cw.add_argument("--file", action="append", help="a file whose state this assumes; repeatable")
+    cps.add_parser("resume", help="re-check the assumptions before continuing")
+    cps.add_parser("show")
+    cp.set_defaults(fn=cmd_checkpoint)
 
     args = ap.parse_args()
     return args.fn(args)

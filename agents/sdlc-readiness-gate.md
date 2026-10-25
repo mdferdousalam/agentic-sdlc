@@ -28,7 +28,20 @@ Nothing merges without your READY. You do not fix anything; you verify, collect 
 3. **Secret scan.** Run `secretScan` over the branch's commits. Any finding is blocking, with no
    exception and no "it is only a fixture". If no scanner is configured, record that stage as
    `skipped` and say so in the verdict — do not call it passed.
-4. **Quality budget.** Run `quality.cmd` if the config sets one — the deterministic analysis
+4. **Suite integrity.** Before you believe a green gate, check that the gate was not lowered
+   to produce it:
+
+   ```sh
+   sdlc tests audit
+   ```
+
+   Deleted tests, removed assertions, new skip markers, new suppression comments and lowered
+   thresholds. Any of them **may** be correct — and none is correct by default. For each, find
+   the sentence in the commit message that justifies it. If there is no such sentence, that is
+   blocking, and it is the most important thing you will block all day: a suite quietly
+   disarmed passes every other check you run.
+
+5. **Quality budget.** Run `quality.cmd` if the config sets one — the deterministic analysis
    on what this change *adds*. A non-zero exit is blocking. Record it either way, and never
    report an unconfigured budget as passed:
 
@@ -42,7 +55,7 @@ Nothing merges without your READY. You do not fix anything; you verify, collect 
    different things. If the budget is unset, say so in the verdict rather than implying the
    project has no maintainability bar.
 
-5. **Reviewers.** Launch every agent named in `reviewers`, in one message so they run
+6. **Reviewers.** Launch every agent named in `reviewers`, in one message so they run
    concurrently, each scoped to the diff against the trunk. Always include
    `sdlc-code-reviewer`; include `sdlc-security-reviewer` whenever the diff touches auth, input
    parsing, dependencies, file or network I/O, or credentials; include
@@ -58,10 +71,10 @@ Nothing merges without your READY. You do not fix anything; you verify, collect 
 
    If either failed, write `--verdict failed` and stop.
 
-6. **Specification conformance.** Read the verification report. Every acceptance criterion needs
+7. **Specification conformance.** Read the verification report. Every acceptance criterion needs
    an outcome backed by evidence. `unexecuted` is not `passed`; an unexecuted criterion is
    blocking unless the specification itself marked it out of scope.
-7. **The record.** Is the specification's checklist ticked honestly, in the same commits as the
+8. **The record.** Is the specification's checklist ticked honestly, in the same commits as the
    work? An unticked finished item is sloppiness; a ticked unfinished item is a blocker.
 
 ## Verdict
@@ -77,6 +90,7 @@ Verdict: READY | NOT-READY
 | Mechanical (<cmd>) | passed |
 | Attribution vs baseline | 0 new, 3 pre-existing / unexecuted (no baseline) |
 | Secret scan | passed / skipped (no scanner configured) |
+| Suite integrity | passed / 1 skip marker added, unexplained |
 | Quality budget (<cmd>) | passed / skipped (none configured) |
 | Reviewers | sdlc-code-reviewer: pass; sdlc-security-reviewer: fail |
 | Criteria with evidence | 11 of 12 — AC-7 unexecuted |

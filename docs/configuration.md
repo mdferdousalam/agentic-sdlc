@@ -27,6 +27,7 @@ Also read from `.opencode/sdlc.json` if you prefer to keep it out of the reposit
 | `receipts.maxAgeMin` | integer | How long a receipt stays valid. Default 180. |
 | `enforce.*` | boolean | What the hook refuses. See below. |
 | `neverByAgent` | string[] | Actions reserved to a human, stated for the agents to read. |
+| `budget.*` | object | Ceilings an agent cannot raise for itself: `maxToolCalls`, `maxWallClockMin`, `maxRetries`, `stopPolicy`. Unset means nothing stops a runaway task. |
 
 ## `enforce`
 
@@ -41,6 +42,31 @@ Also read from `.opencode/sdlc.json` if you prefer to keep it out of the reposit
 
 Turning one off is legitimate — a solo prototype may not want a gate — but do it in the config,
 where it is visible and reviewable, not by arguing with the agent.
+
+## Budgets, checkpoints and suite integrity
+
+```sh
+sdlc budget show                 # what this task has spent against its ceiling
+sdlc budget reset --as 'name'    # a person clears it; an agent does not raise its own ceiling
+sdlc tests audit                 # has this diff made the gate easier to pass?
+sdlc checkpoint write --done "parser" --next "the formatter" --file src/parse.rs
+sdlc checkpoint resume           # re-checks the assumptions before continuing
+```
+
+`budget` is the honest half of cost control: this process cannot see your host's token meter,
+so it counts what it can observe — tool calls through the hook, wall-clock since the task
+began, and repair attempts — and **refuses** at the ceiling. A ceiling that stops the work is
+worth more than a token count that describes it afterwards.
+
+`sdlc tests audit` is the mechanical form of the rule every agent prompt already states: do not
+delete a test, weaken an assertion, add a skip marker, suppress a warning or lower a threshold
+to make the gate pass. It reads the diff, so it over-reports by design — a false positive costs
+one sentence in the pull request, a false negative costs a silently disarmed suite.
+
+`sdlc checkpoint` stores a long task's progress *and the repository state it assumed*.
+`resume` re-checks that state — branch, commit, file digests, toolchain — before saying it is
+safe to continue, because a checkpoint is a record of what was true, not a licence to carry on
+as if it still is.
 
 ## Receipts
 

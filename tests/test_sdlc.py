@@ -506,6 +506,99 @@ ok(not missing, f"no agent or profile cites a rule the table lacks (missing: {mi
 for x in (dc, dq):
     shutil.rmtree(x, ignore_errors=True)
 
+print("suite integrity: the gate cannot be lowered to pass itself")
+dt = newrepo(files={
+    "tests/test_core.py": "def test_a():\n    assert f(1) == 2\n    assert f(2) == 3\n\n"
+                          "def test_b():\n    assert g() is None\n",
+    "tests/test_edge.py": "def test_edge():\n    assert h(0) == 1\n",
+    "ci.yml": "coverage_threshold: 80\nstrict: true\n",
+}, config={"trunk": "main", "spec": {"engine": "prd-frd"}, "verifyCmd": "true"})
+ok(run(["tests", "audit", "--base", "HEAD"], dt).returncode == 0,
+   "an empty diff weakens nothing")
+
+
+def weaken(files, message="make the gate pass"):
+    for name, body in files.items():
+        full = os.path.join(dt, name)
+        if body is None:
+            os.remove(full)
+        else:
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            open(full, "w").write(body)
+    subprocess.run(["git", "add", "-A"], cwd=dt)
+    subprocess.run(["git", "commit", "-qm", message], cwd=dt)
+    return run(["tests", "audit", "--base", "HEAD~1"], dt)
+
+
+r = weaken({"tests/test_edge.py": None})
+ok(r.returncode != 0 and "deleted" in r.stdout, "a deleted test file is caught")
+
+r = weaken({"tests/test_core.py": "import pytest\n\n@pytest.mark.skip\n"
+                                  "def test_a():\n    assert f(1) == 2\n    assert f(2) == 3\n\n"
+                                  "def test_b():\n    assert g() is None\n"})
+ok(r.returncode != 0 and "skipped" in r.stdout, "a newly added skip marker is caught")
+
+r = weaken({"tests/test_core.py": "def test_a():\n    pass\n\n"
+                                  "def test_b():\n    assert g() is None\n"})
+ok(r.returncode != 0 and "assertion" in r.stdout, "assertions removed and not replaced is caught")
+
+r = weaken({"ci.yml": "coverage_threshold: 55\nstrict: true\n"})
+ok(r.returncode != 0 and "lowered" in r.stdout, "a lowered threshold is caught")
+ok("80 -> 55" in r.stdout, "and it says by how much")
+
+r = weaken({"src/x.py": "def f():\n    return 1  # noqa\n"})
+ok(r.returncode != 0 and "silenced" in r.stdout, "a new suppression comment is caught")
+
+r = weaken({"tests/test_core.py": "def test_a():\n    assert f(1) == 2\n\n"
+                                  "def test_b():\n    assert g() is None\n\n"
+                                  "def test_c():\n    assert k() == 9\n"})
+ok(r.returncode == 0, "adding a test and an assertion is not a weakening")
+
+r = run(["tests", "audit", "--base", "HEAD~1", "--acknowledge"], dt)
+ok(r.returncode == 0, "--acknowledge lets a justified change through")
+shutil.rmtree(dt, ignore_errors=True)
+
+print("budget: a ceiling an agent cannot raise for itself")
+dbg = newrepo(config={"trunk": "main", "spec": {"engine": "prd-frd"},
+                      "budget": {"maxToolCalls": 3}})
+ok("of 3" in run(["budget", "show"], dbg).stdout,
+   "a configured tool-call ceiling is reported")
+for _ in range(3):
+    guard(dbg, "git status")
+r = guard(dbg, "git status")
+ok(r.returncode == 2 and "budget" in r.stderr, "the hook refuses once the ceiling is passed")
+ok("sdlc budget reset" in r.stderr, "and it names the allowed route")
+run(["budget", "reset", "--as", "a person"], dbg)
+ok(guard(dbg, "git status").returncode == 0, "a person can reset it")
+
+dnb = newrepo(config={"trunk": "main", "spec": {"engine": "prd-frd"}})
+for _ in range(12):
+    guard(dnb, "git status")
+ok(guard(dnb, "git status").returncode == 0, "no ceiling configured means no refusal")
+ok("no ceiling" in run(["budget", "show"], dnb).stdout, "but doctor-style output says so plainly")
+
+print("checkpoints: resuming is not automatically safe")
+dcp = newrepo(files={"src/a.py": "x = 1\n"},
+              config={"trunk": "main", "spec": {"engine": "prd-frd"}})
+ok(run(["checkpoint", "resume"], dcp).returncode != 0, "no checkpoint is not a green light")
+run(["checkpoint", "write", "--done", "parser", "--next", "the formatter",
+     "--file", "src/a.py"], dcp)
+r = run(["checkpoint", "resume"], dcp)
+ok(r.returncode == 0 and "Safe to continue" in r.stdout, "an unchanged repository resumes")
+ok("parser" in r.stdout and "formatter" in r.stdout, "it says what is done and what is next")
+
+open(os.path.join(dcp, "src/a.py"), "w").write("x = 2\n")
+r = run(["checkpoint", "resume"], dcp)
+ok(r.returncode != 0 and "changed since the checkpoint" in r.stdout,
+   "a file that moved under the checkpoint stops the resume")
+
+subprocess.run(["git", "add", "src/a.py"], cwd=dcp)
+subprocess.run(["git", "commit", "-qm", "edit"], cwd=dcp)
+ok("HEAD has moved" in run(["checkpoint", "resume"], dcp).stdout,
+   "and so does a commit the checkpoint did not know about")
+for x in (dbg, dnb, dcp):
+    shutil.rmtree(x, ignore_errors=True)
+
 for x in (d, d2, d3, home):
     shutil.rmtree(x, ignore_errors=True)
 

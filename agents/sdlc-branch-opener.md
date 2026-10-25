@@ -26,15 +26,39 @@ Read `${CLAUDE_PLUGIN_ROOT}/docs/rules.md` and `sdlc.config.json`. You enforce o
 
    ```sh
    git status --short && git fetch origin && git log --oneline -1 origin/<trunk>
+   git log --oneline HEAD..origin/<trunk> | head
    ```
 
-   Uncommitted tracked changes: stop and report. Never stash, reset or clean them.
+   Uncommitted tracked changes: stop and report. Never stash, reset or clean them — they are
+   somebody's work and they may be the only copy.
+
+   If the trunk has moved ahead, branch from the **fetched** trunk rather than from a stale
+   local one. Starting from yesterday's trunk is how an agent produces a diff that conflicts
+   with work that was already merged.
 
 3. Create the branch from the trunk, using `branchScheme` with every placeholder filled:
 
    ```sh
    git switch -c <branch> origin/<trunk>
    ```
+
+   **Check first that nobody is already there.** Another agent or another person may hold this
+   branch, or one close enough to collide:
+
+   ```sh
+   git branch -a --list '<branch>*' && git worktree list
+   ```
+
+   An existing branch with the same name is a stop, not something to force past. If the work is
+   genuinely independent and the repository supports it, prefer an isolated worktree so two
+   tasks cannot interleave in one working tree:
+
+   ```sh
+   git worktree add ../<repo>-<slug> -b <branch> origin/<trunk>
+   ```
+
+   Say which you did, and where the working tree is, because every later stage needs to run
+   there and not here.
 
 4. **Capture the baseline, before a single line is written:**
 

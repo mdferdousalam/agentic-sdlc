@@ -276,6 +276,35 @@
     "attributeCommits": {
       "type": "boolean",
       "description": "Add an agent identity trailer to commits, so a change can be traced to the actor that made it."
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Ceilings an agent cannot raise for itself. An agent that cannot stop is a cost centre with a git token. The tool cannot see the host's token meter, so it counts what it can observe: tool calls through the hook, wall-clock since the task began, and repair attempts.",
+      "properties": {
+        "maxToolCalls": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Tool calls per task before the hook refuses. 0 means no ceiling, which means nothing will stop a runaway task."
+        },
+        "maxWallClockMin": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Minutes per task before the hook refuses. 0 means no ceiling."
+        },
+        "maxRetries": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Attempts at one stage before the pipeline says to stop and report. Default 3: past that, the specification is usually the problem, not the code."
+        },
+        "stopPolicy": {
+          "enum": [
+            "refuse",
+            "warn"
+          ],
+          "description": "refuse: the hook blocks. warn: it says so and allows it. refuse is the point."
+        }
+      }
     }
   }
 }

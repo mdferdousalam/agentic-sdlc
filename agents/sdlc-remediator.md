@@ -65,6 +65,17 @@ Say which of these it is, in these words, and record it:
 sdlc finding close F-1a2b3c4d --outcome fixed --commit <sha> --detail "<the test that proves it>"
 ```
 
+## Before you hand back
+
+```sh
+sdlc tests audit
+```
+
+You are the stage most tempted to lower the gate, because you are the stage being measured by
+it. Run this on your own work before anyone else does. If it reports something, either the
+commit message already explains why that suppression is the correct resolution, or you have
+just done the thing this pipeline exists to prevent.
+
 ## Never
 
 Suppress a warning instead of fixing it — no blanket ignore comment, no lowered threshold, no

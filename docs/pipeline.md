@@ -152,6 +152,7 @@ suppression *is* the correct resolution, and the commit message must say why.
 | `git add -A`, `git add .`, `git commit -a` | never — commits are path-scoped |
 | force-push, `git tag`, any publish, `gh release`, `docker push` | never — the maintainer's |
 | reading `.env`, keys, `~/.ssh`, `~/.aws` | never |
+| any tool call past `budget.maxToolCalls` or `maxWallClockMin` | a person runs `sdlc budget reset` |
 | `kubectl apply`, `helm upgrade`, `terraform apply`, `fly deploy`, `ansible-playbook`, cloud deploys | a human `approval_release` **and** a READY receipt |
 | `gh pr merge` where `approvals.merge` is `human` | a human `approval_merge` for this commit |
 
