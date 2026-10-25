@@ -3,6 +3,31 @@
 All notable changes to this plugin. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the versioning is [semantic](https://semver.org/).
 
+## [2.2.0] — 2026-10-25
+
+A front door for everyone who is not using Claude Code. Until now the only one-command install
+was `/plugin install`; everybody else had to clone a repository and run a Python script. That,
+rather than any missing adapter, was what would have stopped other developers adopting this.
+
+### Added
+
+- **`install.sh`** — `curl -fsSL .../install.sh | sh`. Downloads a release into
+  `~/.agentic-sdlc`, links `sdlc` into a bin directory already on your PATH, and touches
+  nothing in your repository. No account, no sudo, no Python dependencies. It refuses to
+  proceed on Python older than 3.8 rather than failing later with something cryptic.
+- **npm package `@mdferdousalam/agentic-sdlc`** — `npx @mdferdousalam/agentic-sdlc install`.
+  Scoped because the unscoped name belongs to an unrelated project. The `bin` is a small Node
+  launcher rather than the Python file directly, so Windows gets a real shim instead of
+  depending on a shebang npm cannot honour there; it tries `python`, `py`, `python3` on Windows
+  and `python3`, `python` elsewhere, and says exactly what is missing if none works.
+
+### Verified
+
+Installing the packed tarball into a clean project and pushing: the generated `pre-push` hook
+refused an ungated push to `main`, and allowed it once a gate receipt existed. CI now checks
+the installer with `shellcheck`, that `package.json` and `plugin.json` agree on the version,
+and that the packed tarball's CLI actually runs.
+
 ## [2.1.0] — 2026-10-25
 
 The pipeline stops being a Claude Code feature.
@@ -46,18 +71,6 @@ The pipeline stops being a Claude Code feature.
   shebang works, which is a prerequisite for Windows.
 - `bin/sdlc-install-opencode` is **deprecated** — it now calls `sdlc install opencode`. Removal
   in 3.0.0.
-
-### Distribution
-
-- **`install.sh`** — `curl -fsSL .../install.sh | sh`. Downloads a release into
-  `~/.agentic-sdlc`, links `sdlc` into a bin directory already on your PATH, and touches
-  nothing in your repository. No account, no sudo, no Python dependencies. It refuses to
-  proceed on Python older than 3.8 rather than failing later with something cryptic.
-- **npm package `@mdferdousalam/agentic-sdlc`** — `npx @mdferdousalam/agentic-sdlc install`.
-  Scoped because the unscoped name belongs to an unrelated project. The `bin` is a small Node
-  launcher rather than the Python file directly, so Windows gets a real shim instead of
-  depending on a shebang npm cannot honour there; it tries `python`, `py`, `python3` on Windows
-  and `python3`, `python` elsewhere, and says exactly what is missing if none works.
 
 ### Verified
 
