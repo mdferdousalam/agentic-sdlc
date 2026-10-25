@@ -305,6 +305,20 @@
           "description": "refuse: the hook blocks. warn: it says so and allows it. refuse is the point."
         }
       }
+    },
+    "suiteAudit": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Controls for `sdlc tests audit`. Exemption is declared here rather than inferred from a line's text, because anything decided from the text can be rewritten by the actor the control exists to constrain. Adding a glob is itself reported as a weakening, so the escape hatch cannot be used quietly.",
+      "properties": {
+        "exclude": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Paths or globs the audit does not scan. For files that genuinely DEFINE these patterns \u2014 a detector, its fixtures \u2014 not for files that merely trip it."
+        }
+      }
     }
   }
 }

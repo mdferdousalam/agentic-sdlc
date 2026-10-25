@@ -16,6 +16,12 @@
   "verifyCmd": "python3 tests/test_sdlc.py && node .github/scripts/validate-plugin.mjs && npx --yes markdownlint-cli2",
   "gateCmd": null,
   "secretScan": "gitleaks git --no-banner --redact --log-opts=\"-n 50\"",
+  "suiteAudit": {
+    "exclude": [
+      "bin/sdlc",
+      "tests/test_sdlc.py"
+    ]
+  },
   "heavy": null,
   "profile": "library",
   "concerns": [

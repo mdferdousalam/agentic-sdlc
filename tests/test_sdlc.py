@@ -673,16 +673,35 @@ ok("not waived" in r.stdout, "and says plainly that it recorded rather than waiv
 ok("suite.acknowledged" in open(os.path.join(dt, ".sdlc/audit.log")).read(),
    "the acknowledgement is its own audit event, not the same line as a plain run")
 
-# Found by running this check against its own repository: the detector's own patterns, its
-# test fixtures and the evals that quote a suppression were all reported. A marker inside a
-# string literal suppresses nothing, and prose cannot disable a linter — so neither is a
-# loosening to skip. Six false positives on the tool's own diff would get the tool ignored.
-r = weaken({"src/patterns.py": 'SKIPS = ["# noqa", "@pytest.mark.skip", "// nolint"]\n'})
-ok(r.returncode == 0, "a suppression inside a string literal is a definition, not a suppression")
-r = weaken({"docs/guide.md": "Do not write `# noqa` or `@pytest.mark.skip` to pass the gate.\n"})
-ok(r.returncode == 0, "prose that quotes a suppression is not a suppression")
+# Exemption is declared in config, not inferred from a line's text. Two content-based
+# heuristics were tried and both were forgeable by the actor the control constrains: quote
+# parity fell to one apostrophe, and "a quote on both sides" fell to appending a quote. The
+# second residual was found by a readiness gate re-run, after the first fix.
 r = weaken({"src/real.py": "def f():\n    return undefined_name  # noqa\n"})
-ok(r.returncode != 0, "but a real suppression in real code is still caught")
+ok(r.returncode != 0, "a real suppression in real code is caught")
+r = weaken({"src/real.py": 'def f():\n    return x  "y"  # noqa  # "\n'})
+ok(r.returncode != 0, "and quotes sprinkled around the marker do not hide it")
+r = weaken({"src/real.py": "def f():\n    return x  # don't  # noqa\n"})
+ok(r.returncode != 0, "nor does an apostrophe")
+
+print("suite integrity: the escape hatch is declared, and never quiet")
+cfgp = os.path.join(dt, "sdlc.config.json")
+c = json.load(open(cfgp))
+c["suiteAudit"] = {"exclude": ["src/*"]}
+json.dump(c, open(cfgp, "w"))
+subprocess.run(["git", "add", "sdlc.config.json"], cwd=dt)
+subprocess.run(["git", "commit", "-qm", "exempt src"], cwd=dt)
+r = run(["tests", "audit", "--base", "HEAD~1"], dt)
+ok(r.returncode != 0 and "newly exempted" in r.stdout,
+   "adding an exemption is itself reported — otherwise the hatch would be the bypass")
+r = weaken({"src/real.py": "def f():\n    return y  # noqa\n"})
+ok(r.returncode == 0, "once declared, the exempted path is genuinely not scanned")
+c["suiteAudit"] = {"exclude": []}
+json.dump(c, open(cfgp, "w"))
+subprocess.run(["git", "add", "sdlc.config.json"], cwd=dt)
+subprocess.run(["git", "commit", "-qm", "unexempt"], cwd=dt)
+r = weaken({"src/real.py": "def f():\n    return z  # noqa\n"})
+ok(r.returncode != 0, "removing the exemption brings the path back under the audit")
 shutil.rmtree(dt, ignore_errors=True)
 
 print("budget: a ceiling an agent cannot raise for itself")

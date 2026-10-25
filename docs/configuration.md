@@ -27,6 +27,7 @@ Also read from `.opencode/sdlc.json` if you prefer to keep it out of the reposit
 | `receipts.maxAgeMin` | integer | How long a receipt stays valid. Default 180. |
 | `enforce.*` | boolean | What the hook refuses. See below. |
 | `neverByAgent` | string[] | Actions reserved to a human, stated for the agents to read. |
+| `suiteAudit.exclude` | string[] | Paths `sdlc tests audit` does not scan. Adding one is itself reported — the hatch is visible, not quiet. |
 | `budget.*` | object | Ceilings an agent cannot raise for itself: `maxToolCalls`, `maxWallClockMin`, `maxRetries`, `stopPolicy`. Unset means nothing stops a runaway task. |
 
 ## `enforce`
@@ -57,6 +58,13 @@ sdlc checkpoint resume           # re-checks the assumptions before continuing
 so it counts what it can observe — tool calls through the hook, wall-clock since the task
 began, and repair attempts — and **refuses** at the ceiling. A ceiling that stops the work is
 worth more than a token count that describes it afterwards.
+
+Exemption from the audit is **declared, never inferred**. Two content-based heuristics were
+tried and both were forgeable by the actor the control constrains — quote parity fell to a
+single apostrophe, and "a quote on both sides" fell to appending a quote. A file that
+genuinely defines these patterns says so once in `suiteAudit.exclude`, in the diff, where a
+reviewer sees it; and adding a glob is itself reported, because otherwise the escape hatch
+would be the bypass.
 
 `sdlc tests audit` is the mechanical form of the rule every agent prompt already states: do not
 delete a test, weaken an assertion, add a skip marker, suppress a warning or lower a threshold

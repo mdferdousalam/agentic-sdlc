@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import fnmatch
 import glob
 import hashlib
 import json
@@ -1630,6 +1631,7 @@ NUM_SETTING = re.compile(r"([A-Za-z_][\w.\- ]{2,40})\s*[:=]\s*(\d{1,3})(?:\.\d+)
 # Only a diff *illustration* inside documentation is skipped: a line whose own content begins
 # with + or -, which is an example of a change rather than a change.
 DOC_RE = re.compile(r"\.(md|markdown|rst|adoc)$", re.I)
+
 DIFF_ILLUSTRATION = re.compile(r"^\s*[+-]")
 
 
@@ -1671,23 +1673,28 @@ def diff_files(root: str, base: str):
     return out
 
 
-def marker_is_quoted(line: str, start: int, end: int) -> bool:
-    """Is this marker inside a quoted string — a pattern definition, or a fixture?
+def audit_excluded(cfg: dict, path: str) -> bool:
+    """Is this path declared exempt from the suite audit?
 
-    The previous version counted quote parity before the match, so one apostrophe in a comment
-    (`# don't lint  # noqa`) read as an open string and disarmed every marker after it on the
-    line. That was a bypass in the control, not a rough edge.
+    Content-based exemption was tried twice and is not defensible. Counting quote parity let
+    one apostrophe disarm a line; requiring a quote on both sides let `# noqa  # "` do it.
+    Anything decided from the text of a line can be forged by writing different text, and the
+    actor writing it is the one the control exists to constrain.
 
-    A quoted occurrence has a quote on BOTH sides of it on the same line; a real trailing
-    suppression has none after it. Requiring both cannot be opened by a single apostrophe, and
-    still skips only inert text — a suppression inside a string literal suppresses nothing.
+    So exemption is declared in sdlc.config.json instead: visible in the diff, reviewable, and
+    not reachable by editing the line under suspicion. A file that genuinely *defines* these
+    patterns — this plugin's own detector, its fixtures — says so once, out loud. Adding to
+    the list is itself reported as a weakening, so the escape hatch cannot be used quietly.
     """
-    return (any(q in line[:start] for q in "\"'`")
-            and any(q in line[end:] for q in "\"'`"))
+    for pat in ((cfg.get("suiteAudit") or {}).get("exclude") or []):
+        if fnmatch.fnmatch(path, pat) or path == pat:
+            return True
+    return False
 
 
-def suite_findings(root: str, base: str):
+def suite_findings(root: str, base: str, cfg: dict = None):
     """Everything in this diff that makes the gate easier to pass, or None if git failed."""
+    cfg = cfg if cfg is not None else load_config(root)
     found = []
 
     r = subprocess.run(["git", "diff", "--name-only", "--diff-filter=D", f"{base}...HEAD"],
@@ -1701,6 +1708,30 @@ def suite_findings(root: str, base: str):
     files = diff_files(root, base)
     if files is None:
         return None
+
+    # Widening the exemption list is itself a weakening — otherwise the escape hatch IS the
+    # bypass: add one glob and the check goes quiet everywhere. Compared as parsed lists at
+    # the two revisions rather than by pattern-matching the diff, so reformatting the config
+    # neither hides an addition nor invents one.
+    cfg_path = config_path(root)
+    if cfg_path:
+        name = os.path.relpath(cfg_path, root)
+        before, after = set(), set()
+        r = subprocess.run(["git", "show", f"{base}:{name}"], cwd=root,
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            try:
+                before = set(((json.loads(r.stdout).get("suiteAudit") or {}).get("exclude")) or [])
+            except Exception:
+                pass
+        try:
+            after = set(((load_config(root).get("suiteAudit") or {}).get("exclude")) or [])
+        except Exception:
+            after = set()
+        for added_glob in sorted(after - before):
+            found.append((name, "a path was newly exempted from the suite audit — the audit "
+                                "no longer looks at it at all",
+                          f'suiteAudit.exclude += "{added_glob}"'))
 
     for path, added, removed in files:
         if TEST_PATH_RE.search(path or ""):
@@ -1720,14 +1751,16 @@ def suite_findings(root: str, base: str):
                               next(l.strip() for l in removed if ASSERT_RE.search(l))))
 
         is_doc = bool(DOC_RE.search(path or ""))
+        exempt = audit_excluded(cfg, path or "")
         for line in added:
             if is_doc and DIFF_ILLUSTRATION.search(line):
                 continue  # a diff shown as an example in documentation
-            for pat, why in SKIP_ADDED + SUPPRESS_ADDED:
-                m = pat.search(line)
-                if m and not marker_is_quoted(line, m.start(), m.end()):
-                    found.append((path, why, line.strip()))
-                    break
+            if not exempt:
+                for pat, why in SKIP_ADDED + SUPPRESS_ADDED:
+                    if pat.search(line):
+                        found.append((path, why, line.strip()))
+                        break
+
 
         was = {}
         for line in removed:
@@ -1748,7 +1781,7 @@ def cmd_tests(args) -> int:
     root = repo_root()
     cfg = load_config(root)
     base = args.base or merge_base(root, cfg)
-    found = suite_findings(root, base)
+    found = suite_findings(root, base, cfg)
 
     if found is None:
         print(f"suite integrity: UNEXECUTED — git could not produce a diff against "
