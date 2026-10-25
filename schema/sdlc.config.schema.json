@@ -1,0 +1,268 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/mdferdousalam/agentic-sdlc/schema/sdlc.config.schema.json",
+  "title": "agentic-sdlc project adapter",
+  "description": "The only file in a project that knows its stack. Every agent reads it; none hardcodes a package manager, a branch name or a test runner.",
+  "type": "object",
+  "required": [
+    "trunk",
+    "spec"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "version": {
+      "const": 2,
+      "description": "Adapter format version."
+    },
+    "trunk": {
+      "type": "string",
+      "description": "The branch work merges into.",
+      "examples": [
+        "main",
+        "master",
+        "develop"
+      ]
+    },
+    "stack": {
+      "type": "string",
+      "description": "Detected language or ecosystem; informational."
+    },
+    "pm": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Package manager or build driver."
+    },
+    "monorepo": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "turbo",
+        "nx",
+        "lerna",
+        "workspaces",
+        null
+      ]
+    },
+    "commits": {
+      "enum": [
+        "conventional",
+        "descriptive"
+      ],
+      "description": "Commit message style the lander and implementer follow."
+    },
+    "test": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      },
+      "description": "Test runners by kind, e.g. {\"unit\":\"vitest\",\"e2e\":\"playwright\"}."
+    },
+    "spec": {
+      "type": "object",
+      "required": [
+        "engine"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "engine": {
+          "enum": [
+            "openspec",
+            "prd-frd"
+          ],
+          "description": "openspec: proposal/design/tasks + delta specs, validated by the openspec CLI. prd-frd: a PRD and an FRD with numbered requirements."
+        },
+        "docsRoot": {
+          "type": "string",
+          "description": "Where specifications live."
+        },
+        "strict": {
+          "type": "boolean",
+          "description": "openspec: validate with --strict."
+        }
+      }
+    },
+    "branchScheme": {
+      "type": "string",
+      "description": "Placeholders are filled from the unit of work, e.g. {kind}/{slug}."
+    },
+    "verifyCmd": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The mechanical check: lint, types, tests. Without it nothing can be gated."
+    },
+    "gateCmd": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "A heavier project-specific gate, run instead of verifyCmd when set."
+    },
+    "secretScan": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "A command that fails when a credential appears in the branch's commits."
+    },
+    "heavy": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Prose rule for workloads that must be bounded or serialised."
+    },
+    "profile": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "An opt-in standards profile from the plugin's profiles/ directory."
+    },
+    "reviewers": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Agents the readiness gate fans out to."
+    },
+    "protected": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Branches a push may not reach without a passed gate receipt. Globs allowed."
+    },
+    "receipts": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "maxAgeMin": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "How long a receipt stays valid."
+        }
+      }
+    },
+    "enforce": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "What the PreToolUse hook refuses. Turning one off is a deliberate, recorded choice.",
+      "properties": {
+        "pushToTrunkNeedsGate": {
+          "type": "boolean"
+        },
+        "mergeNeedsReadiness": {
+          "type": "boolean"
+        },
+        "branchNeedsApprovedSpec": {
+          "type": "boolean"
+        },
+        "blockDestructiveGit": {
+          "type": "boolean"
+        },
+        "blockPublishing": {
+          "type": "boolean"
+        },
+        "blockCredentialReads": {
+          "type": "boolean"
+        }
+      }
+    },
+    "neverByAgent": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Actions reserved to a human, stated for the agents to read."
+    },
+    "quality": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Deterministic analysis budget on NEW code. Peer-reviewed work on repositories that adopted coding agents reports persistent rises in analysis warnings and complexity, so the budget is on what a change adds, not on the whole repository.",
+      "properties": {
+        "cmd": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Static analysis / coverage command; non-zero exit fails the gate."
+        },
+        "coverageNewPct": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 100,
+          "description": "Minimum coverage required on changed lines."
+        }
+      }
+    },
+    "release": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "How a merged change reaches users. Merging is not shipping; this is the distance between them.",
+      "properties": {
+        "deployCmd": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "smokeCmd": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Proves the change works in the environment it was deployed to, not in CI."
+        },
+        "rollbackCmd": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "The written way back. A deployment without one is not ready."
+        },
+        "environments": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Lowest first. Production is never deployed before the environment below it has been observed."
+        }
+      }
+    },
+    "approvals": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Which actions need a named human. An agent can never satisfy a 'human' approval: it records who is accountable, and an agent approving its own work records nothing.",
+      "properties": {
+        "merge": {
+          "enum": [
+            "agent",
+            "human"
+          ]
+        },
+        "release": {
+          "enum": [
+            "agent",
+            "human"
+          ]
+        }
+      }
+    },
+    "attributeCommits": {
+      "type": "boolean",
+      "description": "Add an agent identity trailer to commits, so a change can be traced to the actor that made it."
+    }
+  }
+}

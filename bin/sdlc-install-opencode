@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# sdlc-install-opencode — run this pipeline under opencode as well as Claude Code.
+#
+# Claude Code loads the plugin from its marketplace. opencode has no plugin marketplace, so this
+# copies the same agents, commands and enforcement into ~/.config/opencode, rewriting the two
+# things that differ between the hosts:
+#   * agent frontmatter: Claude Code's `tools:` list becomes opencode's `permission:` block
+#   * ${CLAUDE_PLUGIN_ROOT} becomes this checkout's absolute path
+#
+#   bin/sdlc-install-opencode [--prefix ~/.config/opencode] [--model MODEL] [--dry-run]
+#
+# Re-run it after pulling a new version. It overwrites only the files it owns.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PREFIX="${HOME}/.config/opencode"
+MODEL=""
+DRY=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --prefix) PREFIX="$2"; shift 2 ;;
+    --model)  MODEL="$2";  shift 2 ;;
+    --dry-run) DRY=1; shift ;;
+    -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
+    *) echo "unknown option: $1" >&2; exit 2 ;;
+  esac
+done
+
+say() { printf '%s\n' "$*"; }
+put() { # put <dest> ; content on stdin
+  if [ "$DRY" = 1 ]; then say "would write $1"; cat >/dev/null; else mkdir -p "$(dirname "$1")"; cat > "$1"; say "wrote $1"; fi
+}
+
+command -v python3 >/dev/null || { echo "python3 is required" >&2; exit 1; }
+
+# Agents -------------------------------------------------------------------------------------
+for f in "$ROOT"/agents/*.md; do
+  name="$(basename "$f")"
+  python3 - "$f" "$ROOT" "$MODEL" <<'PY' | put "$PREFIX/agents/$name"
+import re, sys
+src, root, model = sys.argv[1], sys.argv[2], sys.argv[3]
+text = open(src).read().replace("${CLAUDE_PLUGIN_ROOT}", root)
+
+def convert(m):
+    fm = m.group(1)
+    tools = re.search(r"^tools:\s*\[(.*?)\]\s*$", fm, re.M)
+    edits = True
+    if tools:
+        listed = [t.strip() for t in tools.group(1).split(",")]
+        edits = any(t in ("Write", "Edit", "NotebookEdit") for t in listed)
+        fm = re.sub(r"^tools:.*$\n?", "", fm, flags=re.M)
+    perm = f"permission:\n  edit: {'allow' if edits else 'deny'}\n  bash: allow"
+    mode = "primary" if "implementer" in src or "spec-writer" in src else "subagent"
+    extra = f"mode: {mode}\ntemperature: 0.1\n"
+    if model:
+        extra += f"model: {model}\n"
+    return "---\n" + fm.rstrip() + "\n" + extra + perm + "\n---"
+
+print(re.sub(r"^---\n([\s\S]*?)\n---", convert, text, count=1), end="")
+PY
+done
+
+# Commands -----------------------------------------------------------------------------------
+for f in "$ROOT"/commands/*.md; do
+  name="sdlc-$(basename "$f")"
+  sed "s|\${CLAUDE_PLUGIN_ROOT}|$ROOT|g" "$f" | put "$PREFIX/commands/$name"
+done
+
+# Enforcement --------------------------------------------------------------------------------
+sed "s|__PLUGIN_ROOT__|$ROOT|g" "$ROOT/opencode/plugin/agentic-sdlc.ts" \
+  | put "$PREFIX/plugins/agentic-sdlc.ts"
+
+say ""
+say "Installed into $PREFIX."
+say "Next:  opencode reload   (a stale background server shows none of this)"
+say "Then:  $ROOT/bin/sdlc doctor   in the repository you are working in"

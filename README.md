@@ -1,84 +1,188 @@
 # agentic-sdlc
 
-A **stack-agnostic, agent-based SDLC pipeline** packaged as a Claude Code plugin. The
-same pipeline — PRD → FRD → branch → DI → code → CVR → readiness gate → IR — runs on any
-project. What varies per project is a single detected adapter file, `sdlc.config.json`;
-the agents and skills are constant.
+An agent-based SDLC pipeline that is **enforced, not suggested**.
 
-## Core idea
+Most agent workflows are a prompt that asks a model to be careful. This one asks too — and then
+refuses, at the tool call, to let a stage be skipped. A branch cannot be created without an
+approved specification. A push to the trunk cannot happen without a passed gate. A merge cannot
+happen without a READY verdict for *that exact commit*. Those are not sentences in a system
+prompt; they are a `PreToolUse` hook that exits non-zero.
 
-| Layer | Reusable? | Where it lives |
-|------|-----------|----------------|
-| Pipeline shape (stages + owners) | yes — shipped by this plugin | `agents/`, `skills/` |
-| Stack bindings (pm, trunk, ORM, test runner, reviewers) | no — detected per project | `sdlc.config.json` |
+It is stack-agnostic through a single detected adapter file, and it speaks
+[OpenSpec](https://github.com/Fission-AI/OpenSpec) or plain PRD/FRD.
 
-Every agent reads `sdlc.config.json` instead of hardcoding `pnpm`, `main`, `drizzle`,
-etc. Swap that file and the identical pipeline runs on a Go monorepo or a single-package
-Next.js app.
-
-## Install
-
-```bash
-# add this repo as a marketplace, then install the plugin
+```sh
 /plugin marketplace add mdferdousalam/agentic-sdlc
 /plugin install agentic-sdlc
 
-# or load locally for development
-claude --plugin-dir ./agentic-sdlc
+/agentic-sdlc:init --write          # detect the stack, write sdlc.config.json
+/agentic-sdlc:feature "2FA for the admin login"
 ```
 
-## Use
+## The pipeline
 
-```bash
-# 1. once per repo: detect stack, write sdlc.config.json, scaffold docs
-/agentic-sdlc:sdlc-init
+| # | Stage | Command | Owner | Leaves behind |
+| --- | --- | --- | --- | --- |
+| 0 | Adapt | `:init` | — | `sdlc.config.json` |
+| 1 | Specify | `:feature` | `sdlc-spec-writer` | an OpenSpec change, or a PRD + FRD |
+| 2 | Review the spec | ↑ | `sdlc-spec-reviewer` | `spec` receipt — approved or changes-requested |
+| 3 | Branch | ↑ | `sdlc-branch-opener` | a branch, only on an approved spec |
+| 4 | Implement | `:implement` | `sdlc-implementer` | code, tests, ticked checklist |
+| 5 | Verify | `:verify` | `sdlc-verifier` | requirement-by-requirement evidence |
+| 6 | Review | `:review` | `sdlc-code-reviewer`, `sdlc-security-reviewer` | findings with `file:line` |
+| 7a | Mechanical gate | `:gate` | — | `gate` receipt — what a push to the trunk needs |
+| 7b | Readiness | `:readiness` | `sdlc-readiness-gate` | `readiness` receipt — READY or NOT-READY |
+| 8 | Land | `:land` | `sdlc-lander` | branch pushed, pull request with its evidence |
+| 9 | Report | `:report` | `sdlc-reporter` | implementation report, documentation brought up to date |
 
-# 2. per feature: drives spec -> review -> branch -> DI in one shot
-/agentic-sdlc:start-feature phase=1 module=auth feature=2fa
+Also `:gate` (the mechanical half on its own), `:status` (which receipts hold right now), `:doctor` (is the install sane), and
+`sdlc-test-author` for the tests a review finds missing.
 
-# 3. implement against the DI, then:
-/agentic-sdlc:verification-report     # cross-verify build vs spec (CVR)
-# run the readiness gate (sdlc-readiness-gate agent) -> READY
-/agentic-sdlc:implementation-report   # close the feature (IR)
+Eleven agents, each with one job and no permission to do another's. The reviewers cannot edit.
+The gate cannot push. Only the lander touches the remote, and it cannot tag, release or publish
+at all.
+
+## What "enforced" means
+
+Three receipts, each bound to a commit, a clock, and — for a specification — the content that
+was approved:
+
+```sh
+sdlc status
+#   spec        approved   9a1c4f21e  2026-10-25T09:04:11Z  current
+#   readiness   ready      9a1c4f21e  2026-10-25T09:41:02Z  current
 ```
 
-## Components
+- Make another commit → the readiness receipt is for the old one, and the merge is refused.
+- Edit the specification after approval → the digest no longer matches, and the branch stage
+  refuses.
+- Let three hours pass → the receipt is stale.
 
-**Agents** (`agents/`)
+**Humans where humans matter.** `approvals` says which actions need a named person. Deployment
+defaults to `human`, and an agent cannot satisfy it — the approval records who is accountable,
+and an agent approving its own work records nothing. Approvals are scoped (a release approval
+does not authorise a merge) and die with the next commit.
 
-- `sdlc-spec-writer` — writes PRD + FRD for a `{phase, module, feature}`.
-- `sdlc-spec-reviewer` — gates the spec (APPROVED / CHANGES-REQUESTED) before branching.
-- `sdlc-branch-opener` — the single owner of branch creation; validates the name,
-  enforces doc-first, creates + pushes the branch, drafts the PR, updates the ledgers.
-- `sdlc-readiness-gate` — the single pre-merge gate; runs the verify command and fans
-  out to the project's configured reviewers.
+**Failure is routed, not dropped.** A gate failure is written back as enriched context with
+`sdlc feedback`, so the retry starts informed instead of repeating itself. After three attempts
+at one stage the tool says to stop: at that point the specification is usually the problem.
 
-**Skills** (`skills/`)
+The same hook also refuses `git stash`, `reset --hard`, `clean`, `checkout -- .`, `add -A`,
+`commit -a`, force-push, `tag`, every `publish`, `gh release`, `docker push`, and reading a
+credential file. Each refusal explains itself and names the route that is allowed.
 
-- `sdlc-init` — bootstrap: detect stack, write config, scaffold docs.
-- `start-feature` — chain spec → review → branch → DI.
-- `dev-instructions` (DI), `verification-report` (CVR), `implementation-report` (IR) —
-  artifact generators, parameterized by config paths.
+This cannot make a dishonest verdict honest — nothing can. It makes a **skipped** stage
+impossible, which is the failure that actually happens.
 
-## Conventions written into each project
+## One adapter, any stack
 
-- `prd-frd-dev-instructions/MODULES_MAP.md` — canonical Phase → Module → Feature grid
-  (status: `planned | in-progress | in-cvr | shipped`).
-- `prd-frd-dev-instructions/SDLC.md` — the pipeline doc.
-- `prd-frd-dev-instructions/BRANCH_LEDGER.md` — append-only branch history.
-- Branch scheme: `phase-{N}/{module}/{feature}` (configurable).
+`sdlc.config.json` is the only file that knows your project. Agents read it; none of them
+hardcodes `pnpm`, `main` or `pytest`.
 
-## Non-negotiable standards the pipeline enforces
+```jsonc
+{
+  "trunk": "main",
+  "stack": "node",
+  "pm": "pnpm",
+  "test": { "unit": "vitest", "e2e": "playwright" },
+  "spec": { "engine": "openspec", "docsRoot": "openspec/changes", "strict": true },
+  "verifyCmd": "pnpm run lint && pnpm run typecheck && pnpm test",
+  "secretScan": "gitleaks git --no-banner --redact -n 50",
+  "profile": "webapp",
+  "reviewers": ["sdlc-code-reviewer", "sdlc-security-reviewer"],
+  "enforce": { "mergeNeedsReadiness": true, "pushToTrunkNeedsGate": true }
+}
+```
 
-1. **No code merges without a DI → CVR → IR trail.**
-2. **No configurable value ships hardcoded** — it must live in a normalized
-   config/reference table (3NF, separation of concerns) with admin/moderator CRUD.
-3. **DRY** — reuse shared packages before writing new code.
-4. **Tests + intent comments** on all new code.
+`:init` detects all of it — package manager from the lockfile, test runners from the
+dependencies, trunk from git, spec engine from whether OpenSpec is present, verify command from
+your own scripts. Re-running it never overwrites something you set by hand.
+[Full reference](docs/configuration.md).
 
-## Adapting to a new stack
+## Profiles: opinions you opt into
 
-`sdlc-init` infers everything it can from lockfiles, `turbo.json`/`nx.json`, commitlint,
-test deps, and the ORM. It only asks you for what it cannot detect. Edit
-`sdlc.config.json` afterward to override any field (trunk name, reviewer set, verify
-command, branch scheme).
+A rule like *"no hardcoded value that the spec marked configurable"* is right for an
+admin-driven web app and meaningless for a compiler. So the core carries no such rule, and
+profiles carry them instead — `"profile": "webapp"` and the reviewers hold you to it.
+
+| Profile | Adds |
+| --- | --- |
+| [`webapp`](profiles/webapp.md) | configurability, data model and migrations, accessibility, tenant isolation |
+| [`library`](profiles/library.md) | public API as a promise, semver from the diff, documented exports |
+| [`service`](profiles/service.md) | timeouts and retries, idempotency, observability, limits, rollback |
+| [`compiler`](profiles/compiler.md) | specification first, diagnostic codes, evidence vocabulary, bounded workloads |
+
+Writing your own is one markdown file. Keep it to what a reviewer can check.
+
+## OpenSpec, properly
+
+When OpenSpec is present the specification *is* an OpenSpec change, and the pipeline uses the
+parts of it that are machine-checkable:
+
+- `openspec change validate <id> --strict` — a malformed spec is an automatic
+  changes-requested, quoted rather than paraphrased;
+- `tasks.md` is the acceptance criteria: the implementer ticks each item in the commit that did
+  it, the verifier maps each to `file:line` plus a test outcome, the gate treats a ticked
+  unfinished item as a blocker;
+- `openspec archive <id>` after landing, so `openspec list` keeps telling the truth.
+
+Without OpenSpec you get PRD + FRD with numbered requirements and the identical downstream
+behaviour. [How it fits](docs/openspec.md).
+
+## Governance you can show someone
+
+```sh
+sdlc metrics      # stage outcomes, first-pass rates, which refusals fire, who acted
+sdlc trace        # requirement → commit → test → receipts, as markdown or JSON
+sdlc status       # which receipts hold right now, which are stale
+```
+
+Everything lands in an append-only `.sdlc/audit.log`. A first-pass gate rate of 100% is
+reported as a finding, not a success — it usually means the gate is not checking anything.
+[Standards mapping](docs/compliance.md) for NIST AI RMF, OWASP Agentic AI and OWASP NHI,
+including what this does **not** give you.
+
+## Four levels, each a configuration
+
+Adoption is not a switch. [docs/maturity.md](docs/maturity.md) gives the config for each level:
+human executes → human validates → human orchestrates → human sets constraints. Start where
+your trust actually is, and let `sdlc metrics` tell you when to move.
+
+## Five words
+
+**passed · failed · skipped · refused · unexecuted.** Every report in the pipeline uses them and
+only them. A test that did not run is `unexecuted` — not `passed`, and not `failed`. That one
+distinction is what stops a green summary hiding an unrun check, and it is why the gate asks for
+`file:line` and a command output behind every claim.
+
+## Also works with opencode
+
+```sh
+bin/sdlc-install-opencode        # agents, commands and the same enforcement
+opencode reload
+```
+
+The rules live in one Python CLI, so both hosts refuse exactly the same things.
+[Details](docs/opencode.md).
+
+## Requirements
+
+`git` and `python3` (standard library only — no dependencies, no network). Optional but
+recommended: `gh` for pull requests, `gitleaks` for the secret scan, `openspec` for the spec
+engine. `/agentic-sdlc:doctor` tells you what is missing and what it costs you.
+
+## Documentation
+
+- **[Getting started](GETTING-STARTED.md) — start here if this is new to you**
+- [The pipeline in detail](docs/pipeline.md) — every stage, its inputs, its exit condition
+- [Maturity levels](docs/maturity.md) — what to configure at each stage of adoption
+- [Standards mapping](docs/compliance.md) — NIST AI RMF, OWASP, and the honest limits
+- [Configuration reference](docs/configuration.md)
+- [OpenSpec integration](docs/openspec.md)
+- [Using it with opencode](docs/opencode.md)
+- [The rules every agent obeys](docs/rules.md)
+- [Contributing](CONTRIBUTING.md) · [Changelog](CHANGELOG.md) · [Security](SECURITY.md)
+
+## Licence
+
+MIT © Engr Md Ferdous Alam

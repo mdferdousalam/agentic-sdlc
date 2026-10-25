@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""Tests for bin/sdlc — the part of the pipeline that must not be talked out of its job.
+
+Run: python3 tests/test_sdlc.py     (standard library only; makes throwaway git repos in /tmp)
+"""
+import json, os, subprocess, sys, tempfile, shutil, time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+SDLC = os.path.join(os.path.dirname(HERE), "bin", "sdlc")
+fails = []
+
+
+def ok(cond, label):
+    print(("  ok   " if cond else "  FAIL ") + label)
+    if not cond:
+        fails.append(label)
+
+
+def run(args, cwd, stdin=None):
+    return subprocess.run([sys.executable, SDLC, *args], cwd=cwd, input=stdin,
+                          capture_output=True, text=True)
+
+
+def guard(cwd, command, tool="Bash", **inp):
+    payload = {"tool_name": tool, "tool_input": {"command": command, **inp}, "cwd": cwd}
+    return run(["guard"], cwd, stdin=json.dumps(payload))
+
+
+def newrepo(files=None, config=None):
+    d = tempfile.mkdtemp(prefix="sdlc-test-")
+    subprocess.run(["git", "init", "-q", "-b", "main", "."], cwd=d)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=d)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=d)
+    for name, body in (files or {"README.md": "# t\n"}).items():
+        p = os.path.join(d, name)
+        os.makedirs(os.path.dirname(p), exist_ok=True) if os.path.dirname(p) else None
+        open(p, "w").write(body)
+    subprocess.run(["git", "add", "-A"], cwd=d)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=d)
+    if config is not None:
+        json.dump(config, open(os.path.join(d, "sdlc.config.json"), "w"))
+    return d
+
+
+def head(d):
+    return subprocess.run(["git", "rev-parse", "HEAD"], cwd=d, capture_output=True, text=True).stdout.strip()
+
+
+print("detection")
+d = newrepo({"package.json": json.dumps({"scripts": {"lint": "x", "test": "y"},
+                                         "devDependencies": {"vitest": "^1"}}),
+             "pnpm-lock.yaml": ""})
+cfg = json.loads(run(["init"], d).stdout)
+ok(cfg["stack"] == "node", "node stack detected")
+ok(cfg["pm"] == "pnpm", "pnpm detected from the lockfile")
+ok(cfg["test"].get("unit") == "vitest", "vitest detected")
+ok("pnpm run lint" in (cfg["verifyCmd"] or ""), "verify command assembled from scripts")
+shutil.rmtree(d)
+
+d = newrepo({"Cargo.toml": "[package]\nname='t'\n"})
+cfg = json.loads(run(["init"], d).stdout)
+ok(cfg["stack"] == "rust" and cfg["pm"] == "cargo", "rust stack detected")
+ok("clippy" in cfg["verifyCmd"], "clippy in the rust verify command")
+shutil.rmtree(d)
+
+d = newrepo({"go.mod": "module t\n"})
+ok(json.loads(run(["init"], d).stdout)["stack"] == "go", "go stack detected")
+shutil.rmtree(d)
+
+print("init is idempotent and keeps human edits")
+d = newrepo({"Cargo.toml": "[package]\nname='t'\n"})
+run(["init", "--write"], d)
+cfg = json.load(open(os.path.join(d, "sdlc.config.json")))
+cfg["verifyCmd"] = "my-own-command"
+json.dump(cfg, open(os.path.join(d, "sdlc.config.json"), "w"))
+run(["init", "--write"], d)
+ok(json.load(open(os.path.join(d, "sdlc.config.json")))["verifyCmd"] == "my-own-command",
+   "a hand-set verifyCmd survives re-init")
+shutil.rmtree(d)
+
+print("guard: destructive git")
+d = newrepo()
+for cmd in ["git stash", "git reset --hard HEAD~1", "git clean -fd", "git checkout -- .",
+            "git add -A", "git commit -am x", "git push --force origin main",
+            "rm -rf /", "git filter-branch --all"]:
+    ok(guard(d, cmd).returncode == 2, f"blocked: {cmd}")
+for cmd in ["git stash list", "git status --short", "git add src/main.rs",
+            "git commit -m 'fix the -a flag'", "cargo test", "gh pr create --fill"]:
+    ok(guard(d, cmd).returncode == 0, f"allowed: {cmd}")
+
+print("guard: publishing")
+for cmd in ["git tag v1.0", "npm publish", "cargo publish", "gh release create v1",
+            "docker push x/y", "git push --tags origin"]:
+    ok(guard(d, cmd).returncode == 2, f"blocked: {cmd}")
+ok(guard(d, "git tag --list").returncode == 0, "allowed: git tag --list")
+
+print("guard: credentials")
+for cmd in ["cat .env", "cp ~/.ssh/id_rsa /tmp/x", "head -2 .env.production"]:
+    ok(guard(d, cmd).returncode == 2, f"blocked: {cmd}")
+ok(guard(d, "cat .env.example").returncode == 0, "allowed: cat .env.example")
+ok(guard(d, "", tool="Edit", file_path=".env").returncode == 2, "blocked: editing .env")
+ok(guard(d, "", tool="Edit", file_path="src/main.rs").returncode == 0, "allowed: editing source")
+
+print("guard: push to trunk needs a passed gate receipt")
+ok(guard(d, "git push origin main").returncode == 2, "blocked: push main, no receipt")
+ok(guard(d, "git push -u origin feat/x").returncode == 0, "allowed: push a feature branch")
+run(["receipt", "write", "gate", "--verdict", "failed"], d)
+ok(guard(d, "git push origin main").returncode == 2, "blocked: push main, failed gate")
+run(["receipt", "write", "gate", "--verdict", "passed"], d)
+ok(guard(d, "git push origin main").returncode == 0, "allowed: push main, passed gate")
+
+print("guard: merging needs a READY readiness receipt")
+ok(guard(d, "gh pr merge --squash").returncode == 2, "blocked: merge, no readiness")
+run(["receipt", "write", "readiness", "--verdict", "not-ready"], d)
+ok(guard(d, "gh pr merge --squash").returncode == 2, "blocked: merge, NOT-READY")
+run(["receipt", "write", "readiness", "--verdict", "ready"], d)
+ok(guard(d, "gh pr merge --squash").returncode == 0, "allowed: merge, READY")
+ok(guard(d, "git merge --abort").returncode == 0, "allowed: git merge --abort")
+
+print("receipts: bound to the commit")
+open(os.path.join(d, "x.txt"), "w").write("x")
+subprocess.run(["git", "add", "x.txt"], cwd=d)
+subprocess.run(["git", "commit", "-qm", "more"], cwd=d)
+ok(run(["receipt", "check", "readiness", "--verdict", "ready"], d).returncode == 1,
+   "a new commit voids the readiness receipt")
+ok(guard(d, "gh pr merge --squash").returncode == 2, "blocked: merge after a new commit")
+
+print("receipts: bound to the subject's content")
+spec = os.path.join(d, "spec.md")
+open(spec, "w").write("# spec v1\n")
+run(["receipt", "write", "spec", "--verdict", "approved", "--subject", "spec.md"], d)
+ok(run(["receipt", "check", "spec", "--verdict", "approved"], d).returncode == 0,
+   "an approved spec receipt holds")
+open(spec, "w").write("# spec v1 — quietly changed\n")
+ok(run(["receipt", "check", "spec", "--verdict", "approved"], d).returncode == 1,
+   "editing the spec after approval voids the approval")
+
+print("receipts: bound to the clock")
+rp = os.path.join(d, ".sdlc/receipts/readiness.json")
+r = json.load(open(rp)); r["commit"] = head(d)
+r["at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - 5 * 3600))
+json.dump(r, open(rp, "w"))
+ok(guard(d, "gh pr merge --squash").returncode == 2, "blocked: merge with a 5-hour-old receipt")
+
+print("guard never crashes a session")
+ok(subprocess.run([sys.executable, SDLC, "guard"], cwd=d, input="not json",
+                  capture_output=True, text=True).returncode == 0, "malformed hook payload is ignored")
+ok(guard(d, "", tool="Grep").returncode == 0, "unrelated tools pass through")
+
+print("enforcement can be turned off deliberately")
+json.dump({"enforce": {"blockPublishing": False}}, open(os.path.join(d, "sdlc.config.json"), "w"))
+ok(guard(d, "npm publish").returncode == 0, "publishing allowed when the config says so")
+shutil.rmtree(d)
+
+print("deployment is gated on a human approval and a READY gate")
+d = newrepo(config={"approvals": {"release": "human", "merge": "agent"}})
+for cmd in ["kubectl rollout restart deploy/api", "terraform apply -auto-approve",
+            "helm upgrade api ./chart", "flyctl deploy", "ansible-playbook site.yml"]:
+    ok(guard(d, cmd).returncode == 2, f"blocked without approval: {cmd}")
+ok(guard(d, "kubectl get pods").returncode == 0, "allowed: kubectl get pods")
+ok(guard(d, "terraform plan").returncode == 0, "allowed: terraform plan")
+run(["approve", "release", "--as", "A Person"], d)
+ok(guard(d, "terraform apply").returncode == 2, "still blocked: approved but no readiness receipt")
+run(["receipt", "write", "readiness", "--verdict", "ready"], d)
+ok(guard(d, "terraform apply").returncode == 0, "allowed: human approval + READY")
+ok(run(["approve", "release"], d).returncode == 3, "approve refuses without --as")
+ok(guard(d, "gh pr merge --squash").returncode == 0, "a release approval does not authorise a merge check that is agent-level")
+
+print("human approval on merge when the project asks for it")
+json.dump({"approvals": {"merge": "human"}}, open(os.path.join(d, "sdlc.config.json"), "w"))
+run(["receipt", "write", "readiness", "--verdict", "ready"], d)
+ok(guard(d, "gh pr merge --squash").returncode == 2, "blocked: READY but no human approval")
+run(["approve", "merge", "--as", "A Person"], d)
+ok(guard(d, "gh pr merge --squash").returncode == 0, "allowed: READY + human approval")
+
+print("approvals expire with the next commit")
+open(os.path.join(d, "z.txt"), "w").write("z")
+subprocess.run(["git", "add", "z.txt"], cwd=d); subprocess.run(["git", "commit", "-qm", "z"], cwd=d)
+ok(guard(d, "gh pr merge --squash").returncode == 2, "blocked: a new commit voids the approval")
+
+print("the retry loop carries context forward")
+run(["feedback", "write", "--stage", "gate", "--detail", "3 tests failed in auth.test.ts"], d)
+out = run(["feedback", "read"], d).stdout
+ok("auth.test.ts" in out and "Attempt 1" in out, "feedback is readable by the next attempt")
+r2 = run(["feedback", "write", "--stage", "gate", "--detail", "same 3 tests"], d)
+r3 = run(["feedback", "write", "--stage", "gate", "--detail", "still failing"], d)
+ok("Stop and report" in r3.stdout, "three attempts at one stage says stop")
+ok(run(["feedback", "clear"], d).returncode == 0, "feedback can be cleared")
+
+print("the audit trail and metrics")
+ok(os.path.exists(os.path.join(d, ".sdlc/audit.log")), "an audit log is written")
+mout = run(["metrics"], d).stdout
+ok("stage outcomes" in mout and "approval" in mout, "metrics summarise stage outcomes")
+
+print("traceability")
+tout = run(["trace", "--json"], d).stdout
+tj = json.loads(tout)
+ok("receipts" in tj and "commits" in tj, "trace emits machine-readable json")
+ok(run(["trace"], d).returncode == 0, "trace renders for a human")
+shutil.rmtree(d)
+
+print()
+print(f"FAILED: {len(fails)}" if fails else "all tests passed")
+sys.exit(1 if fails else 0)

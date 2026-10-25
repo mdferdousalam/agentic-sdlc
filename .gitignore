@@ -1,3 +1,10 @@
 .DS_Store
 node_modules/
 *.log
+
+# Receipts describe one working copy, never a commit.
+.sdlc/
+
+# Python bytecode from running the tests.
+__pycache__/
+*.pyc

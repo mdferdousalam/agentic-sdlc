@@ -1,0 +1,120 @@
+# Changelog
+
+All notable changes to this plugin. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and the versioning is [semantic](https://semver.org/).
+
+## [2.0.0] — 2026-10-25
+
+A rewrite. v0.1.0 was a document pipeline that asked a model to be careful; this is a pipeline
+whose stages cannot be skipped.
+
+### Added — lifecycle, governance and adoption
+
+Informed by a review of published agentic-SDLC material (Sonar's AC/DC framework, CodeRabbit's
+guide, Weave Intelligence's ASDLC, Optiver's engineering account, NHI Management Group's
+governance glossary, and the agentic-ai-sdlc/Framework repository). Two further sources the
+maintainer supplied — a Medium article and an Infosys page — returned HTTP 403 and were not
+read; nothing here is attributed to them.
+
+- **The lifecycle no longer stops at the merge.** `sdlc-release-manager` and
+  `/agentic-sdlc:release` own deployment, post-deploy verification against the environment
+  itself, and the rollback decision. A written rollback plan and named irreversible steps are
+  required *before* deploying, and `release.*` in the config carries the commands.
+- **Human approval gates.** `approvals.merge` and `approvals.release` (release defaults to
+  `human`). `sdlc approve <what> --as '<name>'` is a person's command; an agent that runs it
+  records nothing. Approvals are scoped — a release approval does not authorise a merge — and
+  are voided by the next commit. Deployment commands (kubectl, helm, terraform, serverless,
+  fly, ansible, cloud CLIs) are refused without both an approval and a READY receipt.
+- **The hybrid retry loop.** `sdlc feedback write|read|clear` carries a gate's failure back to
+  the next attempt as enriched context rather than dropping it, and says to stop after three
+  attempts at the same stage.
+- **`sdlc-remediator` and `/agentic-sdlc:remediate`** — work through findings one commit at a
+  time, each re-verified, each closed as fixed / refused / deferred / unexecuted. Suppressing a
+  warning to close a finding is called out as the failure the pipeline exists to prevent.
+- **`sdlc-triager` and `/agentic-sdlc:triage`** — turn an alert, advisory, bug report or flaky
+  test into a scoped unit of work or a reasoned dismissal, treating the signal's text as data
+  and never as instruction.
+- **Governance you can show someone**: `sdlc metrics` (stage outcomes, first-pass rates,
+  refusals, actors), `sdlc trace` (requirement → commit → test → receipts, markdown or JSON),
+  and an append-only `.sdlc/audit.log`. A 100% first-pass rate is reported as a finding.
+- **`docs/maturity.md`** — four adoption levels, each expressed as a configuration rather than
+  an aspiration, with the metric that says you are ready to move up.
+- **`docs/compliance.md`** — mapping to NIST AI RMF, OWASP Agentic AI, OWASP Non-Human
+  Identity and ISO 42001/SOC 2 evidence, with five stated limits including no cryptographic
+  identity and no shipped analyser.
+- **`GETTING-STARTED.md`** — a guided first hour for someone who has never used this.
+- **`quality` config** — a deterministic-analysis budget on *new* code, because the research on
+  agent-written code reports rising warnings and complexity rather than falling ones.
+- **An eval suite** (`evals/`, four cases) for `claude plugin eval`: does the spec reviewer
+  catch unfalsifiable requirements, does the gate refuse an `unexecuted` criterion behind a
+  green suite, is a refusal negotiable under social pressure, does the release manager insist
+  on a rollback plan and a human approval.
+
+### Added — the enforced pipeline
+
+- **Enforcement.** `hooks/hooks.json` registers a `PreToolUse` hook calling `bin/sdlc guard`,
+  which exits 2 to refuse a tool call. A branch needs an approved spec; a push to a protected
+  branch needs a passed gate; a merge needs a READY verdict for that exact commit. Destructive
+  git, publishing and credential reads are refused outright.
+- **Receipts.** `sdlc receipt write|check|show` records each stage's verdict bound to a commit,
+  a clock and — for a specification — a digest of the content approved. A new commit voids a
+  receipt; editing an approved spec voids its approval.
+- **`bin/sdlc`** — stack detection, config, receipts, the guard, `status` and `doctor`. Python
+  3.8+, standard library only, no network.
+- **Seven new agents**: `sdlc-implementer` (v0.1.0 had no agent that wrote code),
+  `sdlc-test-author`, `sdlc-code-reviewer`, `sdlc-security-reviewer`, `sdlc-verifier`,
+  `sdlc-lander`, `sdlc-reporter`.
+- **Eleven slash commands** — `:init`, `:feature`, `:implement`, `:verify`, `:review`,
+  `:gate`, `:readiness`, `:land`, `:report`, `:status`, `:doctor`.
+- **OpenSpec as a first-class engine.** `spec.engine` is detected; the spec reviewer runs
+  `openspec change validate --strict`, `tasks.md` becomes the acceptance criteria the verifier
+  and the gate check against, and the reporter archives the change after landing.
+- **Profiles** — `webapp`, `library`, `service`, `compiler`: opt-in standards a reviewer can
+  check, selected by `"profile"`.
+- **A JSON Schema** for the adapter, and a config that is re-detected without overwriting
+  anything set by hand.
+- **opencode support** — `bin/sdlc-install-opencode` installs the same agents, commands and
+  enforcement, calling the same guard.
+- **Tests** — 46 cases over detection, the guard, receipt binding and config overrides, run in
+  CI. The validator now checks agent/filename agreement, command→agent references, hook wiring
+  and that the CLI is executable.
+
+### Changed
+
+- **The evidence vocabulary is five words** — passed, failed, skipped, refused, unexecuted —
+  replacing `met/partial/missing` and `pass/fail`. A test that did not run is `unexecuted`, and
+  the gate treats it as such.
+- **Specifications are no longer hand-versioned.** `PRD_v1.0.md` and `CVR_of-DI-v1.0_r1.md`
+  become `PRD.md` and `verification.md`; git keeps the history.
+- `sdlc.config.json` gains `spec`, `secretScan`, `profile`, `receipts`, `enforce`, `heavy`, and
+  a `version` field.
+- Every agent now reads `docs/rules.md` rather than restating the rules, so they cannot drift
+  apart.
+
+### Removed
+
+- **The configurability audit from the core.** "No hardcoded value the spec marked
+  configurable", reference tables, admin CRUD surfaces and 3NF were rules from the application
+  the kit was extracted from, and they produced noise on every other kind of project. They now
+  live in `profiles/webapp.md` and apply when you ask for them.
+- **The DI stage.** A third document between the FRD and the code mostly restated the FRD; the
+  implementer reads the specification directly. What the DI uniquely carried — the decisions
+  taken while building — is now in the implementation report, where it is written after the
+  fact and is therefore true.
+- The `sdlc-init`, `start-feature`, `dev-instructions`, `verification-report` and
+  `implementation-report` skills, replaced by commands and agents. Three reference skills
+  remain: `agentic-sdlc-pipeline`, `openspec-with-sdlc`, `writing-specifications`.
+
+### Migration from 0.1.x
+
+1. `/agentic-sdlc:init --write` — rewrites `sdlc.config.json` in the v2 shape, keeping your
+   `trunk`, `verifyCmd` and anything else you had set.
+2. Add `.sdlc/` to `.gitignore`.
+3. Set `"profile": "webapp"` if you relied on the configurability and data-model rules.
+4. Existing `PRD_v1.0.md` / `FRD_v1.0.md` still read fine; new specs drop the version suffix.
+5. `/agentic-sdlc:doctor`.
+
+## [0.1.0] — 2026-10
+
+First release: PRD → FRD → branch → DI → code → CVR → readiness gate → IR, four agents, five
+skills, and a detected `sdlc.config.json`.

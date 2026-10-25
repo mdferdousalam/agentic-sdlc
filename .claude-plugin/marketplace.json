@@ -5,7 +5,7 @@
     {
       "name": "agentic-sdlc",
       "source": "./",
-      "description": "Portable agent-based SDLC pipeline for any project: PRD -> FRD -> branch -> DI -> code -> CVR -> readiness gate -> IR."
+      "description": "An enforced agent-based SDLC pipeline: specify, review, branch, implement, verify, review, gate, land, report — each stage owned by one agent and closed by a receipt a hook checks. Stack-agnostic; speaks OpenSpec or PRD/FRD."
     }
   ]
 }

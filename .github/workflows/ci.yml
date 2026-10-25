@@ -14,35 +14,59 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  validate-json:
-    name: Validate JSON
+  test:
+    name: Tests (${{ matrix.os }}, python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Guard, receipts and detection
+        run: python3 tests/test_sdlc.py
+
+  structure:
+    name: Plugin structure
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-node@v6
         with:
           node-version: 20
-      - name: Parse JSON manifests
+      - name: Manifests parse
         run: |
-          for f in .claude-plugin/plugin.json .claude-plugin/marketplace.json; do
-            node -e "JSON.parse(require('fs').readFileSync('$f','utf8')); console.log('ok: ' + '$f')"
+          for f in .claude-plugin/plugin.json .claude-plugin/marketplace.json \
+                   hooks/hooks.json schema/sdlc.config.schema.json; do
+            node -e "JSON.parse(require('fs').readFileSync('$f','utf8'))" && echo "ok: $f"
           done
+      - name: Validate agents, commands, skills, hooks and the CLI
+        run: node .github/scripts/validate-plugin.mjs
+      - name: A generated config satisfies the schema
+        run: |
+          npx --yes ajv-cli@5 validate \
+            -s schema/sdlc.config.schema.json \
+            -d <(python3 bin/sdlc init) --spec=draft2020 --strict=false
 
-  lint-markdown:
+  shell:
+    name: Shell and Python lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: shellcheck
+        run: shellcheck bin/sdlc-install-opencode
+      - name: python syntax and a byte-compile
+        run: python3 -m py_compile bin/sdlc tests/test_sdlc.py
+      - name: the CLI is executable
+        run: test -x bin/sdlc && test -x bin/sdlc-install-opencode
+
+  markdown:
     name: Lint Markdown
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - name: markdownlint
-        run: npx --yes markdownlint-cli2
-
-  validate-plugin:
-    name: Validate plugin structure
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 20
-      - name: Validate plugin manifest, agents, and skills
-        run: node .github/scripts/validate-plugin.mjs
+      - run: npx --yes markdownlint-cli2

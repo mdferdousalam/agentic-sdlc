@@ -1,0 +1,871 @@
+#!/usr/bin/env python3
+"""sdlc — the machine half of the agentic SDLC pipeline.
+
+The agents are prose: they persuade a model. This is the part that does not negotiate. It
+detects the project, records each stage's verdict as a receipt bound to a commit and a clock,
+and — as a PreToolUse hook — refuses the actions that would skip a stage.
+
+    sdlc init [--write]          detect the stack and write sdlc.config.json
+    sdlc config                  print the effective configuration
+    sdlc receipt write KIND --verdict V [--subject S] [--detail D]
+    sdlc receipt check KIND [--verdict V] [--max-age-min N]
+    sdlc receipt show  KIND
+    sdlc status                  where this unit of work stands
+    sdlc guard                   PreToolUse hook: reads tool JSON on stdin, exit 2 blocks
+    sdlc doctor                  check the install, the config and the repo
+
+Python 3.8+, standard library only, no network. Exit codes: 0 fine, 1 a check failed,
+2 blocked (the hook contract), 3 misuse.
+"""
+from __future__ import annotations
+
+import argparse
+import calendar
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+CONFIG_NAMES = ("sdlc.config.json", ".opencode/sdlc.json")
+RECEIPT_DIR = ".sdlc/receipts"
+RECEIPT_KINDS = ("spec", "verification", "review", "security", "quality", "gate",
+                 "readiness", "approval_merge", "approval_release", "approval_exception",
+                 "release", "postdeploy")
+AUDIT_LOG = ".sdlc/audit.log"
+FEEDBACK = ".sdlc/feedback.json"
+DEFAULT_MAX_AGE_MIN = 180
+
+# --------------------------------------------------------------------------------------- git
+
+
+def git(*args: str, cwd: str | None = None) -> str:
+    try:
+        p = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=20)
+        return p.stdout.strip()
+    except Exception:
+        return ""
+
+
+def repo_root(start: str | None = None) -> str:
+    r = git("rev-parse", "--show-toplevel", cwd=start or os.getcwd())
+    return r or (start or os.getcwd())
+
+
+def head(root: str) -> str:
+    return git("rev-parse", "HEAD", cwd=root)
+
+
+def branch(root: str) -> str:
+    return git("rev-parse", "--abbrev-ref", "HEAD", cwd=root)
+
+
+def tree_clean(root: str) -> bool:
+    return git("status", "--porcelain", "--untracked-files=no", cwd=root) == ""
+
+
+# ------------------------------------------------------------------------------------ config
+
+
+def exists(root: str, *names: str) -> bool:
+    return any(os.path.exists(os.path.join(root, n)) for n in names)
+
+
+def which(name: str) -> bool:
+    return shutil.which(name) is not None
+
+
+def config_path(root: str) -> str | None:
+    for n in CONFIG_NAMES:
+        p = os.path.join(root, n)
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def load_config(root: str) -> dict:
+    p = config_path(root)
+    if not p:
+        return {}
+    try:
+        return json.load(open(p))
+    except Exception as e:
+        print(f"sdlc: {p} is not valid JSON: {e}", file=sys.stderr)
+        return {}
+
+
+def detect_trunk(root: str) -> str:
+    ref = git("symbolic-ref", "--short", "refs/remotes/origin/HEAD", cwd=root)
+    if ref:
+        return ref.split("/")[-1]
+    for cand in ("main", "master", "develop", "Development"):
+        if git("rev-parse", "--verify", "--quiet", f"refs/heads/{cand}", cwd=root):
+            return cand
+    return branch(root) or "main"
+
+
+def detect(root: str) -> dict:
+    """Infer the project's bindings. Everything here is a guess the user may correct."""
+    pm = monorepo = None
+    stack = "unknown"
+    test = {}
+    verify = []
+
+    if exists(root, "pnpm-lock.yaml"):
+        pm = "pnpm"
+    elif exists(root, "yarn.lock"):
+        pm = "yarn"
+    elif exists(root, "bun.lockb", "bun.lock"):
+        pm = "bun"
+    elif exists(root, "package-lock.json"):
+        pm = "npm"
+    elif exists(root, "package.json"):
+        pm = "npm"
+
+    if pm:
+        stack = "node"
+        monorepo = ("turbo" if exists(root, "turbo.json") else
+                    "nx" if exists(root, "nx.json") else
+                    "lerna" if exists(root, "lerna.json") else
+                    "workspaces" if exists(root, "pnpm-workspace.yaml") else None)
+        pkg = {}
+        try:
+            pkg = json.load(open(os.path.join(root, "package.json")))
+        except Exception:
+            pass
+        deps = {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}
+        scripts = pkg.get("scripts", {})
+        for runner in ("vitest", "jest", "mocha", "ava", "node:test"):
+            if runner.split(":")[0] in deps:
+                test["unit"] = runner
+                break
+        for e2e in ("playwright", "@playwright/test", "cypress"):
+            if e2e in deps:
+                test["e2e"] = e2e.replace("@playwright/test", "playwright")
+                break
+        for s in ("lint", "typecheck", "type-check", "test"):
+            if s in scripts:
+                verify.append(f"{pm} run {s}" if s != "test" else f"{pm} test")
+    elif exists(root, "Cargo.toml"):
+        stack, pm = "rust", "cargo"
+        test["unit"] = "cargo test"
+        verify = ["cargo fmt --all -- --check",
+                  "cargo clippy --all-targets --all-features -- -D warnings",
+                  "cargo test --workspace"]
+    elif exists(root, "go.mod"):
+        stack, pm = "go", "go"
+        test["unit"] = "go test"
+        verify = ["gofmt -l .", "go vet ./...", "go test ./..."]
+    elif exists(root, "pyproject.toml", "setup.cfg", "requirements.txt"):
+        stack = "python"
+        pm = "uv" if exists(root, "uv.lock") else "poetry" if exists(root, "poetry.lock") else "pip"
+        test["unit"] = "pytest"
+        verify = (["ruff check ."] if exists(root, "ruff.toml") or which("ruff") else []) + ["pytest -q"]
+    elif exists(root, "pom.xml"):
+        stack, pm, verify = "java", "maven", ["mvn -q verify"]
+    elif exists(root, "build.gradle", "build.gradle.kts"):
+        stack, pm, verify = "java", "gradle", ["./gradlew check"]
+    elif exists(root, "Gemfile"):
+        stack, pm, verify = "ruby", "bundler", ["bundle exec rubocop", "bundle exec rspec"]
+    elif exists(root, "composer.json"):
+        stack, pm, verify = "php", "composer", ["composer test"]
+    elif exists(root, "book.toml"):
+        stack, verify = "mdbook", ["mdbook build"]
+    elif exists(root, "action.yml", "action.yaml"):
+        stack = "github-action"
+
+    engine = "openspec" if exists(root, "openspec") or which("openspec") else "prd-frd"
+
+    commits = "conventional" if exists(
+        root, "commitlint.config.js", "commitlint.config.cjs", "commitlint.config.mjs",
+        ".commitlintrc", ".commitlintrc.json", ".husky") else "descriptive"
+
+    secret_scan = ("gitleaks git --no-banner --redact -n 50" if which("gitleaks")
+                   else "trufflehog git file://. --since-commit HEAD~50 --fail" if which("trufflehog")
+                   else None)
+
+    cfg = {
+        "$schema": "./schema/sdlc.config.schema.json",
+        "version": 2,
+        "trunk": detect_trunk(root),
+        "stack": stack,
+        "pm": pm,
+        "monorepo": monorepo,
+        "commits": commits,
+        "test": test,
+        "spec": {
+            "engine": engine,
+            "docsRoot": "openspec/changes" if engine == "openspec" else "docs/specs",
+            "strict": True,
+        },
+        "branchScheme": "{kind}/{slug}",
+        "verifyCmd": " && ".join(verify) if verify else None,
+        "gateCmd": None,
+        "secretScan": secret_scan,
+        "heavy": None,
+        "profile": None,
+        "quality": {
+            "cmd": None,
+            "coverageNewPct": None,
+            "note": "Deterministic analysis on NEW code. Research on agent-written code reports "
+                    "rising warnings and complexity, so the budget is on what this change adds, "
+                    "not on the whole repository.",
+        },
+        "release": {
+            "deployCmd": None,
+            "smokeCmd": None,
+            "rollbackCmd": None,
+            "environments": [],
+        },
+        "approvals": {"merge": "agent", "release": "human"},
+        "attributeCommits": True,
+        "reviewers": ["sdlc-code-reviewer"] + (["sdlc-security-reviewer"] if stack in ("rust", "go", "node", "python", "java") else []),
+        "protected": ["main", "master", "release/*"],
+        "receipts": {"maxAgeMin": DEFAULT_MAX_AGE_MIN},
+        "enforce": {
+            "pushToTrunkNeedsGate": True,
+            "mergeNeedsReadiness": True,
+            "branchNeedsApprovedSpec": True,
+            "blockDestructiveGit": True,
+            "blockPublishing": True,
+            "blockCredentialReads": True,
+        },
+        "neverByAgent": ["tag", "release", "publish", "force-push", "deploy"],
+    }
+    return cfg
+
+
+# ---------------------------------------------------------------------------------- receipts
+
+
+def receipt_path(root: str, kind: str) -> str:
+    return os.path.join(root, RECEIPT_DIR, f"{kind}.json")
+
+
+def subject_digest(root: str, subject: str) -> str | None:
+    if not subject:
+        return None
+    p = os.path.join(root, subject)
+    h = hashlib.sha256()
+    if os.path.isfile(p):
+        h.update(open(p, "rb").read())
+    elif os.path.isdir(p):
+        for dirpath, dirnames, names in os.walk(p):
+            dirnames.sort()
+            for n in sorted(names):
+                f = os.path.join(dirpath, n)
+                h.update(os.path.relpath(f, p).encode())
+                try:
+                    h.update(open(f, "rb").read())
+                except OSError:
+                    pass
+    else:
+        return None
+    return "sha256:" + h.hexdigest()[:16]
+
+
+def audit(root: str, event: str, detail: str) -> None:
+    """Append-only record of everything the pipeline decided. Never rotated by this tool."""
+    try:
+        p = os.path.join(root, AUDIT_LOG)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        line = "\t".join([
+            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            event,
+            (head(root) or "")[:9],
+            branch(root) or "-",
+            os.environ.get("CLAUDE_AGENT") or os.environ.get("OPENCODE_AGENT") or "-",
+            re.sub(r"\s+", " ", str(detail))[:400],
+        ])
+        with open(p, "a") as fh:
+            fh.write(line + "\n")
+    except Exception:
+        pass
+
+
+def receipt_write(root: str, kind: str, verdict: str, subject: str, detail: str, by: str) -> int:
+    r = {
+        "kind": kind,
+        "verdict": verdict,
+        "commit": head(root),
+        "branch": branch(root),
+        "subject": subject or None,
+        "subjectDigest": subject_digest(root, subject),
+        "detail": detail,
+        "by": by,
+        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "treeClean": tree_clean(root),
+    }
+    p = receipt_path(root, kind)
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "w") as fh:
+        json.dump(r, fh, indent=2)
+        fh.write("\n")
+    audit(root, f"receipt.{kind}", f"{verdict} by {by}: {detail}")
+    print(f"{kind}: {verdict}  ->  {os.path.relpath(p, root)}")
+    return 0
+
+
+def receipt_problem(root: str, kind: str, verdict: str | None, max_age_min: int,
+                    require_commit: bool = True) -> str | None:
+    """Why this receipt does not hold, or None."""
+    p = receipt_path(root, kind)
+    if not os.path.exists(p):
+        return f"there is no {kind} receipt"
+    try:
+        r = json.load(open(p))
+    except Exception as e:
+        return f"the {kind} receipt is unreadable ({e})"
+    if verdict and r.get("verdict") != verdict:
+        return f'the {kind} receipt says "{r.get("verdict")}", not "{verdict}"'
+    if require_commit:
+        h = head(root)
+        if r.get("commit") != h:
+            return (f"the {kind} receipt is for {str(r.get('commit'))[:9]} but HEAD is {h[:9]} — "
+                    f"the work changed after it was granted")
+    if r.get("subject") and r.get("subjectDigest"):
+        now = subject_digest(root, r["subject"])
+        if now and now != r["subjectDigest"]:
+            return (f"the {kind} receipt is for a different version of {r['subject']} — "
+                    f"it was edited after approval")
+    try:
+        age = (time.time() - calendar.timegm(time.strptime(r["at"], "%Y-%m-%dT%H:%M:%SZ"))) / 60
+    except Exception:
+        return f"the {kind} receipt has no readable timestamp"
+    if age > max_age_min:
+        return f"the {kind} receipt is {int(age)} minutes old (limit {max_age_min})"
+    return None
+
+
+# ------------------------------------------------------------------------------------- guard
+
+DESTRUCTIVE = [
+    (r"\bgit\s+stash\b(?!\s+(list|show))", "git stash hides uncommitted work; commit path-scoped instead"),
+    (r"\bgit\s+reset\s+(--hard|--merge|--keep)\b", "git reset --hard destroys uncommitted work"),
+    (r"\bgit\s+clean\b", "git clean deletes untracked files"),
+    (r"\bgit\s+(checkout|restore)\s+(--\s+)?\.(\s|$)", "this discards every uncommitted change"),
+    (r"\bgit\s+(push|branch)\b[^|;&]*--force(-with-lease)?\b", "force-push rewrites published history"),
+    (r"\bgit\s+filter-(branch|repo)\b", "history rewriting is the maintainer's decision"),
+    (r"\brm\s+(-[a-zA-Z]*\s+)*(-rf|-fr)\s+(/|~|\$HOME)(\s|$)", "refusing rm -rf of a root or home path"),
+]
+PUBLISHING = [
+    (r"\bgit\s+tag\b(?!\s+(-l|--list|-n))", "a tag is a public promise — the maintainer's call"),
+    (r"\bgit\s+push\b[^|;&]*(--tags|\brefs/tags/)", "pushing tags is the maintainer's call"),
+    (r"\b(npm|pnpm|yarn|bun)\s+publish\b", "publishing is the maintainer's call"),
+    (r"\bcargo\s+publish\b", "publishing is the maintainer's call"),
+    (r"\b(twine|poetry)\s+(upload|publish)\b", "publishing is the maintainer's call"),
+    (r"\bgh\s+release\s+(create|edit|delete|upload)\b", "cutting a release is the maintainer's call"),
+    (r"\bdocker\s+push\b", "pushing an image is a deploy — the maintainer's call"),
+]
+STAGING = [
+    (r"\bgit\s+add\s+(-A|--all|\.)(\s|$)", "commit path-scoped: git add <explicit paths>"),
+    (r"\bgit\s+commit(\s+-{1,2}[\w-]+)*\s+(-[a-zA-Z]*a[a-zA-Z]*|--all)(\s|$)",
+     "git commit -a stages the whole tree; stage explicit paths"),
+]
+# Commands that put a change in front of users. Detected conservatively: a false positive costs
+# one approval, a false negative costs an unreviewed deployment.
+DEPLOY_PATTERNS = [
+    r"\b(kubectl|helm)\s+(apply|rollout|upgrade|install|delete)\b",
+    r"\b(terraform|tofu)\s+(apply|destroy)\b",
+    r"\b(serverless|sls)\s+deploy\b",
+    r"\baws\s+(deploy|ecs|lambda|cloudformation|s3\s+sync)\b",
+    r"\b(gcloud|az)\s+\w+\s+deploy\b",
+    r"\b(flyctl|fly|vercel|netlify|heroku|railway|render)\s+(deploy|releases?)\b",
+    r"\bdocker\s+(compose\s+)?(up|stack\s+deploy)\b[^|;&]*(prod|production)",
+    r"\bansible-playbook\b",
+    r"\bgh\s+workflow\s+run\b[^|;&]*(deploy|release|prod)",
+]
+
+CREDENTIALS = [
+    (r"(^|[\s;|&(])(cat|bat|less|more|head|tail|strings|xxd|od|cp|scp|rsync|curl)\b[^|;&]*"
+     r"(\.env(\.(?!example|sample|template)[\w.-]+)?|/\.ssh/|/\.aws/|id_rsa|id_ed25519|\.pem|\.p12|"
+     r"credentials\.json|secrets\.ya?ml)(\s|$|['\")])",
+     "reading a credential file is forbidden"),
+    (r"\b(sk-[A-Za-z0-9]{12,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{12,})",
+     "a credential appears in this command line"),
+]
+
+
+def guard_problem(root: str, command: str, cfg: dict) -> str | None:
+    enforce = cfg.get("enforce") or {}
+    groups = []
+    if enforce.get("blockDestructiveGit", True):
+        groups += DESTRUCTIVE + STAGING
+    if enforce.get("blockPublishing", True):
+        groups += PUBLISHING
+    if enforce.get("blockCredentialReads", True):
+        groups += CREDENTIALS
+    for pattern, why in groups:
+        if re.search(pattern, command):
+            return f"{why}."
+
+    protected = cfg.get("protected") or ["main", "master"]
+    trunk = cfg.get("trunk") or "main"
+    prot_re = "|".join(re.escape(p).replace(r"\*", r"[^\s]*") for p in set(protected + [trunk]))
+    max_age = int(((cfg.get("receipts") or {}).get("maxAgeMin")) or DEFAULT_MAX_AGE_MIN)
+    approvals = cfg.get("approvals") or {}
+    cur = branch(root)
+
+    if enforce.get("pushToTrunkNeedsGate", True) and re.search(r"\bgit\s+push\b", command):
+        named = re.search(r"\bgit\s+push\b\s+\S+\s+\S", command)
+        targets_protected = bool(re.search(rf"\b({prot_re})\b", command)) or (
+            not named and re.fullmatch(rf"({prot_re})", cur or "") is not None)
+        if targets_protected:
+            why = receipt_problem(root, "gate", "passed", max_age)
+            if why:
+                return (f"pushing a protected branch needs a passed gate receipt, and {why}.\n"
+                        f"Run `/agentic-sdlc:gate` (the mechanical checks and the secret scan), or "
+                        f"push a feature branch and open a pull request instead — that needs no "
+                        f"receipt.")
+
+    if enforce.get("mergeNeedsReadiness", True):
+        merging = re.search(r"\bgh\s+pr\s+merge\b", command) or (
+            re.search(r"\bgit\s+merge\b", command)
+            and not re.search(r"--(abort|continue|quit)\b", command)
+            and re.fullmatch(rf"({prot_re})", cur or "") is not None)
+        if merging:
+            why = receipt_problem(root, "readiness", "ready", max_age)
+            if why:
+                return (f"merging needs a READY readiness receipt, and {why}.\n"
+                        f"Run `/agentic-sdlc:readiness`. It runs the reviewers, the secret scan and "
+                        f"the verify command, and checks every acceptance criterion against evidence.")
+            if approvals.get("merge") == "human":
+                why = receipt_problem(root, "approval_merge", "granted", max_age)
+                if why:
+                    return (f"this project requires a human to approve a merge, and {why}.\n"
+                            f"A person runs:  sdlc approve merge --as '<their name>'\n"
+                            f"An agent must not run it for them — the approval records who is "
+                            f"accountable, and an agent approving its own work records nothing.")
+
+    # Deployment is a separate authority from merging, and defaults to a human's.
+    deploying = any(re.search(pat, command) for pat in DEPLOY_PATTERNS)
+    if deploying:
+        if approvals.get("release", "human") == "human":
+            why = receipt_problem(root, "approval_release", "granted", max_age)
+            if why:
+                return (f"deploying needs a human approval, and {why}.\n"
+                        f"A person runs:  sdlc approve release --as '<their name>'\n"
+                        f"Deployment changes what users are running. No agent grants itself that.")
+        why = receipt_problem(root, "readiness", "ready", max_age)
+        if why:
+            return f"deploying needs a READY readiness receipt, and {why}."
+    return None
+
+
+def cmd_guard(_args) -> int:
+    """PreToolUse hook. Reads Claude Code's tool JSON on stdin; exit 2 blocks the call."""
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        return 0  # never break a session over a malformed payload
+    tool = payload.get("tool_name") or payload.get("tool") or ""
+    inp = payload.get("tool_input") or payload.get("input") or {}
+    cwd = payload.get("cwd") or os.getcwd()
+    root = repo_root(cwd)
+    cfg = load_config(root)
+
+    if tool in ("Bash", "bash", "shell"):
+        command = str(inp.get("command", ""))
+        if not command:
+            return 0
+        problem = guard_problem(root, command, cfg)
+        if problem:
+            print(f"BLOCKED by agentic-sdlc: {problem}\n"
+                  f"This is a pipeline rule, not a preference. Do not work around it — choose "
+                  f"another route or stop and report.", file=sys.stderr)
+            return 2
+    elif tool in ("Edit", "Write", "NotebookEdit", "edit", "write"):
+        path = str(inp.get("file_path") or inp.get("path") or "")
+        if re.search(r"(^|/)(\.env(\.(?!example|sample|template)[\w.-]+)?|credentials\.json|"
+                     r"secrets\.ya?ml|id_rsa|id_ed25519|.*\.pem)$|(^|/)\.(ssh|aws)/", path):
+            print(f"BLOCKED by agentic-sdlc: {path} holds credentials.", file=sys.stderr)
+            return 2
+    return 0
+
+
+# ------------------------------------------------------------------------------- subcommands
+
+
+def cmd_init(args) -> int:
+    root = repo_root()
+    cfg = detect(root)
+    existing = load_config(root)
+    if existing:
+        # Keep what a human has set; only fill what detection newly knows.
+        for k, v in existing.items():
+            if k != "$schema":
+                cfg[k] = v
+        cfg.setdefault("version", 2)
+    out = json.dumps(cfg, indent=2) + "\n"
+    target = os.path.join(root, "sdlc.config.json")
+    if not args.write:
+        print(out, end="")
+        print(f"\n# not written — re-run with --write to save {os.path.relpath(target, root)}",
+              file=sys.stderr)
+        return 0
+    open(target, "w").write(out)
+    print(f"wrote {os.path.relpath(target, root)}")
+    if cfg["spec"]["engine"] == "openspec" and not os.path.isdir(os.path.join(root, "openspec")):
+        print("openspec is available but this repo has no openspec/ — run: openspec init")
+    if not cfg.get("verifyCmd"):
+        print("no verify command could be detected — set \"verifyCmd\" by hand; the pipeline "
+              "cannot gate anything without it")
+    return 0
+
+
+def cmd_config(_args) -> int:
+    root = repo_root()
+    p = config_path(root)
+    if not p:
+        print("no sdlc.config.json — run: sdlc init --write", file=sys.stderr)
+        return 1
+    print(f"# {os.path.relpath(p, root)}")
+    print(json.dumps(load_config(root), indent=2))
+    return 0
+
+
+def cmd_receipt(args) -> int:
+    root = repo_root()
+    if args.receipt_action == "write":
+        if not args.verdict:
+            print("sdlc receipt write needs --verdict", file=sys.stderr)
+            return 3
+        return receipt_write(root, args.kind, args.verdict, args.subject, args.detail, args.by)
+    if args.receipt_action == "show":
+        p = receipt_path(root, args.kind)
+        if not os.path.exists(p):
+            print(f"no {args.kind} receipt", file=sys.stderr)
+            return 1
+        print(open(p).read(), end="")
+        return 0
+    cfg = load_config(root)
+    max_age = args.max_age_min or int(((cfg.get("receipts") or {}).get("maxAgeMin")) or DEFAULT_MAX_AGE_MIN)
+    why = receipt_problem(root, args.kind, args.verdict, max_age, require_commit=not args.any_commit)
+    if why:
+        print(f"{args.kind} receipt does not hold: {why}", file=sys.stderr)
+        return 1
+    print(f"{args.kind} receipt holds")
+    return 0
+
+
+def cmd_status(_args) -> int:
+    root = repo_root()
+    cfg = load_config(root)
+    print(f"repo      {os.path.basename(root)}")
+    print(f"branch    {branch(root)}   (trunk: {cfg.get('trunk', '?')})")
+    print(f"head      {head(root)[:9]}  tree {'clean' if tree_clean(root) else 'DIRTY'}")
+    spec = cfg.get("spec") or {}
+    print(f"spec      engine {spec.get('engine', '?')}, root {spec.get('docsRoot', '?')}")
+    print(f"verify    {cfg.get('verifyCmd') or '(none set — the gate cannot run)'}")
+    if cfg.get("gateCmd"):
+        print(f"gate      {cfg['gateCmd']}")
+    print("receipts")
+    for kind in RECEIPT_KINDS:
+        p = receipt_path(root, kind)
+        if not os.path.exists(p):
+            continue
+        try:
+            r = json.load(open(p))
+        except Exception:
+            continue
+        why = receipt_problem(root, kind, None, 10 ** 9)
+        mark = "stale" if why else "current"
+        print(f"  {kind:<13} {r.get('verdict','?'):<18} {str(r.get('commit',''))[:9]}  {r.get('at','')}  {mark}")
+    return 0
+
+
+def cmd_doctor(_args) -> int:
+    root = repo_root()
+    cfg = load_config(root)
+    problems, notes = [], []
+
+    if not git("rev-parse", "--is-inside-work-tree", cwd=root):
+        problems.append("not inside a git repository — the pipeline needs git")
+    if not cfg:
+        problems.append("no sdlc.config.json — run: sdlc init --write")
+    else:
+        if not cfg.get("verifyCmd"):
+            problems.append('"verifyCmd" is not set — nothing can be gated')
+        if not cfg.get("secretScan"):
+            notes.append('"secretScan" is not set — install gitleaks and re-run `sdlc init`')
+        engine = (cfg.get("spec") or {}).get("engine")
+        if engine == "openspec":
+            if not which("openspec"):
+                problems.append('spec.engine is "openspec" but the openspec CLI is not installed')
+            elif not os.path.isdir(os.path.join(root, "openspec")):
+                problems.append("openspec is configured but this repo has no openspec/ — run: openspec init")
+        if cfg.get("trunk") and cfg["trunk"] != detect_trunk(root):
+            notes.append(f'config says trunk "{cfg["trunk"]}" but git says "{detect_trunk(root)}"')
+
+    hooks = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hooks", "hooks.json")
+    if os.path.exists(hooks):
+        notes.append(f"hooks shipped at {hooks} — enforcement is active when the plugin is installed")
+    else:
+        problems.append("hooks/hooks.json is missing — the pipeline would be advisory only")
+
+    for name, why in (("git", "required"), ("gh", "pull requests"), ("gitleaks", "secret scanning"),
+                      ("openspec", "the OpenSpec engine")):
+        if not which(name):
+            (problems if why == "required" else notes).append(f"{name} not found ({why})")
+
+    for n in notes:
+        print(f"note     {n}")
+    for p in problems:
+        print(f"PROBLEM  {p}")
+    print("doctor: ok" if not problems else f"doctor: {len(problems)} problem(s)")
+    return 0 if not problems else 1
+
+
+
+# ------------------------------------------------------------------- the hybrid retry loop
+
+def cmd_feedback(args) -> int:
+    """Carry a gate's failure back to the agent as context, instead of as a dead end.
+
+    A first-pass failure is the normal shape of agentic work; the productive pattern is
+    candidate -> deterministic gate -> failure routed back as enriched context -> retry. Without
+    somewhere to put that context, each retry starts as ignorant as the attempt before it.
+    """
+    root = repo_root()
+    p = os.path.join(root, FEEDBACK)
+    if args.feedback_action == "clear":
+        if os.path.exists(p):
+            os.remove(p)
+        print("feedback cleared")
+        return 0
+    if args.feedback_action == "read":
+        if not os.path.exists(p):
+            print("no feedback — this is the first attempt")
+            return 0
+        d = json.load(open(p))
+        print(f"# Attempt {d['attempts'] + 1}. Previous attempts failed as follows — read this "
+              f"before changing anything.\n")
+        for i, e in enumerate(d["entries"], 1):
+            print(f"## Attempt {i} — {e['stage']} ({e['at']})")
+            print(e["detail"].strip())
+            print()
+        return 0
+    # write
+    d = {"attempts": 0, "entries": []}
+    if os.path.exists(p):
+        try:
+            d = json.load(open(p))
+        except Exception:
+            pass
+    d["attempts"] = d.get("attempts", 0) + 1
+    d["entries"] = (d.get("entries") or [])[-4:] + [{
+        "stage": args.stage,
+        "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "commit": head(root),
+        "detail": args.detail,
+    }]
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "w") as fh:
+        json.dump(d, fh, indent=2)
+    audit(root, "feedback", f"{args.stage}: attempt {d['attempts']}")
+    print(f"feedback recorded — attempt {d['attempts']} at stage {args.stage}")
+    if d["attempts"] >= 3:
+        print("Three attempts at the same stage. Stop and report rather than trying a fourth: "
+              "the specification or the approach is probably the problem, not the code.")
+    return 0
+
+
+# ------------------------------------------------------------------------------- governance
+
+def cmd_metrics(args) -> int:
+    """What the pipeline actually did — from the audit log, not from anyone's impression."""
+    root = repo_root()
+    p = os.path.join(root, AUDIT_LOG)
+    if not os.path.exists(p):
+        print("no audit log yet — it fills as stages run")
+        return 0
+    rows = []
+    for line in open(p, errors="replace"):
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) >= 6:
+            rows.append(dict(zip(("at", "event", "commit", "branch", "agent", "detail"), parts)))
+    if args.since:
+        rows = [r for r in rows if r["at"][:10] >= args.since]
+    if not rows:
+        print("no events in that window")
+        return 0
+
+    stages, blocks, agents = {}, {}, {}
+    for r in rows:
+        if r["event"].startswith("receipt."):
+            kind = r["event"].split(".", 1)[1]
+            verdict = r["detail"].split(" by ")[0]
+            stages.setdefault(kind, {}).setdefault(verdict, 0)
+            stages[kind][verdict] += 1
+        elif r["event"] == "blocked":
+            blocks[r["detail"][:70]] = blocks.get(r["detail"][:70], 0) + 1
+        if r["agent"] != "-":
+            agents[r["agent"]] = agents.get(r["agent"], 0) + 1
+
+    print(f"{len(rows)} events from {rows[0]['at'][:10]} to {rows[-1]['at'][:10]}\n")
+    print("stage outcomes")
+    for kind in RECEIPT_KINDS:
+        if kind in stages:
+            total = sum(stages[kind].values())
+            detail = ", ".join(f"{v} {k}" for k, v in sorted(stages[kind].items()))
+            good = stages[kind].get("passed", 0) + stages[kind].get("approved", 0) + \
+                stages[kind].get("ready", 0) + stages[kind].get("granted", 0) + \
+                stages[kind].get("pass", 0)
+            print(f"  {kind:<13} {total:>4} runs   {detail}   first-pass {100 * good // max(total, 1)}%")
+    if blocks:
+        print("\nrefusals (what the pipeline stopped)")
+        for why, n in sorted(blocks.items(), key=lambda x: -x[1])[:10]:
+            print(f"  {n:>4}x  {why}")
+    if agents:
+        print("\nactors")
+        for a, n in sorted(agents.items(), key=lambda x: -x[1]):
+            print(f"  {a:<24} {n} events")
+    print("\nA low first-pass rate is not a problem by itself — it is the gate doing its job.\n"
+          "A first-pass rate of 100% means the gate is not checking anything.")
+    return 0
+
+
+def cmd_trace(args) -> int:
+    """Requirement -> commit -> test -> pull request, for an auditor or a future maintainer."""
+    root = repo_root()
+    cfg = load_config(root)
+    trunk = cfg.get("trunk", "main")
+    base = git("merge-base", "HEAD", f"origin/{trunk}", cwd=root) or \
+        git("rev-list", "--max-parents=0", "HEAD", cwd=root)
+    commits = [l for l in git("log", "--format=%H|%s", f"{base}..HEAD", cwd=root).splitlines() if l]
+    files = [l for l in git("diff", "--name-only", f"{base}..HEAD", cwd=root).splitlines() if l]
+    tests = [f for f in files if re.search(r"(^|/)(tests?|spec)/|[._-](test|spec)\.[a-z]+$|_test\.", f)]
+
+    spec_subject = None
+    try:
+        spec_subject = json.load(open(receipt_path(root, "spec"))).get("subject")
+    except Exception:
+        pass
+
+    out = {
+        "branch": branch(root),
+        "head": head(root),
+        "base": base,
+        "specification": spec_subject,
+        "commits": [{"sha": c.split("|")[0][:9], "subject": c.split("|", 1)[1]} for c in commits],
+        "files_changed": files,
+        "tests_touched": tests,
+        "receipts": {},
+    }
+    for kind in RECEIPT_KINDS:
+        rp = receipt_path(root, kind)
+        if os.path.exists(rp):
+            try:
+                r = json.load(open(rp))
+                out["receipts"][kind] = {"verdict": r.get("verdict"), "commit": str(r.get("commit"))[:9],
+                                         "at": r.get("at"), "by": r.get("by")}
+            except Exception:
+                pass
+    pr = git("config", "--get", "branch.%s.pr" % branch(root), cwd=root)
+    if pr:
+        out["pull_request"] = pr
+
+    if args.json:
+        print(json.dumps(out, indent=2))
+        return 0
+    print(f"# Traceability — {out['branch']}\n")
+    print(f"Specification: {out['specification'] or '(none recorded — the spec receipt is missing)'}")
+    print(f"Base: {base[:9]}   Head: {out['head'][:9]}\n")
+    print(f"Commits ({len(commits)})")
+    for c in out["commits"]:
+        print(f"  {c['sha']}  {c['subject'][:90]}")
+    print(f"\nFiles changed: {len(files)}   Tests touched: {len(tests)}")
+    if files and not tests:
+        print("  ⚠ no test file in this change — the verifier should treat every criterion as unexecuted")
+    print("\nReceipts")
+    for kind, r in out["receipts"].items():
+        mark = "current" if r["commit"] == out["head"][:9] else f"stale (for {r['commit']})"
+        print(f"  {kind:<13} {r['verdict']:<18} {mark}")
+    missing = [k for k in ("spec", "verification", "review", "readiness") if k not in out["receipts"]]
+    if missing:
+        print(f"\nNo receipt for: {', '.join(missing)} — those stages did not run.")
+    return 0
+
+
+def cmd_approve(args) -> int:
+    """A person records that they approved something. Deliberately a human-run command.
+
+    The tool cannot prove a human typed it — nothing short of a signing key can — so it records
+    *who claims* the approval, in an append-only log, and makes an unapproved action impossible
+    rather than merely discouraged. That is the honest limit of this control.
+    """
+    root = repo_root()
+    if not args.as_person:
+        print("sdlc approve needs --as '<your name>' — an approval with no one behind it is "
+              "not an approval", file=sys.stderr)
+        return 3
+    detail = f"{args.what}: {args.detail}" if args.detail else args.what
+    rc = receipt_write(root, f"approval_{args.what}", "granted", args.subject or "", detail,
+                       args.as_person)
+    audit(root, "approval", f"{args.what} granted by {args.as_person}")
+    print(f"Recorded: {args.as_person} approved {args.what} at {head(root)[:9]}.\n"
+          f"It expires with the next commit, which is the point.")
+    return rc
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="sdlc", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("init", help="detect the stack and write sdlc.config.json")
+    p.add_argument("--write", action="store_true")
+    p.set_defaults(fn=cmd_init)
+
+    sub.add_parser("config", help="print the effective configuration").set_defaults(fn=cmd_config)
+    sub.add_parser("status", help="where this unit of work stands").set_defaults(fn=cmd_status)
+    sub.add_parser("guard", help="PreToolUse hook (stdin JSON; exit 2 blocks)").set_defaults(fn=cmd_guard)
+    sub.add_parser("doctor", help="check the install, the config and the repo").set_defaults(fn=cmd_doctor)
+
+    a = sub.add_parser("approve", help="a person records an approval (merge, release, exception)")
+    a.add_argument("what", choices=("merge", "release", "exception"))
+    a.add_argument("--as", dest="as_person", help="who is approving — required")
+    a.add_argument("--subject", default="")
+    a.add_argument("--detail", default="")
+    a.set_defaults(fn=cmd_approve)
+
+    f = sub.add_parser("feedback", help="carry a failure back to the next attempt as context")
+    fs = f.add_subparsers(dest="feedback_action", required=True)
+    fw = fs.add_parser("write")
+    fw.add_argument("--stage", required=True)
+    fw.add_argument("--detail", required=True)
+    fs.add_parser("read")
+    fs.add_parser("clear")
+    f.set_defaults(fn=cmd_feedback)
+
+    m = sub.add_parser("metrics", help="what the pipeline did, from the audit log")
+    m.add_argument("--since", help="YYYY-MM-DD")
+    m.set_defaults(fn=cmd_metrics)
+
+    t = sub.add_parser("trace", help="requirement to commit to test to pull request")
+    t.add_argument("--json", action="store_true")
+    t.set_defaults(fn=cmd_trace)
+
+    r = sub.add_parser("receipt", help="write, show or check a stage receipt")
+    rs = r.add_subparsers(dest="receipt_action", required=True)
+    for action in ("write", "show", "check"):
+        q = rs.add_parser(action)
+        q.add_argument("kind", choices=RECEIPT_KINDS)
+        q.add_argument("--verdict")
+        q.add_argument("--subject", default="")
+        q.add_argument("--detail", default="")
+        q.add_argument("--by", default=os.environ.get("CLAUDE_AGENT", "agent"))
+        q.add_argument("--max-age-min", type=int, default=0)
+        q.add_argument("--any-commit", action="store_true",
+                       help="do not require the receipt to name the current HEAD")
+    r.set_defaults(fn=cmd_receipt)
+
+    args = ap.parse_args()
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
