@@ -125,7 +125,20 @@
         "string",
         "null"
       ],
-      "description": "An opt-in standards profile from the plugin's profiles/ directory."
+      "description": "The kind of project this is: an opt-in standards profile from the plugin's profiles/ directory (webapp, library, service, compiler). One per project."
+    },
+    "concerns": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Cross-cutting standards from profiles/concerns/, applied in addition to the project-kind profile. A Go service needs service AND concurrency, so this is a list rather than a second single choice. Known: architecture, performance, memory, concurrency, data, platform.",
+      "examples": [
+        [
+          "concurrency",
+          "performance"
+        ]
+      ]
     },
     "reviewers": {
       "type": "array",

@@ -135,6 +135,22 @@ profiles carry them instead — `"profile": "webapp"` and the reviewers hold you
 | [`service`](profiles/service.md) | timeouts and retries, idempotency, observability, limits, rollback |
 | [`compiler`](profiles/compiler.md) | specification first, diagnostic codes, evidence vocabulary, bounded workloads |
 
+Those are project *kinds*, and you pick one. **Concerns** cut across them, so you pick any
+number — a Go service wants `service` and `concurrency` both:
+
+```jsonc
+{ "profile": "service", "concerns": ["concurrency", "data", "performance"] }
+```
+
+`architecture` (dependency direction, cycles, boundaries) · `performance` (N+1, pagination,
+scale limits) · `memory` (lifetimes, cleanup, unbounded growth) · `concurrency` (races, lock
+order, TOCTOU, cancellation) · `data` (constraints, transaction boundaries, reversible
+migrations, idempotency) · `platform` (host assumptions, numerics, locale, shutdown).
+
+`:init` proposes them from what your repository actually does and never imposes one. Each names
+the deterministic tool for your stack and says it belongs in `quality.cmd` — until it is there,
+those findings are a reading, not a measurement, and they are recorded as such.
+
 Writing your own is one markdown file. Keep it to what a reviewer can check.
 
 ## OpenSpec, properly

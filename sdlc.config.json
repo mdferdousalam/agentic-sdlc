@@ -18,6 +18,10 @@
   "secretScan": "gitleaks git --no-banner --redact --log-opts=\"-n 50\"",
   "heavy": null,
   "profile": "library",
+  "concerns": [
+    "architecture",
+    "platform"
+  ],
   "quality": {
     "cmd": null,
     "coverageNewPct": null,

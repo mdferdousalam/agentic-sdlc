@@ -45,8 +45,10 @@ Nothing merges without your READY. You do not fix anything; you verify, collect 
 5. **Reviewers.** Launch every agent named in `reviewers`, in one message so they run
    concurrently, each scoped to the diff against the trunk. Always include
    `sdlc-code-reviewer`; include `sdlc-security-reviewer` whenever the diff touches auth, input
-   parsing, dependencies, file or network I/O, or credentials. Name the reviewers you ran and
-   the ones you skipped, with the reason.
+   parsing, dependencies, file or network I/O, or credentials; include
+   `sdlc-architecture-reviewer` when `concerns` includes `architecture` and the diff adds an
+   import, moves a module or introduces an abstraction. Name the reviewers you ran and the
+   ones you skipped, with the reason.
    Once steps 2 and 3 have both passed, record that much immediately — it is what a push to a
    protected branch needs, and it is true whatever the reviewers go on to find:
 

@@ -130,6 +130,45 @@ def detect_trunk(root: str) -> str:
     return branch(root) or "main"
 
 
+# Cross-cutting standards worth proposing, by what the repository evidently does. Proposed,
+# never imposed: a concern the maintainers did not choose produces noise on every review, which
+# is how a review tool gets switched off.
+CONCERN_HINTS = (
+    ("concurrency", (r"\bgo\s+func\b", r"\basync\s+def\b", r"\bawait\b", r"\bthread\b",
+                     r"\bMutex\b", r"\btokio\b", r"\bgoroutine\b", r"sync\.")),
+    ("data", (r"\bCREATE\s+TABLE\b", r"\bALTER\s+TABLE\b", r"\bmigrations?\b",
+              r"\bprisma\b", r"\bsqlalchemy\b", r"\bdiesel\b", r"\bgorm\b")),
+    ("memory", (r"\bunsafe\b", r"\bmalloc\b", r"\bfree\(", r"\braw pointer\b",
+                r"#include <stdlib", r"\bBox::leak\b")),
+)
+
+
+def suggest_concerns(root: str) -> list:
+    """Which cross-cutting profiles this repository looks like it needs.
+
+    A shallow scan of tracked source, because a wrong guess here costs a reviewer's noise
+    budget. The maintainer edits the list; detection never overwrites it (see cmd_init).
+    """
+    names = [n for n in git("ls-files", cwd=root).splitlines()
+             if re.search(r"\.(go|rs|py|ts|tsx|js|jsx|java|kt|c|cc|cpp|h|sql|rb|cs|swift)$", n)]
+    if not names:
+        return []
+    sample, found = names[:400], []
+    for concern, patterns in CONCERN_HINTS:
+        hits = 0
+        for n in sample:
+            try:
+                body = open(os.path.join(root, n), errors="replace").read(20000)
+            except OSError:
+                continue
+            if any(re.search(pat, body, re.I) for pat in patterns):
+                hits += 1
+                if hits >= 2:  # one match is a coincidence
+                    found.append(concern)
+                    break
+    return found
+
+
 def detect(root: str) -> dict:
     """Infer the project's bindings. Everything here is a guess the user may correct."""
     pm = monorepo = None
@@ -230,6 +269,7 @@ def detect(root: str) -> dict:
         "secretScan": secret_scan,
         "heavy": None,
         "profile": None,
+        "concerns": suggest_concerns(root),
         "quality": {
             "cmd": None,
             "coverageNewPct": None,

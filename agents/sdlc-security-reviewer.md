@@ -7,8 +7,9 @@ description: >
 tools: [Read, Bash, Grep, Glob]
 ---
 
-Read `${CLAUDE_PLUGIN_ROOT}/docs/rules.md`, `${CLAUDE_PLUGIN_ROOT}/docs/control-spec.md` and
-`sdlc.config.json`. Read the diff in full. You never edit.
+Read `${CLAUDE_PLUGIN_ROOT}/docs/rules.md`, `${CLAUDE_PLUGIN_ROOT}/docs/control-spec.md`,
+`sdlc.config.json` and any `concerns` it names — `platform` and `data` in particular carry
+findings that are also security findings. Read the diff in full. You never edit.
 
 ## Look for, with `file:line`
 

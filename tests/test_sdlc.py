@@ -3,7 +3,7 @@
 
 Run: python3 tests/test_sdlc.py     (standard library only; makes throwaway git repos in /tmp)
 """
-import json, os, subprocess, sys, tempfile, shutil, time
+import json, os, re, subprocess, sys, tempfile, shutil, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SDLC = os.path.join(os.path.dirname(HERE), "bin", "sdlc")
@@ -456,6 +456,55 @@ ok(isinstance(rec.get("env"), dict) and "git" in rec["env"],
 ok("os" in rec["env"] and "arch" in rec["env"], "including the platform it ran on")
 
 shutil.rmtree(db, ignore_errors=True)
+
+print("concerns: proposed from what the repository does, never imposed")
+dc = newrepo(files={
+    "src/worker.go": "package main\nimport \"sync\"\nfunc a(){var m sync.Mutex; go func(){m.Lock()}()}\n",
+    "src/pool.go": "package main\nimport \"sync\"\nfunc b(){var w sync.WaitGroup; go func(){w.Done()}()}\n",
+    "src/schema.sql": "CREATE TABLE users (id int);\nALTER TABLE users ADD COLUMN e text;\n",
+    "src/migrate.sql": "-- migrations\nCREATE TABLE orders (id int);\n",
+})
+cfg = json.loads(run(["init"], dc).stdout)
+ok("concurrency" in cfg["concerns"], "goroutines and mutexes propose the concurrency concern")
+ok("data" in cfg["concerns"], "schema and migrations propose the data concern")
+ok("memory" not in cfg["concerns"], "nothing unsafe here, so memory is not proposed")
+
+dq = newrepo(files={"README.md": "# docs only\n"})
+ok(json.loads(run(["init"], dq).stdout)["concerns"] == [],
+   "a repository with no source proposes nothing")
+
+# A concern a maintainer removed must stay removed: init fills gaps, it does not overrule.
+run(["init", "--write"], dc)
+c = json.load(open(os.path.join(dc, "sdlc.config.json")))
+c["concerns"] = []
+json.dump(c, open(os.path.join(dc, "sdlc.config.json"), "w"))
+run(["init", "--write"], dc)
+ok(json.load(open(os.path.join(dc, "sdlc.config.json")))["concerns"] == [],
+   "re-running init does not re-impose a concern the maintainer removed")
+
+print("concern profiles exist and are reachable")
+root = os.path.dirname(HERE)
+for name in ("architecture", "performance", "memory", "concurrency", "data", "platform"):
+    ok(os.path.exists(os.path.join(root, "profiles", "concerns", name + ".md")),
+       f"profiles/concerns/{name}.md exists")
+
+print("every rule an agent cites resolves to the control spec")
+spec = open(os.path.join(root, "docs", "control-spec.md"), encoding="utf-8").read()
+table = set(re.findall(r"^\|\s*`([A-Z][A-Z0-9-]*)`\s*\|", spec, re.M))
+ok(len(table) > 40, f"the rule table has {len(table)} rules")
+cited = set()
+for sub in ("agents", "profiles", "commands"):
+    for dirpath, _, names in os.walk(os.path.join(root, sub)):
+        for n in names:
+            if n.endswith(".md"):
+                body = open(os.path.join(dirpath, n), encoding="utf-8").read()
+                cited |= set(re.findall(r"--rule ([A-Z][A-Z0-9-]*)", body))
+                cited |= set(re.findall(r"`((?:ARCH|PERF|MEM|CONC|DATA|PLAT|SEC|TEST|IMPACT|SPEC|CODE|ENV|BUDGET|GIT|QUALITY|BUILD|TYPE)-[A-Z0-9-]+)`", body))
+missing = sorted(cited - table)
+ok(not missing, f"no agent or profile cites a rule the table lacks (missing: {missing})")
+
+for x in (dc, dq):
+    shutil.rmtree(x, ignore_errors=True)
 
 for x in (d, d2, d3, home):
     shutil.rmtree(x, ignore_errors=True)

@@ -203,8 +203,42 @@ be traced across versions. A renamed rule is a new rule.
 | `BUDGET-EXCEEDED` | X7 | deterministic | high | no | the limit and the measurement |
 | `GIT-WORK-DESTROYED` | X3 | deterministic | critical | **never** | the refused command |
 
-Concern profiles add rules in their own namespaces — `PERF-*`, `MEM-*`, `CONC-*`, `DATA-*`,
-`PLAT-*` — and name their deterministic tool where the stack has one.
+### Concern rules
+
+Raised only where `concerns` in the config enables them. Each concern profile names the
+deterministic tool for the stacks that have one; until that tool is in `quality.cmd`, these are
+`llm` findings at `medium` confidence at best, and must say so.
+
+| Rule ID | Domain | Detection | Default severity | Autofix | Evidence required |
+| --- | --- | --- | --- | --- | --- |
+| `ARCH-UNDECLARED` | B.18 | llm | advisory | no | that the project states no structure anywhere |
+| `ARCH-BOUNDARY-REACH` | B.14 | llm | medium | no | the access past the interface |
+| `ARCH-COHESION` | B.13 | llm | advisory | no | the module's second responsibility |
+| `ARCH-INDIRECTION-UNPAID` | J.104 | llm | advisory | no | the abstraction and its single user |
+| `PERF-N-PLUS-ONE` | E.50 | llm | high | no | the query inside the loop |
+| `PERF-UNPAGINATED` | E.51 | llm | high | no | the list endpoint with no bound |
+| `PERF-HOT-PATH-WORK` | E.43 | llm | medium | no | the work repeated per call |
+| `PERF-CACHE-UNSPECIFIED` | E.52 | llm | medium | no | the missing invalidation answer |
+| `PERF-SCALE-LIMIT-UNSTATED` | N.144 | llm | medium | no | the unbounded dimension |
+| `MEM-UNBOUNDED` | F.62 | llm | high | no | the collection with no eviction or bound |
+| `MEM-LEAK` | F.60 | runtime | high | no | allocation evidence over time |
+| `MEM-CLEANUP-MISSING` | F.63 | llm | high | no | the exit path with no release |
+| `MEM-SAFETY` | F.57 | deterministic | critical | no | the sanitiser or checker output |
+| `CONC-DATA-RACE` | G.66 | runtime | high | no | the detector's report |
+| `CONC-DEADLOCK-ORDER` | G.67 | llm | high | no | the two lock orders |
+| `CONC-TOCTOU` | G.68 | llm | high | no | the check and the act, with the window |
+| `CONC-TASK-LEAK` | G.72 | llm | medium | no | the spawned task nobody holds |
+| `CONC-NO-TIMEOUT` | G.73 | llm | medium | no | the call with no bound |
+| `CONC-BACKPRESSURE` | G.74 | llm | medium | no | the unbounded channel or queue |
+| `DATA-CONSTRAINT-MISSING` | K.110 | llm | medium | no | the invariant held only in code |
+| `DATA-TRANSACTION-BOUNDARY` | K.111 | llm | high | no | the side effect inside the transaction |
+| `DATA-MIGRATION-IRREVERSIBLE` | K.114 | llm | high | no | the step with no stated way back |
+| `DATA-IDEMPOTENCY` | K.116 | llm | high | no | the retryable operation with no key |
+| `DATA-PRECISION` | K.117 | llm | medium | no | the float money, or the zoneless time |
+| `PLAT-HOST-ASSUMPTION` | S.189 | llm | medium | no | the hardcoded path, separator or case |
+| `PLAT-NUMERIC` | S.191 | llm | high | no | the overflow or narrowing cast |
+| `PLAT-LOCALE` | S.194 | llm | medium | no | the locale-dependent comparison |
+| `PLAT-SHUTDOWN` | S.195 | llm | medium | no | the in-flight work on termination |
 
 ### Adding a rule
 

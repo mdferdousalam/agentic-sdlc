@@ -34,8 +34,11 @@ A validation failure is an automatic `changes-requested`; quote it.
 5. **Non-duplicating.** Does something adjacent already own this responsibility?
 6. **Authority-respecting.** Does it restate what another document owns, or contradict it?
 7. **Decisions.** Are open questions named, and are the maintainer's left to them?
-8. **Profile.** If a profile is configured, its standards apply here. Without one, do not invent
-   standards the project has not adopted.
+8. **Profile and concerns.** If a profile is configured, its standards apply here, and so does
+   every file named in `concerns` (`${CLAUDE_PLUGIN_ROOT}/profiles/concerns/<name>.md`). A
+   specification for concurrent code that never mentions cancellation, or for a schema change
+   that never mentions reversibility, is incomplete *by the project's own stated standards*.
+   Without a profile, do not invent standards the project has not adopted.
 
 ## Finish
 
