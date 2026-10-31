@@ -358,6 +358,24 @@ def subject_digest(root: str, subject: str) -> str | None:
     return "sha256:" + h.hexdigest()[:16]
 
 
+# What a secret looks like, for redaction. Deliberately the same shapes SECRETS_IN_LINE
+# refuses: if it is worth refusing a line for, it is worth not writing it down.
+SECRET_SHAPE = re.compile(
+    r"\b(sk-[A-Za-z0-9]{12,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{12,}|"
+    r"xox[abprs]-[A-Za-z0-9-]{10,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+)")
+
+
+def redact(text: str) -> str:
+    """Keep the shape, drop the secret.
+
+    The guard refused a line for carrying a credential and then wrote that line, credential
+    and all, into `.sdlc/audit.log` — which `docs/compliance.md` tells operators to ship to
+    a log store. The refusal is worth recording; the secret is not, and copying it into a
+    second place is the opposite of the control's purpose.
+    """
+    return SECRET_SHAPE.sub(lambda m: m.group(0)[:7] + "…redacted", str(text))
+
+
 def audit(root: str, event: str, detail: str) -> None:
     """Append-only record of everything the pipeline decided. Never rotated by this tool."""
     try:
@@ -369,7 +387,7 @@ def audit(root: str, event: str, detail: str) -> None:
             (head(root) or "")[:9],
             branch(root) or "-",
             os.environ.get("CLAUDE_AGENT") or os.environ.get("OPENCODE_AGENT") or "-",
-            re.sub(r"\s+", " ", str(detail))[:400],
+            redact(re.sub(r"\s+", " ", str(detail)))[:400],
         ])
         with open(p, "a") as fh:
             fh.write(line + "\n")
@@ -1018,7 +1036,7 @@ def cmd_guard(args) -> int:
         problem = guard_decide(root, args.command, load_config(root))
         if problem:
             audit(root, "blocked", f"{problem.splitlines()[0]} :: {args.command}")
-            print(f"BLOCKED by agentic-sdlc: {problem}", file=sys.stderr)
+            print(f"BLOCKED by agentic-sdlc: {redact(problem)}", file=sys.stderr)
             return 2
         return 0
     try:
@@ -1038,7 +1056,7 @@ def cmd_guard(args) -> int:
         problem = guard_decide(root, command, cfg)
         if problem:
             audit(root, "blocked", f"{problem.splitlines()[0]} :: {command}")
-            print(f"BLOCKED by agentic-sdlc: {problem}\n"
+            print(f"BLOCKED by agentic-sdlc: {redact(problem)}\n"
                   f"This is a pipeline rule, not a preference. Do not work around it — choose "
                   f"another route or stop and report.", file=sys.stderr)
             return 2
