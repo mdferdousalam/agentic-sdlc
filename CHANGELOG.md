@@ -119,18 +119,58 @@ produced it, as a test.
   their own. Three passing scenarios hold by observation and carry no regression test; they
   are marked, because a scenario nothing guards is one a later change can break in silence.
 
+### Fixed — round two, from an independent review of this branch
+
+A code review and a security review, run against the branch, each independently found that
+the parser rewrite above had reopened the bypass class it was written to close. Both
+reports are in the commit history. Everything below came out of them, or out of working
+through the rest of what the gate had raised against 3.0.0.
+
+- **A refused command is refused wherever on the line it sits.** The credential rule keyed
+  on a verb list, so the next reader of the same path was allowed — `xxd` was listed, `base64`
+  was not. The path is a subject in its own right now.
+- **The findings store reaches the enforcement boundary.** A READY receipt let a merge
+  through with an open critical against the same commit. Open critical and high findings
+  block a merge and the refusal names them; advisory does not.
+- **Three paths that failed open.** `tree_clean` compared git's output to the empty string,
+  so git failing to run read as a clean tree. `known_rules` returned an empty set when the
+  rule table would not parse, and the caller then accepted any rule id at all. `subject_digest`
+  joined a receipt-supplied path to the root unchecked and read it whole into memory on every
+  guard call that consults that receipt.
+- **`fixed` needs a commit.** A claim that something was repaired, with nothing behind it, is
+  how a false-fix rate stays at zero while the defects come back.
+- **The budget cannot be re-keyed.** Moving the local trunk ref or editing `trunk` produced a
+  new key and a fresh ceiling. Spend is summed across the window; `reset --as` clears it.
+- **A reading is not a measurement.** Each concern profile says a finding it owns is `medium`
+  at most when read from a diff. That was prose; it is checked now, for the rules the control
+  spec declares as `llm`, and a reproduction still earns `high`.
+- **The detector no longer contains the strings it scans for.** The markers moved to
+  `schema/suppression-patterns.json`, so `bin/sdlc` comes out of `suiteAudit.exclude` and the
+  file implementing every control is scanned again. The obvious alternative — inferring from
+  a line's text whether a marker is quoted — was tried and reverted: one apostrophe defeats
+  it, and this project has rejected that heuristic twice before.
+- **The contract says what the pipeline does.** The stage map was missing Impact and the
+  architecture reviewer; `concerns` was absent from it entirely; reviewer selection had two
+  authorities and now has one, the config; and the generated rules file's links resolved to
+  nothing on every host.
+- **The impact stage leaves a receipt**, `sdlc metrics` reads a structured field instead of
+  re-parsing prose, the finding schema has a consumer in CI, secrets are redacted from the
+  audit log, and the four GitHub Actions are pinned to commit SHAs.
+
+All 64 findings raised against this branch are closed. The test suite is 431 assertions, up
+from 248 at 3.0.0.
+
 ### Known, and not fixed here
 
-- `profiles/concerns/performance.md` caps a finding raised by reading at `medium` confidence
-  and nothing enforces it — `finding write --rule PERF-N-PLUS-ONE --detection llm
-  --confidence high` is accepted (`F-92db516b`).
-- The impact stage leaves no receipt, so nothing records whether it ran (`F-59fb1d0e`).
-- `suiteAudit.exclude` still exempts `bin/sdlc` and `tests/test_sdlc.py`, which removes the
-  suppression-marker check from the file implementing every control (`F-51c26d39`). The
-  obvious repair — inferring from a line's text whether a marker is quoted — was tried and
-  reverted: it is the same forgeable heuristic this project has already rejected twice, and
-  one apostrophe defeats it. The sound fix is to move the detector's pattern literals out of
-  `bin/sdlc` into a data file so the control file no longer contains the strings it scans for.
+- Three paths remain in `suiteAudit.exclude`: the marker data file, the suite that tests the
+  detector, and an eval fixture quoting a bad diff. Each has to contain the strings the
+  detector looks for in order to be what it is, and none holds logic. They are declared in
+  the config where a reviewer sees them, and acknowledging them is a maintainer's decision.
+- Two scenarios in `openspec/changes/verification.md` are `unexecuted`, and three more pass
+  by observation with no regression test. Both facts are recorded there rather than rounded
+  up to a pass.
+- Precision and recall are still unmeasured. That needs a seeded-defect corpus;
+  `docs/maturity.md` says how.
 
 ## [3.0.0] — 2026-10-25
 
