@@ -709,6 +709,19 @@ SHELL_KEYWORDS = {"if", "then", "elif", "else", "fi", "do", "done", "while", "un
                   "case", "esac", "select", "function", "!", "{", "}", "time"}
 # Interpreters whose argument is code rather than data.
 SHELL_INTERPRETERS = {"sh", "bash", "zsh", "dash", "ksh", "fish", "eval", "source", "."}
+# Flags whose value is a command, whatever the program.
+CODE_OPTIONS = {"-c", "--command", "-e", "--eval", "-x", "--exec", "-exec", "-S", "--execute",
+                "--eval-command", "-execdir"}
+# Interpreters whose code operand is not shell, so shell parsing cannot reach inside it.
+# `python3 -c 'os.system("git stash")'` is a real invocation and the payload sits in a
+# string literal; the operand is matched raw rather than parsed, because it is code and not
+# somebody's prose.
+SCRIPT_INTERPRETERS = {"python", "python3", "node", "deno", "bun", "ruby", "perl", "php",
+                       "Rscript", "osascript", "pwsh", "powershell"}
+# Programs that run what they are handed, without being a shell themselves.
+COMMAND_RUNNERS = {"ssh", "su", "doas", "flock", "watch", "parallel", "script", "chroot",
+                   "nsenter", "docker", "podman", "kubectl", "oc", "vagrant", "ansible",
+                   "rsh", "telnet", "expect", "screen", "tmux", "at", "batch"}
 SHELL_OPERATORS = {";", "&&", "||", "|", "|&", "&", "(", ")", "{", "}", "<", ">", ">>", "<<",
                    "<<<"}
 ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=", re.S)
@@ -721,9 +734,24 @@ BRACE_LIST = re.compile(r"\{([^}\s]*,[^}\s]*)\}")
 
 
 def widen_expansions(text: str) -> str:
-    """Each unperformed expansion standing in for the separator the shell will make it."""
-    return BRACE_LIST.sub(lambda m: " " + m.group(1).replace(",", " ") + " ",
-                          EXPANSION.sub(" ", text))
+    """Each unperformed expansion standing in for the separator the shell will make of it.
+
+    Only outside quotes. An expansion inside a quoted argument is still expanded by the
+    shell, but it stays one word, so widening it invented word boundaries that do not exist
+    — a backquoted span inside a quoted sentence then read as two bare words and the
+    sentence read as a command. Which it did, on a commit message describing this fix.
+    """
+    quoted = {i for i, _c, q in quote_spans(text) if q is not None}
+
+    def sub(m):
+        return " " if m.start() not in quoted else m.group(0)
+
+    def brace(m):
+        if m.start() in quoted:
+            return m.group(0)
+        return " " + m.group(1).replace(",", " ") + " "
+
+    return BRACE_LIST.sub(brace, EXPANSION.sub(sub, text))
 
 
 def quote_spans(text: str):
@@ -757,7 +785,7 @@ def quote_spans(text: str):
         i += 1
 
 
-HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+HEREDOC = re.compile(r"(?<!<)<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1(?!<)")  # not a here-string
 
 
 def strip_heredocs(command: str):
@@ -778,20 +806,55 @@ def strip_heredocs(command: str):
     for n, line in enumerate(lines):
         m = HEREDOC.search(line)
         if m and (pos + m.start()) in unquoted:
-            starts[n] = m.group(2)
+            starts[n] = (m.group(2), bool(m.group(1)))
         pos += len(line) + 1
     while i < len(lines):
         out.append(lines[i])
-        word = starts.get(i)
+        word, quoted = starts.get(i, (None, False))
         i += 1
         if word is None:
             continue
+        body = []
         while i < len(lines) and lines[i].strip() != word:
+            body.append(lines[i])
             i += 1
         if i >= len(lines):
             return None          # no terminator: a parse failure, not an invitation
+        # A quoted delimiter (<<'EOF') makes the body inert. An unquoted one does not: the
+        # shell expands $(...) and backticks in it before a single byte is written, so those
+        # run. Keep just the substitutions; the rest of the body stays data.
+        if not quoted:
+            for b in body:
+                for mm in re.finditer(r"\$\(([^)]*)\)|`([^`]*)`", b):
+                    out.append(mm.group(1) or mm.group(2) or "")
         out.append(lines[i])
         i += 1
+    return "\n".join(out)
+
+
+def strip_comments(command: str) -> str:
+    """Drop `# ...` to end of line, the way bash does.
+
+    shlex has its own commenter, and it ran after newlines had been flattened into ` ; ` —
+    so a single `#` anywhere discarded the rest of the entire input. `echo hi # x` on line
+    one hid `git stash` on line two, with no evasion involved. shlex's commenter is off now
+    and this does it per line. bash starts a comment only at a word boundary, so `a#b` is a
+    word and not a comment; shlex disagreed, and that was a second way through.
+    """
+    if "#" not in command:
+        return command
+    state = {i: q for i, _c, q in quote_spans(command)}
+    out, line, prev, i = [], [], "", 0
+    while i < len(command):
+        c = command[i]
+        if c == "\n":
+            out.append("".join(line)); line = []; prev = ""; i += 1; continue
+        if c == "#" and state.get(i) is None and (prev == "" or prev in " \t;|&("):
+            while i < len(command) and command[i] != "\n":
+                i += 1
+            continue
+        line.append(c); prev = c; i += 1
+    out.append("".join(line))
     return "\n".join(out)
 
 
@@ -858,6 +921,7 @@ def simple_commands(command: str):
     """The line as a list of argv lists, or None if it cannot be parsed."""
     lex = shlex.shlex(command, posix=True, punctuation_chars=True)
     lex.whitespace_split = True
+    lex.commenters = ""      # handled per line, before newlines became separators
     try:
         tokens = list(lex)
     except ValueError:
@@ -899,7 +963,7 @@ def command_units(command: str, depth: int = 0) -> list[tuple[str, bool]]:
     refused command reached through `find -exec`, `ssh host`, `git submodule foreach` or a
     shell keyword sits in argument position and is still run.
     """
-    body = strip_heredocs(command)
+    body = strip_heredocs(strip_comments(command))
     parsed = simple_commands(newlines_to_separators(body)) if body is not None else None
     if parsed is None:
         return [(command, False)]
@@ -908,18 +972,16 @@ def command_units(command: str, depth: int = 0) -> list[tuple[str, bool]]:
     # one token here and two words to bash, and `{git,stash}` is a brace list that expands to
     # a real command. Widen the line and parse it again -- it has to happen before lexing,
     # because an argument's own whitespace is collapsed afterwards.
-    if depth < 3 and UNEXPANDED.search(command):
-        widened_line = widen_expansions(command)
-        if widened_line != command:
+    widened_line = widen_expansions(command) if UNEXPANDED.search(command) else command
+    if widened_line != command:
+        # An expansion outside quotes is a word separator the shell has not performed yet.
+        # Inside quotes it is not, and widening there invented boundaries that do not exist.
+        suspect = True
+        if depth < 3:
             units += [u for u in command_units(widened_line, depth + 1) if u[1]]
     for argv in parsed:
         if not argv:
             continue
-        if any(UNEXPANDED.search(t) for t in argv):
-            # The shell rewrites this before running it, so what we parsed is not what runs.
-            # `git${IFS}stash` is one token here and two words to bash, so offer the form
-            # with each expansion standing in for the separator it will become.
-            suspect = True
         stripped = strip_wrappers(argv)
         for form in ({tuple(argv), tuple(stripped)} if stripped else {tuple(argv)}):
             text = rebuild(list(form))
@@ -932,14 +994,37 @@ def command_units(command: str, depth: int = 0) -> list[tuple[str, bool]]:
                 for arg in stripped[1:]:
                     if not arg.startswith("-"):
                         units += command_units(arg, depth + 1)
-        # `git rebase --exec '<cmd>'` and friends carry a command in an argument, exactly as
-        # `sh -c` does. The quoted token is code; parse it rather than reading it as text.
-        if depth < 3:
-            for n, arg in enumerate(stripped[:-1]):
-                if arg in ("--exec", "-exec", "--command") or arg.startswith("--exec="):
-                    code = arg.split("=", 1)[1] if "=" in arg else stripped[n + 1]
-                    nested = True
+        # An operand can be code without the program being a shell. `ssh host 'git push
+        # --force'`, `su -c`, `docker exec c '...'`, `git rebase -x '...'` and a git `-c`
+        # alias all run what they are handed, and reading it as prose is how each of them
+        # slipped past. Two ways in: a flag whose value is code, and a runner whose quoted
+        # operand is.
+        forms = [stripped, argv] if stripped != argv else [argv]
+        for form in (forms if depth < 3 else []):
+            if not form:
+                continue
+            prog = program_name(form[0])
+            for n, arg in enumerate(form):
+                code = None
+                name = arg.split("=", 1)[0]
+                if name in CODE_OPTIONS:
+                    code = (arg.split("=", 1)[1] if "=" in arg
+                            else (form[n + 1] if n + 1 < len(form) else None))
+                elif prog in COMMAND_RUNNERS and " " in arg and not arg.startswith("-"):
+                    code = arg
+                elif prog == "git" and name == "-c":
+                    val = (arg.split("=", 1)[1] if "=" in arg
+                           else (form[n + 1] if n + 1 < len(form) else "")) or ""
+                    # `-c alias.x='!git stash'` and `-c core.pager='git stash'` both execute
+                    _, _, rhs = val.partition("=")
+                    code = rhs.lstrip("!") if (" " in rhs or rhs.startswith("!")) else None
+                if code:
+                    # Parsed, so no raw-line fallback: that is for an interpreter whose
+                    # argument we could not reach, and adding it here made every quoted
+                    # sentence on the line readable as a command again.
                     units += command_units(code, depth + 1)
+                    if prog in SCRIPT_INTERPRETERS:
+                        units.append((code, False))
     if nested or suspect:
         units.append((command, False))
     return units or [(command, False)]

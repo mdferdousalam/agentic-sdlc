@@ -153,6 +153,31 @@ for cmd in ['sdlc finding write --detail "git stash is refused by the guard"',
             "git status\ngit log --oneline -5"]:
     ok(guard(d, cmd).returncode == 0, f"allowed: {cmd!r}")
 
+print("guard: round three — a comment, a here-string, and code in an operand")
+# A third independent review. shlex's own commenter ran after newlines had been flattened
+# into separators, so one `#` anywhere discarded the rest of the input; `<<<x` matched the
+# heredoc pattern from its second `<`; an unquoted heredoc delimiter means the shell expands
+# the body before writing it; and an operand can be code without the program being a shell.
+for cmd in ["echo hi # x\ngit stash", "echo a#b; git stash", "echo a#b\ngit stash",
+            "ls #x\ngit push --force", 'echo "x" #\ngit stash',
+            "cat <<<x\ngit stash\nx", "echo hi # <<EOF\ngit stash\nEOF",
+            "cat <<EOF\n$(git stash)\nEOF", "cat <<EOF\n`git stash`\nEOF",
+            "ssh host 'git push --force'", 'ssh host "git stash"',
+            "git rebase -x 'git clean -fd'", "su -c 'git stash'", "su root -c 'git stash'",
+            "flock /tmp/l -c 'git stash'", "watch 'git stash'", "docker exec c 'git stash'",
+            "kubectl exec p -- 'git stash'", "git -c alias.x='!git stash' x",
+            "git -c core.pager='git stash' log", "git bisect run sh -c 'git stash'",
+            "env -S 'git stash'", "script -qc 'git stash' /dev/null",
+            "parallel 'git stash' ::: a",
+            "python3 -c 'import os; os.system(\"git stash\")'",
+            "node -e 'require(\"child_process\").exec(\"git stash\")'"]:
+    ok(guard(d, cmd).returncode == 2, f"blocked: {cmd!r}")
+for cmd in ["cat <<'EOF'\ngit stash\nEOF",          # a quoted delimiter is inert
+            "# just a comment", "echo 'a#b'", "ssh host uptime", "docker ps",
+            'python3 -c "print(1+1)"', 'node -e "console.log(2)"',
+            'python3 -c "print()" --note "rm -rf / is refused"']:
+    ok(guard(d, cmd).returncode == 0, f"allowed: {cmd!r}")
+
 print("guard: the credential rule is about the file, not the verb that reads it")
 # Keying on a verb list meant the next reader of the same path was allowed: xxd was listed
 # and base64 was not. The path is a subject in its own right now.
