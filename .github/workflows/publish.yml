@@ -1,0 +1,79 @@
+# Publishes to npm when a GitHub release is published.
+#
+# The trigger is deliberate. Cutting a release stays a human act — the pipeline's own
+# rule is that a release is the maintainer's call — and this workflow is only the hands
+# that carry it out afterwards. Nothing here can publish a version the maintainer did
+# not release.
+#
+# Authentication is npm Trusted Publishing (OIDC): no NPM_TOKEN secret, no one-time
+# password, nothing long-lived to leak. GitHub attests the workflow's identity and npm
+# checks it against the trusted publisher registered for this package.
+#
+# One-time setup on npmjs.com, under the package's Settings -> Trusted Publishers:
+#   Provider:     GitHub Actions
+#   Organization: mdferdousalam        (the GitHub owner, not the npm username)
+#   Repository:   agentic-sdlc
+#   Workflow:     publish.yml          (filename only, with the extension)
+#   Environment:  leave empty
+# Every field is case-sensitive, npm does not validate them when you save, and a new
+# configuration must complete its first successful publish within two days.
+
+name: Publish
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:          # a re-run, if a release published before the setup existed
+
+permissions:
+  contents: read
+
+jobs:
+  npm:
+    name: npm
+    runs-on: ubuntu-latest    # trusted publishing does not support self-hosted runners
+    permissions:
+      contents: read
+      id-token: write         # the OIDC token; without this the publish cannot authenticate
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24    # trusted publishing needs Node >= 22.14.0
+          registry-url: https://registry.npmjs.org
+
+      - name: npm must be new enough for trusted publishing
+        run: |
+          have=$(npm --version)
+          echo "npm $have"
+          # 11.5.1 is the documented floor. An older npm fails with a misleading
+          # "token expired" or 404 rather than saying the version is the problem.
+          node -e '
+            const [a,b,c] = process.argv[1].split(".").map(Number);
+            const ok = a > 11 || (a === 11 && (b > 5 || (b === 5 && c >= 1)));
+            if (!ok) { console.error("npm >= 11.5.1 required for trusted publishing"); process.exit(1); }
+          ' "$have"
+
+      - name: the release tag and package.json must agree
+        if: github.event_name == 'release'
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          pkg=$(node -p "require('./package.json').version")
+          echo "tag=$tag package.json=$pkg"
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::release tag v$tag does not match package.json $pkg"
+            exit 1
+          fi
+
+      - name: the mechanical gate, re-run here rather than trusted
+        run: |
+          python3 tests/test_sdlc.py
+          node .github/scripts/validate-plugin.mjs
+          npx --yes markdownlint-cli2
+
+      - name: publish
+        # No --provenance: publishing through a trusted publisher attaches provenance
+        # automatically. --access public is required because the package is scoped and
+        # scoped packages default to private.
+        run: npm publish --access public

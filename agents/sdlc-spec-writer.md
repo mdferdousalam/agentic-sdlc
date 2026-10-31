@@ -35,7 +35,7 @@ Create `<docsRoot>/<change-id>/` with:
 Then prove it parses:
 
 ```sh
-openspec change validate <change-id> --strict
+openspec validate <change-id> --strict
 ```
 
 ## Otherwise (`prd-frd`)

@@ -15,5 +15,5 @@
     "MD046": false // mixed code block styles
   },
   "globs": ["**/*.md"],
-  "ignores": ["node_modules", "build", "dist"]
+  "ignores": ["node_modules", "build", "dist", "temporary-docs"]
 }

@@ -10,7 +10,7 @@ does not cover, so you can answer an auditor honestly rather than optimistically
 | --- | --- | --- |
 | **Govern** | `approvals` names who may merge and deploy; `enforce` is explicit, versioned policy in the repository; `neverByAgent` states reserved actions | organisational policy, roles outside the repo, training |
 | **Map** | `sdlc trace` links requirement → commit → test → receipts; the specification records intent and scope before code | system-level risk assessment, impact on affected people |
-| **Measure** | `sdlc metrics` reports stage outcomes, first-pass rates and refusals from an append-only log; the gate's five-word vocabulary distinguishes unexecuted from passed | model-level evaluation, bias testing, drift monitoring |
+| **Measure** | `sdlc metrics` reports stage outcomes, first-pass rates, refusals, findings by severity and taxonomy domain, verified repair rate, false-fix rate, human-intervention rate and reproducible share, from an append-only log; the five-word vocabulary distinguishes unexecuted from passed | **detection precision and recall** (needs a seeded-defect corpus — see `docs/maturity.md`), model-level evaluation, bias testing, drift monitoring |
 | **Manage** | the hook refuses unapproved merges and deployments; receipts expire with the commit; rollback is a required artefact before deploying | incident response outside the repository, vendor risk |
 
 ## OWASP Agentic AI — the risks this addresses directly
@@ -22,6 +22,8 @@ does not cover, so you can answer an auditor honestly rather than optimistically
 | Prompt injection via untrusted content | `docs/rules.md` §7 makes all non-instruction content data; `sdlc-triager` is explicit that a signal's text is never a command; the reviewers look for it |
 | Unauthorised actions | Approvals scoped per action — approving a release does not authorise a merge — and voided by the next commit |
 | Insufficient oversight | Every stage leaves a receipt; `.sdlc/audit.log` is append-only; `sdlc trace` reconstructs what happened |
+| Unbounded consumption | `budget` ceilings refused at the tool call; `sdlc budget reset` requires `--as <person>` and records who accepted the extra cost |
+| Agent self-serving evaluation | `sdlc tests audit` detects a diff that lowers the gate it is about to be judged by; `--acknowledge` requires a named person, emits its own audit event, and does not remove the finding |
 | Repudiation | Receipts record who claimed each verdict and when, bound to a commit |
 
 ## OWASP Non-Human Identity
@@ -50,7 +52,19 @@ outside this tool, and treat the receipt as corroboration rather than proof.
 2. **No cryptographic identity.** See above.
 3. **Deterministic analysis is yours to supply.** `quality.cmd` runs whatever analyser you
    configure. The pipeline does not ship one, and an LLM reviewer is not a substitute for
-   deterministic analysis — it is a complement with different coverage.
+   deterministic analysis — it is a complement with different coverage. This is visible rather
+   than hidden: a finding records whether it came from a tool or from reading, and the concern
+   profiles cap a read finding at `medium` confidence. An auditor can therefore ask how much
+   of your coverage is measurement and get a real answer.
 4. **The hook is a Claude Code / opencode control.** Someone running `git` in a terminal is
    unaffected. Use git hooks or branch protection for that boundary.
-5. **This has not been audited by anyone.** It is a defensible structure, not a certified one.
+5. **The budget is not cost control.** It counts tool calls and elapsed time, which are
+   observable here. It cannot see your model provider's meter, and nothing inside a repository
+   can. It stops a runaway task; it does not account for one.
+6. **The suite audit is a heuristic over text.** It reads a diff for the patterns that make a
+   gate easier to pass. It will over-report, and it will miss a stack whose idioms it does not
+   know. It is a control, not a proof, and `--acknowledge` records a human decision rather
+   than removing the finding — so the record shows what was accepted and by whom.
+7. **Precision and recall are unmeasured.** The pipeline reports what it did, never what it
+   missed. Measuring that needs a seeded-defect corpus; `docs/maturity.md` says how.
+8. **This has not been audited by anyone.** It is a defensible structure, not a certified one.

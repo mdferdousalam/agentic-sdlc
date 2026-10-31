@@ -20,12 +20,15 @@ Also read from `.opencode/sdlc.json` if you prefer to keep it out of the reposit
 | `gateCmd` | string | A heavier project gate, run instead of `verifyCmd` when set. |
 | `secretScan` | string | A command that fails if a credential is in the branch's commits. |
 | `heavy` | string | Prose rule for workloads that must be bounded or serialised. |
-| `profile` | string | An opt-in standards profile from `profiles/`. |
+| `profile` | string | The **kind** of project: `webapp`, `library`, `service`, `compiler`. One per project. |
+| `concerns` | string[] | **Cross-cutting** standards from `profiles/concerns/`, applied as well: `architecture`, `performance`, `memory`, `concurrency`, `data`, `platform`. A Go service wants `service` and `concurrency`. |
 | `reviewers` | string[] | Agents the readiness gate fans out to. |
 | `protected` | string[] | Branches needing a passed gate before a push. Globs allowed. |
 | `receipts.maxAgeMin` | integer | How long a receipt stays valid. Default 180. |
 | `enforce.*` | boolean | What the hook refuses. See below. |
 | `neverByAgent` | string[] | Actions reserved to a human, stated for the agents to read. |
+| `suiteAudit.exclude` | string[] | Paths exempt from the **suppression-marker** half of `sdlc tests audit`. Deleted tests, removed assertions and lowered thresholds still fire on them. Adding a glob is itself reported — the hatch is visible, not quiet. |
+| `budget.*` | object | Ceilings an agent cannot raise for itself: `maxToolCalls`, `maxWallClockMin`, `maxRetries`, `stopPolicy`. Unset means nothing stops a runaway task. |
 
 ## `enforce`
 
@@ -40,6 +43,38 @@ Also read from `.opencode/sdlc.json` if you prefer to keep it out of the reposit
 
 Turning one off is legitimate — a solo prototype may not want a gate — but do it in the config,
 where it is visible and reviewable, not by arguing with the agent.
+
+## Budgets, checkpoints and suite integrity
+
+```sh
+sdlc budget show                 # what this task has spent against its ceiling
+sdlc budget reset --as 'name'    # a person clears it; an agent does not raise its own ceiling
+sdlc tests audit                 # has this diff made the gate easier to pass?
+sdlc checkpoint write --done "parser" --next "the formatter" --file src/parse.rs
+sdlc checkpoint resume           # re-checks the assumptions before continuing
+```
+
+`budget` is the honest half of cost control: this process cannot see your host's token meter,
+so it counts what it can observe — tool calls through the hook, wall-clock since the task
+began, and repair attempts — and **refuses** at the ceiling. A ceiling that stops the work is
+worth more than a token count that describes it afterwards.
+
+Exemption from the audit is **declared, never inferred**. Two content-based heuristics were
+tried and both were forgeable by the actor the control constrains — quote parity fell to a
+single apostrophe, and "a quote on both sides" fell to appending a quote. A file that
+genuinely defines these patterns says so once in `suiteAudit.exclude`, in the diff, where a
+reviewer sees it; and adding a glob is itself reported, because otherwise the escape hatch
+would be the bypass.
+
+`sdlc tests audit` is the mechanical form of the rule every agent prompt already states: do not
+delete a test, weaken an assertion, add a skip marker, suppress a warning or lower a threshold
+to make the gate pass. It reads the diff, so it over-reports by design — a false positive costs
+one sentence in the pull request, a false negative costs a silently disarmed suite.
+
+`sdlc checkpoint` stores a long task's progress *and the repository state it assumed*.
+`resume` re-checks that state — branch, commit, file digests, toolchain — before saying it is
+safe to continue, because a checkpoint is a record of what was true, not a licence to carry on
+as if it still is.
 
 ## Receipts
 
@@ -64,6 +99,7 @@ Stored in `.sdlc/receipts/`. They describe *this working copy*, so add `.sdlc/` 
   "verifyCmd": "gofmt -l . && go vet ./... && go test -race ./...",
   "secretScan": "gitleaks git --no-banner --redact -n 50",
   "profile": "service",
+  "concerns": ["concurrency", "data"],
   "reviewers": ["sdlc-code-reviewer", "sdlc-security-reviewer"],
   "protected": ["main", "release/*"]
 }

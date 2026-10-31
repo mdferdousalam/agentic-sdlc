@@ -1,6 +1,6 @@
 {
   "name": "agentic-sdlc",
-  "version": "2.3.0",
+  "version": "3.0.0",
   "description": "An enforced agent-based SDLC pipeline that runs on any coding agent: specify, review, branch, implement, verify, review, gate, land, release. Each stage is owned by one agent and closed by a receipt bound to a commit. Claude Code, opencode, Codex and Cline refuse a skipped stage at the tool call; Gemini denies by policy; Cursor, Copilot, Windsurf and 20+ AGENTS.md hosts get the pipeline plus git-hook and CI enforcement. One adapter file per project; speaks OpenSpec or PRD/FRD.",
   "keywords": [
     "sdlc",

@@ -3,6 +3,96 @@
 All notable changes to this plugin. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the versioning is [semantic](https://semver.org/).
 
+## [3.0.0] — 2026-10-25
+
+Findings become data, the gate can no longer be lowered to pass itself, and the six taxonomy
+domains the reviewers were silent on are covered.
+
+**Major, because the gate got stricter.** Nothing was removed and no configuration key
+changed meaning, but three things that previously passed now block: a configured
+`quality.cmd` actually runs, a diff that weakens the test suite is refused, and a budget
+ceiling stops a task. A repository that was green on 2.3.0 may not be green on this. That is
+the point, and it is a narrowing, so it is a major.
+
+### Added
+
+- **A finding contract.** `schema/finding.schema.json` and `sdlc finding write|list|show|close`.
+  A finding now carries an identity, a rule, a taxonomy address, evidence, a root cause, a
+  verification plan and a provenance — not just the word "blocking". Findings deduplicate by
+  content, so the same one raised twice is one finding rather than two comments.
+- **`docs/control-spec.md`**, normative for every agent: the four vocabularies, the repair
+  policy, the A–U and X1–X12 coverage map with an honest `review-level` marker, and a table of
+  56 rules. A rule that lives only in a prompt is that agent's opinion, and `sdlc finding
+  write` refuses a rule the table does not list.
+- **Severity and confidence as independent axes.** What an agent may repair unattended comes
+  from the pair, never from severity alone: `critical` at `low` confidence escalates to a
+  person, `high` at `medium` needs a reproduction first, and `advisory` is never committed at
+  any confidence.
+- **`sdlc baseline capture|compare|show`.** The branch-opener records what the verify command
+  said *before* any work began; the verifier and gate classify every later failure as `new`,
+  `pre-existing` or `fixed`. Comparison is over normalised signal lines, so it works in any
+  stack without a parser per test runner. Keyed to the merge base, so it survives commits —
+  unlike a receipt, which must not.
+- **`sdlc tests audit`.** Deleted test files, removed assertions, new skip markers, new
+  suppression directives and lowered thresholds. Every agent prompt already forbade these;
+  this is the part that does not negotiate. `--acknowledge` records a human decision and
+  deliberately does not waive the finding.
+- **`budget`.** `maxToolCalls` and `maxWallClockMin`, refused at the tool call and resettable
+  only by a person.
+- **`sdlc checkpoint write|resume|show`.** Stores a long task's progress *and the repository
+  state it assumed*; `resume` re-validates branch, commit ancestry, file digests and toolchain
+  before saying it is safe to continue.
+- **`concerns`**, a second profile axis beside `profile`. Six cross-cutting profiles —
+  `architecture`, `performance`, `memory`, `concurrency`, `data`, `platform` — covering
+  taxonomy domains B, E, F, G, J, K, N and S. A Go service wants `service` *and*
+  `concurrency`, which one field could not express. `sdlc init` proposes them from what the
+  repository actually contains and never imposes one.
+- **`sdlc-impact-analyst`** and **`sdlc-architecture-reviewer`**, both read-only. The first
+  reports dependents, published shapes and ordered migration steps *before* implementation;
+  the second walks the import graph, which is a different search from reading a diff.
+- **Environment fingerprint on every receipt**, so an environmental failure is distinguishable
+  from a defect.
+- **Metrics that measure outcomes**, not just activity: findings by severity and taxonomy
+  domain, verified repair rate, false-fix rate, human-intervention rate and reproducible
+  share.
+- Four evals for the new refusals, and tests for every detection in both directions.
+
+- **Publishing runs from a GitHub release, over OIDC.** `.github/workflows/publish.yml`
+  authenticates with npm Trusted Publishing — no stored token, no one-time password, and
+  provenance attached automatically. The trigger is a published release, so cutting one
+  stays the maintainer's act and the workflow is only the hands that carry it out; it
+  refuses if the tag and `package.json` disagree, and re-runs the gate rather than
+  trusting that it ran earlier.
+
+### Noted
+
+Running `sdlc tests audit` against this repository reported six weakenings that were not
+weakenings: its own detection patterns, its own test fixtures, and the eval that quotes a
+skipped test. A marker inside a string literal suppresses nothing and prose cannot disable a
+linter, so neither is excluded at the cost of a bypass — but six false positives on the
+tool's own diff is how a tool gets ignored, so both are now excluded, with regression tests
+in each direction. Found by dogfooding, which is the point of dogfooding.
+
+### Fixed
+
+- **`quality.cmd` never ran.** It was in the schema, documented as the Level 2 configuration,
+  and reserved as a receipt kind — and no agent or command executed it. The only consumer was
+  the generated CI workflow. The readiness gate and the mechanical gate now run it, and an
+  unset budget is reported as `skipped` rather than passed. Found by auditing this plugin
+  against its own design brief.
+- The OpenSpec commands in the agents and docs used `openspec change validate` and
+  `openspec change show`, which warn as deprecated on openspec 1.6. An agent reading our docs
+  would copy the deprecated form and paste the warning into its report as a finding. Found by
+  dogfooding: this repository now has the `openspec/` scaffolding its own config always said
+  it had.
+
+### Documented
+
+`docs/maturity.md` now says plainly what this still does not give you — detection precision
+and recall, runtime evidence, token accounting, sandboxing — and, for precision and recall,
+how to measure them yourself with a seeded-defect corpus. `docs/compliance.md` gains three
+more honest limits rather than three more claims.
+
 ## [2.3.0] — 2026-10-25
 
 Published through every package manager a developer is likely to already have.

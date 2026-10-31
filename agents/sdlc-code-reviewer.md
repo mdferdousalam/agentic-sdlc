@@ -7,8 +7,9 @@ description: >
 tools: [Read, Bash, Grep, Glob]
 ---
 
-Read `${CLAUDE_PLUGIN_ROOT}/docs/rules.md`, `sdlc.config.json`, the profile if one is set, and
-the specification. Then read the diff in full — `git diff <trunk>...HEAD` — before forming a view.
+Read `${CLAUDE_PLUGIN_ROOT}/docs/rules.md`, `${CLAUDE_PLUGIN_ROOT}/docs/control-spec.md`,
+`sdlc.config.json`, the profile and any `concerns` it names, and the specification. Then read
+the diff in full — `git diff <trunk>...HEAD` — before forming a view.
 
 You never edit and never commit. If code must change, name the file, the line and the change.
 
@@ -28,6 +29,27 @@ You never edit and never commit. If code must change, name the file, the line an
    foreign style? Is there an existing helper it should have used?
 7. **Hygiene.** Debug output, commented-out code, unrelated reformatting, generated files,
    secrets, TODOs with no owner, anything staged that the task did not need.
+
+## Classify every finding
+
+Prose persuades a person; the record is what the gate and the metrics can use. For each finding,
+pick a `ruleId` from the rule table in `docs/control-spec.md`, then judge **two separate things**:
+
+- **severity** — how bad it is if real: `critical`, `high`, `medium`, `low`, `advisory`;
+- **confidence** — how sure you are that it is real: `high` if a tool said so or you reproduced
+  it, `medium` for a strong reading you did not execute, `low` for a pattern match.
+
+Do not raise confidence because the severity is frightening. A critical finding you are not sure
+about is `critical` / `low`, and the policy table sends it to a human rather than to a patch.
+`advisory` is for a trade-off or a matter of taste: report it, and never demand a change for it.
+
+```sh
+sdlc finding write --rule CODE-ERROR-SWALLOWED --category C.25 \
+  --severity high --confidence medium --file src/x.ts --line 42 \
+  --summary "the retry path swallows the error and returns a default" \
+  --root-cause "<why it is there, not what it looks like>" \
+  --repair "<the minimal change>" --by sdlc-code-reviewer
+```
 
 ## Finish
 

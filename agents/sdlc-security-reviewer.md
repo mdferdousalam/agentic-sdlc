@@ -7,8 +7,9 @@ description: >
 tools: [Read, Bash, Grep, Glob]
 ---
 
-Read `${CLAUDE_PLUGIN_ROOT}/docs/rules.md` and `sdlc.config.json`. Read the diff in full. You
-never edit.
+Read `${CLAUDE_PLUGIN_ROOT}/docs/rules.md`, `${CLAUDE_PLUGIN_ROOT}/docs/control-spec.md`,
+`sdlc.config.json` and any `concerns` it names — `platform` and `data` in particular carry
+findings that are also security findings. Read the diff in full. You never edit.
 
 ## Look for, with `file:line`
 
@@ -27,6 +28,28 @@ never edit.
   before? Personal data, internal paths, stack traces, identifiers.
 - **Denial of service.** Unbounded allocation, unbounded recursion, an unpaginated query, a
   regex that backtracks, a loop over user-controlled length.
+
+## Record each one
+
+Use the `SEC-*` rules in the rule table, and classify severity and confidence **separately** —
+`docs/control-spec.md` §1. Security is where the two are most often confused: a suspected auth
+bypass you have not reproduced is `critical` / `low`, which escalates to a human. It is not
+`critical` / `high` because the consequence would be severe. The consequence sets severity; only
+evidence sets confidence.
+
+Record reachability in `--exploitability` (`remote`, `local`, `authenticated`, `theoretical`,
+`not-applicable`). Describe it; never write an exploit.
+
+```sh
+sdlc finding write --rule SEC-INJECTION-SQL --category D.31 \
+  --severity critical --confidence high --exploitability remote \
+  --file src/db/query.ts --line 42 \
+  --summary "the tenant filter is concatenated into the SQL string" \
+  --detection llm --repair "bind it as a parameter" --by sdlc-security-reviewer
+```
+
+When the finding comes from `secretScan` or another scanner, pass `--detection deterministic`
+and `--tool-output` with the real line. That is what earns `high` confidence.
 
 ## Finish
 

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import fnmatch
 import glob
 import hashlib
 import json
@@ -39,6 +40,30 @@ RECEIPT_KINDS = ("spec", "verification", "review", "security", "quality", "gate"
 AUDIT_LOG = ".sdlc/audit.log"
 FEEDBACK = ".sdlc/feedback.json"
 DEFAULT_MAX_AGE_MIN = 180
+FINDING_DIR = ".sdlc/findings"
+BASELINE = ".sdlc/baseline.json"
+BUDGET = ".sdlc/budget.json"
+CHECKPOINT = ".sdlc/checkpoint.json"
+
+# The finding vocabularies. Severity is how bad it is if real; confidence is how sure we are
+# that it is real. They are separate axes on purpose — see docs/control-spec.md §1.
+SEVERITIES = ("critical", "high", "medium", "low", "advisory")
+CONFIDENCES = ("high", "medium", "low")
+DETECTIONS = ("deterministic", "test", "runtime", "llm")
+FINDING_OUTCOMES = ("open", "fixed", "refused", "deferred", "unexecuted", "escalated")
+EXPLOITABILITY = ("remote", "local", "authenticated", "theoretical", "not-applicable")
+
+# The repair policy, as a table rather than as a paragraph an agent can reinterpret.
+# True: an agent may repair it unattended. False: report or escalate. "repro": only once the
+# finding has a reproduction, because at medium confidence the finding itself is in question.
+# docs/control-spec.md §2 is the readable copy; a test keeps the two from drifting.
+AUTOFIX = {
+    ("critical", "high"): True,   ("critical", "medium"): False, ("critical", "low"): False,
+    ("high", "high"): True,       ("high", "medium"): "repro",   ("high", "low"): False,
+    ("medium", "high"): True,     ("medium", "medium"): True,    ("medium", "low"): False,
+    ("low", "high"): True,        ("low", "medium"): True,       ("low", "low"): False,
+    ("advisory", "high"): False,  ("advisory", "medium"): False, ("advisory", "low"): False,
+}
 
 # --------------------------------------------------------------------------------------- git
 
@@ -106,6 +131,45 @@ def detect_trunk(root: str) -> str:
         if git("rev-parse", "--verify", "--quiet", f"refs/heads/{cand}", cwd=root):
             return cand
     return branch(root) or "main"
+
+
+# Cross-cutting standards worth proposing, by what the repository evidently does. Proposed,
+# never imposed: a concern the maintainers did not choose produces noise on every review, which
+# is how a review tool gets switched off.
+CONCERN_HINTS = (
+    ("concurrency", (r"\bgo\s+func\b", r"\basync\s+def\b", r"\bawait\b", r"\bthread\b",
+                     r"\bMutex\b", r"\btokio\b", r"\bgoroutine\b", r"sync\.")),
+    ("data", (r"\bCREATE\s+TABLE\b", r"\bALTER\s+TABLE\b", r"\bmigrations?\b",
+              r"\bprisma\b", r"\bsqlalchemy\b", r"\bdiesel\b", r"\bgorm\b")),
+    ("memory", (r"\bunsafe\b", r"\bmalloc\b", r"\bfree\(", r"\braw pointer\b",
+                r"#include <stdlib", r"\bBox::leak\b")),
+)
+
+
+def suggest_concerns(root: str) -> list:
+    """Which cross-cutting profiles this repository looks like it needs.
+
+    A shallow scan of tracked source, because a wrong guess here costs a reviewer's noise
+    budget. The maintainer edits the list; detection never overwrites it (see cmd_init).
+    """
+    names = [n for n in git("ls-files", cwd=root).splitlines()
+             if re.search(r"\.(go|rs|py|ts|tsx|js|jsx|java|kt|c|cc|cpp|h|sql|rb|cs|swift)$", n)]
+    if not names:
+        return []
+    sample, found = names[:400], []
+    for concern, patterns in CONCERN_HINTS:
+        hits = 0
+        for n in sample:
+            try:
+                body = open(os.path.join(root, n), errors="replace").read(20000)
+            except OSError:
+                continue
+            if any(re.search(pat, body, re.I) for pat in patterns):
+                hits += 1
+                if hits >= 2:  # one match is a coincidence
+                    found.append(concern)
+                    break
+    return found
 
 
 def detect(root: str) -> dict:
@@ -208,6 +272,7 @@ def detect(root: str) -> dict:
         "secretScan": secret_scan,
         "heavy": None,
         "profile": None,
+        "concerns": suggest_concerns(root),
         "quality": {
             "cmd": None,
             "coverageNewPct": None,
@@ -299,6 +364,7 @@ def receipt_write(root: str, kind: str, verdict: str, subject: str, detail: str,
         "by": by,
         "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "treeClean": tree_clean(root),
+        "env": environment(root),
     }
     p = receipt_path(root, kind)
     os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -348,13 +414,13 @@ DESTRUCTIVE = [
     (r"\bgit\s+reset\s+(--hard|--merge|--keep)\b", "git reset --hard destroys uncommitted work"),
     (r"\bgit\s+clean\b", "git clean deletes untracked files"),
     (r"\bgit\s+(checkout|restore)\s+(--\s+)?\.(\s|$)", "this discards every uncommitted change"),
-    (r"\bgit\s+(push|branch)\b[^|;&]*--force(-with-lease)?\b", "force-push rewrites published history"),
+    (r"\bgit\s+(push|branch)\b[^|;&\n]*--force(-with-lease)?\b", "force-push rewrites published history"),
     (r"\bgit\s+filter-(branch|repo)\b", "history rewriting is the maintainer's decision"),
     (r"\brm\s+(-[a-zA-Z]*\s+)*(-rf|-fr)\s+(/|~|\$HOME)(\s|$)", "refusing rm -rf of a root or home path"),
 ]
 PUBLISHING = [
     (r"\bgit\s+tag\b(?!\s+(-l|--list|-n))", "a tag is a public promise — the maintainer's call"),
-    (r"\bgit\s+push\b[^|;&]*(--tags|\brefs/tags/)", "pushing tags is the maintainer's call"),
+    (r"\bgit\s+push\b[^|;&\n]*(--tags|\brefs/tags/)", "pushing tags is the maintainer's call"),
     (r"\b(npm|pnpm|yarn|bun)\s+publish\b", "publishing is the maintainer's call"),
     (r"\bcargo\s+publish\b", "publishing is the maintainer's call"),
     (r"\b(twine|poetry)\s+(upload|publish)\b", "publishing is the maintainer's call"),
@@ -375,16 +441,27 @@ DEPLOY_PATTERNS = [
     r"\baws\s+(deploy|ecs|lambda|cloudformation|s3\s+sync)\b",
     r"\b(gcloud|az)\s+\w+\s+deploy\b",
     r"\b(flyctl|fly|vercel|netlify|heroku|railway|render)\s+(deploy|releases?)\b",
-    r"\bdocker\s+(compose\s+)?(up|stack\s+deploy)\b[^|;&]*(prod|production)",
+    r"\bdocker\s+(compose\s+)?(up|stack\s+deploy)\b[^|;&\n]*(prod|production)",
     r"\bansible-playbook\b",
-    r"\bgh\s+workflow\s+run\b[^|;&]*(deploy|release|prod)",
+    r"\bgh\s+workflow\s+run\b[^|;&\n]*(deploy|release|prod)",
 ]
 
 CREDENTIALS = [
-    (r"(^|[\s;|&(])(cat|bat|less|more|head|tail|strings|xxd|od|cp|scp|rsync|curl)\b[^|;&]*"
-     r"(\.env(\.(?!example|sample|template)[\w.-]+)?|/\.ssh/|/\.aws/|id_rsa|id_ed25519|\.pem|\.p12|"
-     r"credentials\.json|secrets\.ya?ml)(\s|$|['\")])",
+    # [^|;&\n] rather than [^|;&]: the negated class matched newlines, so in a multi-line
+    # command a reader verb on line 1 paired with a credential word forty lines later. The
+    # verb list stays to tools whose whole job is to emit a file's contents -- adding
+    # interpreters made it fire on any script that merely mentions one.
+    (r"(^|[\s;|&(])(cat|bat|less|more|head|tail|strings|xxd|od|cp|scp|rsync|curl)\b[^|;&\n]*"
+     r"(\.env(?!\.(?:example|sample|template|dist))[\w.-]*|/\.ssh/|/\.aws/|/\.gnupg/|/\.kube/|"
+     r"/\.docker/|\.npmrc|\.pypirc|\.netrc|id_rsa|id_ed25519|\.pem|\.p12|\.kdbx|"
+     r"credentials(\.json)?|secrets?\.ya?ml|service[-_]account[\w.-]*\.json)",
      "reading a credential file is forbidden"),
+    (r"(^|[\s;|&(])(printenv|env)\b[^|;&\n]*\b\w*(SECRET|TOKEN|PASSWORD|PASSWD|"
+     r"API[-_]?KEY|PRIVATE[-_]?KEY|CREDENTIAL)\w*",
+     "printing a secret from the environment is forbidden"),
+    (r"(^|[\s;|&(])echo\s+\"?\$\{?\w*(SECRET|TOKEN|PASSWORD|API[-_]?KEY|"
+     r"PRIVATE[-_]?KEY)\w*",
+     "echoing a secret from the environment is forbidden"),
     (r"\b(sk-[A-Za-z0-9]{12,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{12,})",
      "a credential appears in this command line"),
 ]
@@ -440,6 +517,12 @@ def guard_problem(root: str, command: str, cfg: dict) -> str | None:
                             f"A person runs:  sdlc approve merge --as '<their name>'\n"
                             f"An agent must not run it for them — the approval records who is "
                             f"accountable, and an agent approving its own work records nothing.")
+
+    # X7: a ceiling the agent cannot raise for itself. Checked last, so a destructive command
+    # is still refused for the right reason when the budget also happens to be spent.
+    over = budget_problem(root, cfg)
+    if over:
+        return over
 
     # Deployment is a separate authority from merging, and defaults to a human's.
     deploying = any(re.search(pat, command) for pat in DEPLOY_PATTERNS)
@@ -565,6 +648,11 @@ def cmd_receipt(args) -> int:
     return 0
 
 
+def fingerprint_line(env: dict) -> str:
+    keys = [k for k in ("os", "arch", "python", "node", "go", "cargo", "git") if k in env]
+    return "  ".join(f"{k} {env[k]}" for k in keys)
+
+
 def cmd_status(_args) -> int:
     root = repo_root()
     cfg = load_config(root)
@@ -588,6 +676,7 @@ def cmd_status(_args) -> int:
         why = receipt_problem(root, kind, None, 10 ** 9)
         mark = "stale" if why else "current"
         print(f"  {kind:<13} {r.get('verdict','?'):<18} {str(r.get('commit',''))[:9]}  {r.get('at','')}  {mark}")
+    print(f"toolchain  {fingerprint_line(environment(root))}")
     return 0
 
 
@@ -605,6 +694,11 @@ def cmd_doctor(_args) -> int:
             problems.append('"verifyCmd" is not set — nothing can be gated')
         if not cfg.get("secretScan"):
             notes.append('"secretScan" is not set — install gitleaks and re-run `sdlc init`')
+        if not (cfg.get("quality") or {}).get("cmd"):
+            notes.append('"quality.cmd" is not set — the gate has no deterministic analysis on '
+                         "new code, so maintainability and complexity are reviewed by reading "
+                         "only. An LLM reviewer is a complement to a static analyser, not a "
+                         "substitute for one.")
         engine = (cfg.get("spec") or {}).get("engine")
         if engine == "openspec":
             if not which("openspec"):
@@ -616,6 +710,7 @@ def cmd_doctor(_args) -> int:
 
     present = detect_platforms()
     here = [k for k, v in present.items() if v]
+    print(f"toolchain       {fingerprint_line(environment(root))}")
     print(f"hosts detected  {', '.join(here) if here else 'none'}")
     installed = []
     for rel, label in ((".cursor/rules/agentic-sdlc.mdc", "cursor"),
@@ -648,6 +743,14 @@ def cmd_doctor(_args) -> int:
                      "tool hook (Cursor, Copilot, Windsurf). Run `sdlc install git-hooks`")
     if not os.path.exists(os.path.join(root, ".github/workflows/sdlc-gate.yml")):
         notes.append("no CI gate — the only layer an agent cannot reach. Run `sdlc install ci`")
+
+    openf = [f for f in finding_load_all(root) if f.get("outcome") in ("open", "unexecuted")]
+    if openf:
+        crit = sum(1 for f in openf
+                   if (f.get("classification") or {}).get("severity") in ("critical", "high"))
+        notes.append(f"{len(openf)} finding(s) still open or unexecuted"
+                     + (f", {crit} of them critical or high" if crit else "")
+                     + " — see `sdlc finding list --open`")
 
     hooks = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hooks", "hooks.json")
     if os.path.exists(hooks):
@@ -1279,9 +1382,1006 @@ def cmd_feedback(args) -> int:
         json.dump(d, fh, indent=2)
     audit(root, "feedback", f"{args.stage}: attempt {d['attempts']}")
     print(f"feedback recorded — attempt {d['attempts']} at stage {args.stage}")
-    if d["attempts"] >= 3:
-        print("Three attempts at the same stage. Stop and report rather than trying a fourth: "
-              "the specification or the approach is probably the problem, not the code.")
+    ceiling = int(budget_config(load_config(root)).get("maxRetries") or 3)
+    if d["attempts"] >= ceiling:
+        print(f"{d['attempts']} attempts at the same stage, and budget.maxRetries is "
+              f"{ceiling}. Stop and report rather than trying another: the specification or "
+              f"the approach is probably the problem, not the code.")
+    return 0
+
+
+# ------------------------------------------------------------------- budget and checkpoints
+#
+# X5 and X7: an agent that cannot stop is a cost centre with a git token. X10: a long task that
+# crashes halfway must not leave a half-applied refactor nobody can reason about.
+#
+# The honest limit, stated once: this process cannot see the host's token meter. It counts what
+# it can observe — tool calls through the hook, wall-clock since the task began, and repair
+# attempts — and refuses when a ceiling is reached. A ceiling that stops the work is worth more
+# than a token count that only describes it afterwards.
+
+DEFAULT_BUDGET = {"maxToolCalls": 0, "maxWallClockMin": 0, "maxRetries": 3, "stopPolicy": "refuse"}
+
+
+def budget_config(cfg: dict) -> dict:
+    b = dict(DEFAULT_BUDGET)
+    b.update(cfg.get("budget") or {})
+    return b
+
+
+def budget_state(root: str) -> dict:
+    try:
+        return json.load(open(os.path.join(root, BUDGET)))
+    except Exception:
+        return {"toolCalls": 0, "startedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "task": branch(root)}
+
+
+def budget_save(root: str, st: dict) -> None:
+    try:
+        p = os.path.join(root, BUDGET)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as fh:
+            json.dump(st, fh, indent=2)
+    except Exception:
+        pass
+
+
+def budget_problem(root: str, cfg: dict) -> str | None:
+    """Why this task must stop now, or None. Counts one tool call as a side effect."""
+    b = budget_config(cfg)
+    if not (b.get("maxToolCalls") or b.get("maxWallClockMin")):
+        return None
+    st = budget_state(root)
+    if st.get("task") != branch(root):  # a new branch is a new task
+        st = {"toolCalls": 0, "startedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+              "task": branch(root)}
+    st["toolCalls"] = st.get("toolCalls", 0) + 1
+    budget_save(root, st)
+
+    warn_only = (b.get("stopPolicy") or "refuse") == "warn"
+    limit = int(b.get("maxToolCalls") or 0)
+    if limit and st["toolCalls"] > limit and warn_only:
+        if st["toolCalls"] == limit + 1:  # say it once, not on every call after
+            print(f"agentic-sdlc: this task has passed its budget of {limit} tool calls. "
+                  f"stopPolicy is 'warn', so nothing is being refused — but nothing is "
+                  f"stopping a runaway either.", file=sys.stderr)
+        return None
+    if limit and st["toolCalls"] > limit:
+        return (f"this task has made {st['toolCalls']} tool calls and the budget is {limit}.\n"
+                f"Stop and report what is done, what is left and what it would cost. "
+                f"A person raises the ceiling in sdlc.config.json; an agent does not raise "
+                f"its own.\nReset with:  sdlc budget reset")
+    mins = int(b.get("maxWallClockMin") or 0)
+    if mins and not warn_only:
+        try:
+            began = calendar.timegm(time.strptime(st["startedAt"], "%Y-%m-%dT%H:%M:%SZ"))
+            spent = (time.time() - began) / 60
+            if spent > mins:
+                return (f"this task has run for {int(spent)} minutes and the budget is {mins}.\n"
+                        f"Stop and report. Reset with:  sdlc budget reset")
+        except Exception:
+            pass
+    return None
+
+
+def cmd_budget(args) -> int:
+    root = repo_root()
+    cfg = load_config(root)
+    b, st = budget_config(cfg), budget_state(root)
+    if args.budget_action == "reset":
+        if not args.as_person:
+            print("sdlc budget reset needs --as '<your name>'.\n"
+                  "A ceiling an agent can clear for itself is not a ceiling — it is a pause. "
+                  "The reset records who accepted the extra cost, for the same reason "
+                  "`sdlc approve` does, and an agent must not run it on a person's behalf.",
+                  file=sys.stderr)
+            return 3
+        budget_save(root, {"toolCalls": 0, "task": branch(root),
+                           "startedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+        audit(root, "budget.reset", f"by {args.as_person}")
+        print(f"budget reset for this task by {args.as_person}")
+        return 0
+    spent_min = ""
+    try:
+        began = calendar.timegm(time.strptime(st["startedAt"], "%Y-%m-%dT%H:%M:%SZ"))
+        spent_min = f"{int((time.time() - began) / 60)} min"
+    except Exception:
+        pass
+    print(f"task        {st.get('task')}")
+    print(f"tool calls  {st.get('toolCalls', 0)}" +
+          (f" of {b['maxToolCalls']}" if b.get("maxToolCalls") else " (no ceiling set)"))
+    print(f"elapsed     {spent_min}" +
+          (f" of {b['maxWallClockMin']} min" if b.get("maxWallClockMin") else " (no ceiling set)"))
+    print(f"retries     ceiling {b.get('maxRetries')}")
+    if not (b.get("maxToolCalls") or b.get("maxWallClockMin")):
+        print("\nNo ceiling is set, so nothing will stop a runaway task. Set budget.maxToolCalls "
+              "or budget.maxWallClockMin in sdlc.config.json.")
+    return 0
+
+
+def cmd_checkpoint(args) -> int:
+    """A resumable record of a long task.
+
+    The hard part of resuming is not storing the plan; it is knowing whether the plan still
+    applies. So a checkpoint records the repository state it assumed, and resuming re-checks it
+    — the same discipline receipts use, for the same reason.
+    """
+    root = repo_root()
+    p = os.path.join(root, CHECKPOINT)
+
+    if args.checkpoint_action == "write":
+        c = {
+            "task": args.task or branch(root),
+            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "commit": head(root),
+            "branch": branch(root),
+            "treeClean": tree_clean(root),
+            "done": args.done or [],
+            "next": args.next_step or "",
+            "note": args.note or "",
+            "files": {},
+            "env": environment(root),
+        }
+        for rel in (args.file or []):
+            d = subject_digest(root, rel)
+            if d:
+                c["files"][rel] = d
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as fh:
+            json.dump(c, fh, indent=2)
+            fh.write("\n")
+        audit(root, "checkpoint.write", f"{c['task']}: {args.next_step or ''}")
+        print(f"checkpoint at {c['commit'][:9]}: {len(c['done'])} step(s) done, "
+              f"next: {c['next'] or '(unstated)'}")
+        if not c["treeClean"]:
+            print("note: the tree was dirty when this was taken, so resuming cannot verify "
+                  "the uncommitted part. Commit before checkpointing if you can.")
+        return 0
+
+    if not os.path.exists(p):
+        print("no checkpoint — this is the first attempt at this task")
+        return 1
+    c = json.load(open(p))
+
+    if args.checkpoint_action == "show":
+        print(json.dumps(c, indent=2))
+        return 0
+
+    # resume: a checkpoint is not automatically safe to resume
+    problems = []
+    if c.get("branch") != branch(root):
+        problems.append(f"it was taken on branch {c.get('branch')}, you are on {branch(root)}")
+    if c.get("commit") != head(root):
+        behind = subprocess.run(["git", "merge-base", "--is-ancestor", c["commit"], "HEAD"],
+                                cwd=root, capture_output=True).returncode == 0
+        problems.append(f"HEAD has moved to {head(root)[:9]}" +
+                        ("" if behind else " and the checkpoint's commit is not behind it — "
+                                           "the history was rewritten"))
+    for rel, digest in (c.get("files") or {}).items():
+        now = subject_digest(root, rel)
+        if now is None:
+            problems.append(f"{rel} no longer exists")
+        elif now != digest:
+            problems.append(f"{rel} changed since the checkpoint")
+    env_now = environment(root)
+    drift = [k for k in env_now if k in c.get("env", {}) and env_now[k] != c["env"][k]]
+    if drift:
+        problems.append(f"the toolchain changed ({', '.join(drift)})")
+
+    print(f"# Resuming {c['task']} — checkpointed {c['at']} at {c['commit'][:9]}\n")
+    if c.get("done"):
+        print("Already done, do not repeat:")
+        for step in c["done"]:
+            print(f"  - {step}")
+    print(f"\nNext: {c.get('next') or '(unstated)'}")
+    if c.get("note"):
+        print(f"Note: {c['note']}")
+    if problems:
+        print("\nThe repository is NOT in the state this checkpoint assumed:")
+        for why in problems:
+            print(f"  - {why}")
+        print("\nRe-establish the facts before editing anything. A checkpoint is a record of "
+              "what was true, not a licence to carry on as if it still is.")
+        audit(root, "checkpoint.resume", f"stale: {len(problems)} mismatch(es)")
+        return 1
+    print("\nThe repository matches what this checkpoint assumed. Safe to continue.")
+    audit(root, "checkpoint.resume", "clean")
+    return 0
+
+
+# --------------------------------------------------------------------------- suite integrity
+#
+# The one failure this whole pipeline exists to prevent: making the gate pass by lowering it.
+# Every agent prompt forbids deleting a test, weakening an assertion, suppressing a warning or
+# excluding a path — and a prompt is a request. This is the check that does not negotiate.
+#
+# It reads the diff textually, so it is a heuristic and says so. It is deliberately tuned to
+# over-report: a false positive costs one sentence of explanation in the pull request, and a
+# false negative costs a silently disarmed test suite.
+
+TEST_PATH_RE = re.compile(
+    r"(^|/)(tests?|spec|specs|__tests__|testdata)/|[._-](test|spec)\.[a-z]+$|_test\.|"
+    r"(^|/)test_[^/]+\.py$", re.I)
+
+# A line that declares a test. Losing one is losing a check.
+TEST_DECL = re.compile(
+    r"\b(def\s+test_\w+|func\s+Test\w+|#\[test\]|#\[tokio::test\]|@Test\b|"
+    r"\b(it|test|describe|context)\s*\(|\bTEST(_F|_P)?\s*\()", re.I)
+
+# A line that asserts something. Losing one usually means the test now proves less.
+ASSERT_RE = re.compile(
+    r"\b(assert\w*|expect|should|require\.\w+|must\w*|verify|ok\(|t\.(Error|Fatal)\w*)\b",
+    re.I)
+
+# A marker that stops a test running, or runs only one. Added, these are how a suite goes quiet.
+SKIP_ADDED = (
+    (re.compile(r"\.(skip|only)\s*\(|\bx(it|describe|test)\s*\("), "a test is skipped or isolated"),
+    (re.compile(r"@pytest\.mark\.(skip|xfail)"), "a test is skipped or expected to fail"),
+    (re.compile(r"\bt\.Skip\w*\("), "a Go test skips itself"),
+    (re.compile(r"#\[ignore\]"), "a Rust test is ignored"),
+    (re.compile(r"@(Disabled|Ignore)\b"), "a JVM test is disabled"),
+    (re.compile(r"\breturn\s*;?\s*//\s*(TODO|FIXME|skip)", re.I), "a test returns early"),
+)
+
+# Silencing a tool rather than satisfying it.
+SUPPRESS_ADDED = (
+    (re.compile(r"eslint-disable(-next-line)?"), "an eslint rule is disabled"),
+    (re.compile(r"#\s*noqa|#\s*type:\s*ignore|#\s*pylint:\s*disable"), "a Python check is silenced"),
+    (re.compile(r"#\[allow\("), "a Rust lint is allowed"),
+    (re.compile(r"//\s*nolint|//lint:ignore"), "a Go linter is silenced"),
+    (re.compile(r"@SuppressWarnings|@ts-(ignore|expect-error|nocheck)"), "a type or compiler check is suppressed"),
+    (re.compile(r"\bcontinue-on-error:\s*true"), "a CI step is allowed to fail"),
+    (re.compile(r"\|\|\s*true\s*$"), "a command's failure is swallowed"),
+)
+
+NUM_SETTING = re.compile(r"([A-Za-z_][\w.\- ]{2,40})\s*[:=]\s*(\d{1,3})(?:\.\d+)?\s*%?\s*$")
+
+# Markdown is scanned like anything else. In a plugin whose executable instructions ARE
+# markdown, `|| true` appended to a command in commands/gate.md is a real weakening.
+#
+# There is no content-based exemption left in this function. Three were tried — quote parity,
+# quotes on both sides, and "a line starting with + or - is a diff illustration" — and each
+# was defeated by editing the line: an apostrophe, a trailing quote, and a two-character list
+# prefix. A file that contains these patterns as subject matter rather than as behaviour
+# declares itself in suiteAudit.exclude, where a reviewer sees it.
+
+
+def diff_files(root: str, base: str):
+    """(path, added, removed) per changed file, or None if git could not tell us.
+
+    Each file is diffed on its own, with explicit prefixes. Parsing one combined diff let a
+    line of *content* beginning `++ b/x.md` pose as a file header and reassign every line
+    after it, and a developer's long-standing `diff.noprefix` setting removed the prefix this
+    parser keyed on — silently disabling the whole check. Neither is reachable per-file.
+    """
+    def run(*args):
+        return subprocess.run(["git", *args], cwd=root, capture_output=True, text=True)
+
+    # -z: NUL-separated and never C-quoted. With git's default core.quotePath a non-ASCII
+    # name came back quoted, matched no pathspec, and produced an empty diff with returncode
+    # 0 — so gutting that file reported nothing. Failing OPEN, the mode B1d removed.
+    r = run("diff", "--name-only", "-z", f"{base}...HEAD")
+    if r.returncode != 0:
+        r = run("diff", "--name-only", "-z", base)
+    if r.returncode != 0:
+        return None  # fail closed; the caller reports unexecuted, never "nothing found"
+
+    out = []
+    for path in [x for x in r.stdout.split("\0") if x.strip()]:
+        d = run("diff", "--no-color", "--unified=0", "--src-prefix=a/", "--dst-prefix=b/",
+                f"{base}...HEAD", "--", path)
+        if d.returncode != 0:
+            d = run("diff", "--no-color", "--unified=0", "--src-prefix=a/", "--dst-prefix=b/",
+                    base, "--", path)
+        if d.returncode != 0:
+            return None
+        added, removed, in_body = [], [], False
+        for line in d.stdout.splitlines():
+            if line.startswith("@@"):
+                in_body = True
+            elif in_body and line.startswith("+"):
+                added.append(line[1:])
+            elif in_body and line.startswith("-"):
+                removed.append(line[1:])
+        if not d.stdout.strip():
+            return None  # named as changed but produced no diff; that is not "clean"
+        out.append((path, added, removed))
+    return out
+
+
+def audit_excluded(cfg: dict, path: str) -> bool:
+    """Is this path declared exempt from the suite audit?
+
+    Content-based exemption was tried twice and is not defensible. Counting quote parity let
+    one apostrophe disarm a line; requiring a quote on both sides let `# noqa  # "` do it.
+    Anything decided from the text of a line can be forged by writing different text, and the
+    actor writing it is the one the control exists to constrain.
+
+    So exemption is declared in sdlc.config.json instead: visible in the diff, reviewable, and
+    not reachable by editing the line under suspicion. A file that genuinely *defines* these
+    patterns — this plugin's own detector, its fixtures — says so once, out loud. Adding to
+    the list is itself reported as a weakening, so the escape hatch cannot be used quietly.
+    """
+    for pat in ((cfg.get("suiteAudit") or {}).get("exclude") or []):
+        if fnmatch.fnmatch(path, pat) or path == pat:
+            return True
+    return False
+
+
+def suite_findings(root: str, base: str, cfg: dict = None):
+    """Everything in this diff that makes the gate easier to pass, or None if git failed."""
+    cfg = cfg if cfg is not None else load_config(root)
+    found = []
+
+    r = subprocess.run(["git", "diff", "--name-only", "-z", "--diff-filter=D",
+                        f"{base}...HEAD"], cwd=root, capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    for path in r.stdout.split("\0"):
+        if path and TEST_PATH_RE.search(path):
+            found.append((path, "a test file was deleted", path))
+
+    files = diff_files(root, base)
+    if files is None:
+        return None
+
+    # Widening the exemption list is itself a weakening — otherwise the escape hatch IS the
+    # bypass: add one glob and the check goes quiet everywhere. Compared as parsed lists at
+    # the two revisions rather than by pattern-matching the diff, so reformatting the config
+    # neither hides an addition nor invents one.
+    cfg_path = config_path(root)
+    if cfg_path:
+        name = os.path.relpath(cfg_path, root)
+        before, after = set(), set()
+        r = subprocess.run(["git", "show", f"{base}:{name}"], cwd=root,
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            try:
+                before = set(((json.loads(r.stdout).get("suiteAudit") or {}).get("exclude")) or [])
+            except Exception:
+                pass
+        try:
+            after = set(((load_config(root).get("suiteAudit") or {}).get("exclude")) or [])
+        except Exception:
+            after = set()
+        for added_glob in sorted(after - before):
+            found.append((name, "a path was newly exempted from the suite audit's "
+                                "suppression-marker checks",
+                          f'suiteAudit.exclude += "{added_glob}"'))
+
+    for path, added, removed in files:
+        if TEST_PATH_RE.search(path or ""):
+            lost = sum(1 for l in removed if TEST_DECL.search(l))
+            gained = sum(1 for l in added if TEST_DECL.search(l))
+            if lost > gained:
+                found.append((path, f"{lost - gained} test(s) removed and not replaced",
+                              next(l.strip() for l in removed if TEST_DECL.search(l))))
+            lost_a = sum(1 for l in removed if ASSERT_RE.search(l))
+            gained_a = sum(1 for l in added if ASSERT_RE.search(l))
+            # One removed assertion counts. The old threshold of two meant a reviewer could
+            # drop exactly one check per commit forever and never be reported.
+            if lost_a - gained_a >= 1:
+                n = lost_a - gained_a
+                found.append((path, f"{n} assertion(s) removed and not replaced — the test "
+                                    f"may now prove less",
+                              next(l.strip() for l in removed if ASSERT_RE.search(l))))
+
+        exempt = audit_excluded(cfg, path or "")
+        for line in added:
+            if not exempt:
+                for pat, why in SKIP_ADDED + SUPPRESS_ADDED:
+                    if pat.search(line):
+                        found.append((path, why, line.strip()))
+                        break
+
+
+        was = {}
+        for line in removed:
+            m = NUM_SETTING.search(line.strip())
+            if m:
+                was[m.group(1).strip().lower()] = int(m.group(2))
+        for line in added:
+            m = NUM_SETTING.search(line.strip())
+            if m:
+                key = m.group(1).strip().lower()
+                if key in was and int(m.group(2)) < was[key]:
+                    found.append((path, f"a threshold was lowered: {key} "
+                                        f"{was[key]} -> {m.group(2)}", line.strip()))
+    return found
+
+
+def cmd_tests(args) -> int:
+    root = repo_root()
+    cfg = load_config(root)
+    base = args.base or merge_base(root, cfg)
+    found = suite_findings(root, base, cfg)
+
+    if found is None:
+        print(f"suite integrity: UNEXECUTED — git could not produce a diff against "
+              f"'{base}'. This is not a pass. A check that did not run is `unexecuted`; "
+              f"fix the ref and run it again.", file=sys.stderr)
+        audit(root, "suite.unexecuted", f"git diff failed against {base}")
+        return 1
+
+    if not found:
+        print(f"suite integrity: nothing in this diff weakens a check (against {base[:9]})")
+        return 0
+
+    print(f"suite integrity: {len(found)} thing(s) in this diff make the gate easier to pass\n")
+    for path, why, evidence in found:
+        print(f"  {path}")
+        print(f"    {why}")
+        print(f"    > {evidence[:150]}")
+    print("\nEach of these may be correct. None of them is correct *by default*, and none may")
+    print("pass without a sentence in the commit message saying why. Deleting a failing test,")
+    print("weakening an assertion, skipping a case or lowering a threshold to make the gate")
+    print("pass is the one failure this pipeline exists to prevent.")
+
+    if args.acknowledge:
+        if not args.as_person:
+            print("\n--acknowledge needs --as '<your name>'. An acknowledgement with nobody "
+                  "behind it records nothing, which is the whole reason it exists.",
+                  file=sys.stderr)
+            return 3
+        audit(root, "suite.acknowledged",
+              f"{len(found)} weakening(s) accepted by {args.as_person} against {base[:9]}")
+        print(f"\nAcknowledged by {args.as_person} — recorded, not waived. The reviewers still "
+              f"see every one of these, and so does `sdlc metrics`.")
+        return 0
+
+    print("\nIf a suppression is genuinely the right resolution, say so in the commit and")
+    print("re-run with --acknowledge --as '<your name>' to record who decided.")
+    audit(root, "suite.weakened", f"{len(found)} weakening change(s) against {base[:9]}")
+    return 1
+
+
+# ------------------------------------------------------------------- environment + baseline
+#
+# Two blind spots with one shape: the pipeline judged a change without knowing what the
+# repository looked like before it, and without knowing what produced the result. A test that
+# was already red gets blamed on the patch; a missing binary looks like a defect. Both are
+# answered by recording the starting state and comparing against it.
+
+_ENV_CACHE = None
+
+# Probed in this order; absent tools are simply not reported. Version flags differ, so each
+# names its own.
+VERSION_PROBES = (
+    ("git", ["git", "--version"]),
+    ("python", [sys.executable, "--version"]),
+    ("node", ["node", "--version"]),
+    ("npm", ["npm", "--version"]),
+    ("pnpm", ["pnpm", "--version"]),
+    ("yarn", ["yarn", "--version"]),
+    ("bun", ["bun", "--version"]),
+    ("cargo", ["cargo", "--version"]),
+    ("go", ["go", "version"]),
+    ("uv", ["uv", "--version"]),
+    ("java", ["java", "-version"]),
+)
+
+
+def environment(root: str = "") -> dict:
+    """Which toolchain produced this result. Probed once per process — these are subprocesses.
+
+    Without it, 'the tests failed' cannot be told apart from 'this machine cannot run them',
+    and an agent will spend its retries editing code to fix a missing binary.
+    """
+    global _ENV_CACHE
+    if _ENV_CACHE is not None:
+        return _ENV_CACHE
+    env = {"os": sys.platform, "arch": os.uname().machine if hasattr(os, "uname") else "?"}
+    for name, cmd in VERSION_PROBES:
+        if not which(cmd[0]) and cmd[0] != sys.executable:
+            continue
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            out = (r.stdout or r.stderr or "").strip().splitlines()
+            if out:
+                env[name] = re.sub(r"^[a-z]+ version |^v", "", out[0].strip())[:40]
+        except Exception:
+            pass
+    _ENV_CACHE = env
+    return env
+
+
+# Lines worth comparing between two runs: the ones a runner uses to say something went wrong.
+SIGNAL_RE = re.compile(
+    r"(?:^|\s)(?:error|errors?\[|fail(?:ed|ure|ures)?|warning|warn|panic|assert(?:ion)?|"
+    r"exception|traceback|FAILED|FAIL|✗|✕|×)\b", re.I)
+
+# Everything here changes between two runs of the same unchanged code, so it must not count as
+# a difference. Over-scrubbing can hide a real change, which is why the full output is kept.
+NOISE = (
+    (re.compile(r"\b\d+(\.\d+)?\s*(ms|s|sec|secs|seconds|m|min|minutes)\b", re.I), "<time>"),
+    (re.compile(r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}\S*"), "<ts>"),
+    (re.compile(r"0x[0-9a-fA-F]{4,}"), "<addr>"),
+    (re.compile(r"/(?:tmp|var/folders|private/var)/\S+"), "<tmp>"),
+    (re.compile(r":\d+:\d+"), ":<pos>"),
+    (re.compile(r"\b[0-9a-f]{7,40}\b"), "<sha>"),
+    (re.compile(r"\s+"), " "),
+)
+
+
+def signals(output: str) -> list:
+    """The normalised failure and warning lines in a command's output.
+
+    A heuristic over text, deliberately: parsing would mean a parser per test runner, and only
+    sdlc.config.json is allowed to know the stack.
+    """
+    out = []
+    for line in output.splitlines():
+        line = line.strip()
+        if not line or not SIGNAL_RE.search(line):
+            continue
+        for pat, rep in NOISE:
+            line = pat.sub(rep, line)
+        line = line.strip()
+        if line and line not in out:
+            out.append(line[:300])
+    return out
+
+
+def merge_base(root: str, cfg: dict) -> str:
+    trunk = cfg.get("trunk") or "main"
+    return (git("merge-base", "HEAD", f"origin/{trunk}", cwd=root)
+            or git("merge-base", "HEAD", trunk, cwd=root)
+            or git("rev-list", "--max-parents=0", "HEAD", cwd=root))
+
+
+# A verify command is long by nature; a runaway one is the longest thing the pipeline runs,
+# and the ceiling meant to stop a runaway could not stop it.
+VERIFY_TIMEOUT_S = 1800
+
+
+def run_verify(root: str, cfg: dict):
+    """Run the project's verify command — through the same refusals as any other command.
+
+    `verifyCmd` comes from sdlc.config.json, which docs/rules.md section 7 classifies as data,
+    not authority. Running it with shell=True without consulting guard_problem opened a route
+    around every refusal in this file: a publish, a credential read or a deploy written into a
+    config string executed unchallenged, from a stage the branch-opener runs automatically.
+    The guard sees it first now, and it cannot run forever.
+    """
+    cmd = cfg.get("gateCmd") or cfg.get("verifyCmd")
+    if not cmd:
+        return None, None, None
+    problem = guard_problem(root, cmd, cfg)
+    if problem:
+        audit(root, "blocked", f"verifyCmd: {problem.splitlines()[0]} :: {cmd}")
+        return cmd, 126, (f"REFUSED before running: the configured command is not allowed.\n"
+                          f"{problem}\n\nThis came from sdlc.config.json, which is data, not "
+                          f"authority. A command in a config file is held to the same rules "
+                          f"as one an agent types.")
+    try:
+        r = subprocess.run(cmd, shell=True, cwd=root, capture_output=True, text=True,
+                           timeout=VERIFY_TIMEOUT_S)
+    except subprocess.TimeoutExpired as e:
+        out = e.stdout if isinstance(e.stdout, str) else (e.stdout or b"").decode(errors="replace")
+        return cmd, 124, (f"{out}\nTIMED OUT after {VERIFY_TIMEOUT_S}s. That is `unexecuted` "
+                          f"— not a failure of the change, and not a pass.")
+    return cmd, r.returncode, (r.stdout or "") + (r.stderr or "")
+
+
+def cmd_baseline(args) -> int:
+    root = repo_root()
+    cfg = load_config(root)
+    p = os.path.join(root, BASELINE)
+
+    if args.baseline_action == "show":
+        if not os.path.exists(p):
+            print("no baseline — run `sdlc baseline capture` before starting work")
+            return 1
+        b = json.load(open(p))
+        print(f"captured {b['at']} at base {b['base'][:9]} on {b.get('branch')}")
+        print(f"  command   {b['cmd']}")
+        print(f"  exit      {b['exit']} ({'green' if b['exit'] == 0 else 'ALREADY FAILING'})")
+        print(f"  signals   {len(b['signals'])}")
+        for sig in b["signals"][:20]:
+            print(f"    {sig[:120]}")
+        return 0
+
+    if args.baseline_action == "capture":
+        cmd, code, out = run_verify(root, cfg)
+        if cmd is None:
+            print("no verifyCmd in the config — nothing to baseline. Without one nothing can "
+                  "be gated either; see `sdlc doctor`.", file=sys.stderr)
+            return 3
+        base = merge_base(root, cfg)
+        b = {
+            "base": base,
+            "branch": branch(root),
+            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "cmd": cmd,
+            "exit": code,
+            "signals": signals(out),
+            "output": out[-20000:],
+            "env": environment(root),
+        }
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as fh:
+            json.dump(b, fh, indent=2)
+            fh.write("\n")
+        audit(root, "baseline.capture", f"exit {code}, {len(b['signals'])} signals at {base[:9]}")
+        print(f"baseline captured at {base[:9]}: exit {code}, {len(b['signals'])} signal(s)")
+        if code != 0:
+            print("This repository was NOT green when the work started. That is worth knowing "
+                  "now rather than discovering it as a 'regression' later.")
+        return 0
+
+    # compare
+    if not os.path.exists(p):
+        print("no baseline: this comparison is `unexecuted`, not passed. Capture one at the "
+              "branch point with `sdlc baseline capture`.", file=sys.stderr)
+        return 1
+    b = json.load(open(p))
+    cmd, code, out = run_verify(root, cfg)
+    if cmd is None:
+        print("no verifyCmd in the config", file=sys.stderr)
+        return 3
+    now = signals(out)
+    was = b["signals"]
+    new = [x for x in now if x not in was]
+    gone = [x for x in was if x not in now]
+    kept = [x for x in now if x in was]
+
+    # A baseline goes stale when its base is no longer behind us — a rebase, or a trunk that
+    # moved under the branch. It does NOT go stale merely because we committed: that is the
+    # whole difference between a baseline and a receipt.
+    still_behind = subprocess.run(["git", "merge-base", "--is-ancestor", b["base"], "HEAD"],
+                                  cwd=root, capture_output=True).returncode == 0
+    if not still_behind:
+        print(f"note: the baseline's base {b['base'][:9]} is no longer an ancestor of HEAD — "
+              f"the branch was rebased or the trunk moved. Recapture it.")
+    env_now = environment(root)
+    drift = [k for k in env_now if k in b.get("env", {}) and env_now[k] != b["env"][k]]
+    if drift:
+        print(f"note: the toolchain changed since the baseline ({', '.join(drift)}). A failure "
+              f"may belong to the environment rather than to the change.")
+
+    print(f"baseline {b['exit']} -> now {code}   "
+          f"{len(new)} new, {len(kept)} pre-existing, {len(gone)} fixed")
+    if new:
+        print("\nNEW since the baseline — these belong to this change:")
+        for x in new[:30]:
+            print(f"  {x[:160]}")
+    if kept:
+        print(f"\nPre-existing ({len(kept)}) — already there before the work started, "
+              f"not caused by it:")
+        for x in kept[:10]:
+            print(f"  {x[:160]}")
+    if gone:
+        print(f"\nFixed ({len(gone)}) — present at the baseline, gone now.")
+    audit(root, "baseline.compare", f"{len(new)} new, {len(kept)} pre-existing, {len(gone)} fixed")
+    if code in (124, 126):
+        print(f"\nVerdict: UNEXECUTED. The verify command did not run, so this says nothing "
+              f"about the change — in either direction.\n{out.strip()[:600]}")
+        audit(root, "baseline.unexecuted", f"verify exit {code}")
+        return 1
+
+    if new or (code != 0 and b["exit"] == 0):
+        print("\nVerdict: this change introduced failures. Fix those; leave the pre-existing "
+              "ones alone unless the specification asked for them.")
+        return 1
+    if code != 0:
+        print("\nVerdict: still failing, but with nothing new. The failures predate this work — "
+              "do not spend attempts on them, and do not report them as caused by the change.")
+        return 0
+    print("\nVerdict: nothing new.")
+    return 0
+
+
+# ---------------------------------------------------------------------------------- findings
+#
+# A finding is a claim about the code. Prose carries the argument; this carries the parts that
+# have to be compared, counted and audited: what rule, how bad, how sure, on what evidence, by
+# whom. Validation here mirrors schema/finding.schema.json — two expressions of one contract,
+# because bin/sdlc has no dependencies and cannot run a JSON Schema validator. A test feeds the
+# same values through both so they cannot drift.
+
+
+def control_spec_body() -> str:
+    """The control specification's text, or stop.
+
+    This used to swallow a read error and return nothing, which meant a missing or renamed
+    docs/control-spec.md silently emptied both the rule table and the never-autofix set: any
+    invented rule validated, and TEST-SUITE-WEAKENED came back autofixable. A control whose
+    off-switch is an absent file is not a control, so this fails closed and loudly.
+    """
+    try:
+        body = read_plugin("docs", "control-spec.md")
+    except Exception:
+        body = ""
+    # read_plugin returns "" on a read error rather than raising, so checking for the
+    # exception alone was dead code: a missing file produced an empty policy in silence.
+    if not body.strip() or "| Rule ID |" not in body:
+        e = "missing, empty, or has no rule table"
+        print(f"agentic-sdlc: cannot read docs/control-spec.md ({e}).\n"
+              f"It is the normative rule table: without it no rule can be validated and no "
+              f"rule can be known to be un-autofixable. Refusing rather than proceeding with "
+              f"an empty policy.", file=sys.stderr)
+        raise SystemExit(3)
+    return body
+
+
+def known_rules() -> set:
+    """Rule IDs from the control specification's table — the one source of truth.
+
+    Parsed rather than duplicated, so adding a row to docs/control-spec.md is all it takes to
+    make a rule usable. An unreadable table means we skip the check rather than block work.
+    """
+    body = control_spec_body()
+    return set(re.findall(r"^\|\s*`([A-Z][A-Z0-9-]*)`\s*\|", body, re.M))
+
+
+def finding_id(rule: str, file: str, line, summary: str) -> str:
+    """Stable identity, so the same finding raised twice is one finding and not two.
+
+    Deduplication is not cosmetic: a wall of repeated comments is how a review tool gets turned
+    off (the brief's X9).
+    """
+    key = f"{rule}|{file}|{line or ''}|{summary}".encode()
+    return "F-" + hashlib.sha256(key).hexdigest()[:8]
+
+
+def never_autofix_rules() -> set:
+    """Rules the control spec does not mark autofixable, whatever the severity pair says.
+
+    Parsed from the same table as the rule IDs. Without this the matrix alone decided, and a
+    TEST-SUITE-WEAKENED finding at critical/high came back "eligible for automatic fix" — an
+    agent authorised to repair a disarmed test suite unattended, which is the exact thing the
+    rule exists to stop.
+    """
+    body = control_spec_body()
+    out = set()
+    for rule, rest in re.findall(r"^\|\s*`([A-Z][A-Z0-9-]*)`\s*\|(.*)$", body, re.M):
+        cols = [c.strip() for c in rest.split("|")]
+        # columns: domain | detection | default severity | autofix | evidence
+        autofix = cols[3].lower() if len(cols) > 3 else ""
+        # Only an explicit "yes" defers to the severity x confidence matrix. Reading only
+        # **never** let the 53 rows that say plain "no" — SEC-INJECTION-SQL, SEC-AUTHORITY,
+        # MEM-SAFETY among them — come back autofixable at critical/high, which is the
+        # permissive half of a document that contradicted itself.
+        if not autofix.startswith("yes"):
+            out.add(rule)
+    return out
+
+
+def autofix_eligible(severity: str, confidence: str, has_repro: bool,
+                     rule: str = "") -> bool:
+    if rule and rule in never_autofix_rules():
+        return False
+    policy = AUTOFIX.get((severity, confidence), False)
+    if policy == "repro":
+        return bool(has_repro)
+    return bool(policy)
+
+
+def finding_problems(rec: dict) -> list:
+    """Why this record is not a valid finding. Empty list means it is."""
+    out = []
+    for field in ("id", "category", "ruleId", "summary", "evidence", "classification",
+                  "outcome", "provenance"):
+        if not rec.get(field):
+            out.append(f'missing required field "{field}"')
+    if out:
+        return out
+
+    if not re.fullmatch(r"F-[0-9a-f]{8}", rec["id"]):
+        out.append(f'id "{rec["id"]}" is not F- plus 8 hex digits')
+    if not re.fullmatch(r"([A-U]\.(?:[1-9][0-9]{0,2})|X(?:[1-9]|1[0-2]))", rec["category"]):
+        out.append(f'category "{rec["category"]}" is not a taxonomy address '
+                   f'(a domain letter and a check number, like D.31, or X1 to X12)')
+    if not re.fullmatch(r"[A-Z][A-Z0-9]*(-[A-Z0-9]+)*", rec["ruleId"]):
+        out.append(f'ruleId "{rec["ruleId"]}" is not an upper-case rule identifier')
+    else:
+        rules = known_rules()
+        if rules and rec["ruleId"] not in rules:
+            out.append(f'ruleId "{rec["ruleId"]}" is not in the rule table in '
+                       f'docs/control-spec.md — add the row before raising findings under it')
+    if not (8 <= len(rec["summary"]) <= 200):
+        out.append("summary must be between 8 and 200 characters: one sentence, the defect")
+    if rec["outcome"] not in FINDING_OUTCOMES:
+        out.append(f'outcome "{rec["outcome"]}" is not one of: {", ".join(FINDING_OUTCOMES)}')
+
+    ev = rec.get("evidence") or {}
+    if not ev.get("file"):
+        out.append("evidence.file is required — a finding with no location is an opinion")
+    if ev.get("line") is not None and not (isinstance(ev["line"], int) and ev["line"] >= 1):
+        out.append("evidence.line must be a positive integer")
+
+    cl = rec.get("classification") or {}
+    if cl.get("severity") not in SEVERITIES:
+        out.append(f'severity "{cl.get("severity")}" is not one of: {", ".join(SEVERITIES)}')
+    if cl.get("confidence") not in CONFIDENCES:
+        out.append(f'confidence "{cl.get("confidence")}" is not one of: {", ".join(CONFIDENCES)}')
+    if cl.get("exploitability") and cl["exploitability"] not in EXPLOITABILITY:
+        out.append(f'exploitability "{cl["exploitability"]}" is not one of: '
+                   f'{", ".join(EXPLOITABILITY)}')
+
+    pr = rec.get("provenance") or {}
+    if not pr.get("agent"):
+        out.append("provenance.agent is required — a finding with no author cannot be disputed")
+    if pr.get("detection") and pr["detection"] not in DETECTIONS:
+        out.append(f'detection "{pr["detection"]}" is not one of: {", ".join(DETECTIONS)}')
+    return out
+
+
+def finding_load_all(root: str) -> list:
+    d = os.path.join(root, FINDING_DIR)
+    if not os.path.isdir(d):
+        return []
+    out = []
+    for name in sorted(os.listdir(d)):
+        if name.endswith(".json"):
+            try:
+                out.append(json.load(open(os.path.join(d, name))))
+            except Exception:
+                pass
+    return out
+
+
+def cmd_finding(args) -> int:
+    root = repo_root()
+
+    if args.finding_action == "write":
+        severity, confidence = args.severity, args.confidence
+        rid = finding_id(args.rule, args.file, args.line, args.summary)
+        rec = {
+            "id": rid,
+            "category": args.category,
+            "ruleId": args.rule,
+            "component": args.component or "",
+            "summary": args.summary,
+            "evidence": {
+                "file": args.file,
+                "line": args.line,
+                "endLine": None,
+                "code": args.code or None,
+                "toolOutput": args.tool_output or None,
+                "repro": args.repro or None,
+            },
+            "classification": {
+                "severity": severity,
+                "confidence": confidence,
+                "exploitability": args.exploitability or "not-applicable",
+                "impact": args.impact or None,
+            },
+            "rootCause": args.root_cause or None,
+            "proposedRepair": None,
+            "verificationPlan": args.verification_plan or None,
+            "outcome": "open",
+            "closedBy": None,
+            "provenance": {
+                "agent": args.by,
+                "model": os.environ.get("CLAUDE_MODEL") or None,
+                "detection": args.detection,
+                "toolVersion": args.tool_version or None,
+                "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "commit": head(root),
+            },
+        }
+        # The agent proposes the change; the policy table decides whether it may make it.
+        # Recorded even when no repair was proposed, so the remediator always has the
+        # machine-readable answer and never has to re-derive it from the prose.
+        rec["proposedRepair"] = {
+            "change": args.repair or "",
+            "expectedBehaviour": args.expected or "",
+            "sideEffects": args.side_effects or None,
+            "autofixEligible": autofix_eligible(severity, confidence,
+                                                bool(args.repro), args.rule),
+        }
+        problems = finding_problems(rec)
+        if problems:
+            for why in problems:
+                print(f"invalid finding: {why}", file=sys.stderr)
+            return 3
+        d = os.path.join(root, FINDING_DIR)
+        os.makedirs(d, exist_ok=True)
+        existing = os.path.join(d, rid + ".json")
+        if os.path.exists(existing):
+            # The same finding raised again is one finding — but if it was closed and has
+            # come back, it is NOT still closed. Re-opening it is the honest record: a defect
+            # re-detected after a bad fix was previously written straight back as `fixed`,
+            # and the gate reads `finding list --open`, so it vanished.
+            try:
+                prev = json.load(open(existing))
+                was = prev.get("outcome", "open")
+                if was in ("fixed", "refused", "deferred"):
+                    rec["outcome"] = "open"
+                    rec["closedBy"] = None
+                    rec["reopened"] = int(prev.get("reopened", 0)) + 1
+                    print(f"  REOPENED — this was closed as {was} at "
+                          f"{str(prev.get('closedBy'))[:9]} and has been detected again.")
+                else:
+                    rec["outcome"] = was
+                    rec["closedBy"] = prev.get("closedBy")
+                    if prev.get("reopened"):
+                        rec["reopened"] = prev["reopened"]
+            except Exception:
+                pass
+        with open(existing, "w") as fh:
+            json.dump(rec, fh, indent=2)
+            fh.write("\n")
+        audit(root, "finding.write", f"{rid} {args.rule} {severity}/{confidence} by {args.by}")
+        auto = rec["proposedRepair"]["autofixEligible"]
+        print(f"{rid}  {args.rule}  {severity}/{confidence}  {args.file}"
+              f"{':' + str(args.line) if args.line else ''}")
+        if args.repair:
+            print("  repair: " + ("eligible for automatic fix"
+                                  if auto else "NOT eligible — report or escalate"))
+        return 0
+
+    if args.finding_action == "list":
+        rows = finding_load_all(root)
+        total = len(rows)
+        if args.open_only:
+            rows = [r for r in rows if r.get("outcome") == "open"]
+        if args.severity:
+            rows = [r for r in rows
+                    if (r.get("classification") or {}).get("severity") == args.severity]
+        if args.json:
+            print(json.dumps(rows, indent=2))
+            return 0
+        if not rows:
+            print("no findings" + (" open" if args.open_only else ""))
+            return 0
+        order = {s: i for i, s in enumerate(SEVERITIES)}
+        rows.sort(key=lambda r: order.get((r.get("classification") or {}).get("severity"), 9))
+        for r in rows:
+            cl = r.get("classification") or {}
+            ev = r.get("evidence") or {}
+            loc = ev.get("file", "?") + (f":{ev['line']}" if ev.get("line") else "")
+            print(f"  {r['id']}  {cl.get('severity','?'):<8} {cl.get('confidence','?'):<6} "
+                  f"{r.get('outcome','?'):<10} {r.get('ruleId','?'):<26} {loc}")
+            print(f"            {r.get('summary','')}")
+        allrows = finding_load_all(root)
+        openn = sum(1 for r in allrows if r.get("outcome") == "open")
+        unex = sum(1 for r in allrows if r.get("outcome") == "unexecuted")
+        shown = f"showing {len(rows)} of {total}" if len(rows) != total else f"{total} finding(s)"
+        print(f"\n{shown}; {openn} open, {unex} unexecuted, of {total} raised.")
+        if unex:
+            print("An unexecuted finding is not closed — the fix was never verified.")
+        return 0
+
+    if args.finding_action == "show":
+        p = os.path.join(root, FINDING_DIR, args.id + ".json")
+        if not os.path.exists(p):
+            print(f"no finding {args.id}", file=sys.stderr)
+            return 1
+        print(open(p).read().rstrip())
+        return 0
+
+    # close
+    p = os.path.join(root, FINDING_DIR, args.id + ".json")
+    if not os.path.exists(p):
+        print(f"no finding {args.id}", file=sys.stderr)
+        return 1
+    if args.outcome not in FINDING_OUTCOMES or args.outcome == "open":
+        print(f'outcome must be one of: {", ".join(w for w in FINDING_OUTCOMES if w != "open")}',
+              file=sys.stderr)
+        return 3
+    rec = json.load(open(p))
+    raiser = (rec.get("provenance") or {}).get("agent", "")
+    if raiser and args.by and raiser != args.by:
+        # Not refused — a remediator legitimately closes a reviewer's finding — but recorded,
+        # because "who closed this" was previously nowhere and any actor could close any
+        # finding silently.
+        print(f"note: {raiser} raised this; {args.by} is closing it.")
+    rec["outcome"] = args.outcome
+    rec["closedBy"] = args.commit or head(root)
+    rec["closedByActor"] = args.by
+    if args.detail:
+        rec["verificationPlan"] = rec.get("verificationPlan") or args.detail
+    with open(p, "w") as fh:
+        json.dump(rec, fh, indent=2)
+        fh.write("\n")
+    audit(root, "finding.close",
+          f"{args.id} outcome={args.outcome} by {args.by}: {args.detail or ''}")
+    print(f"{args.id}: {args.outcome}")
+    if args.outcome == "unexecuted":
+        print("unexecuted is not closed — the fix was not verified. It stays on the gate's list.")
     return 0
 
 
@@ -1335,8 +2435,76 @@ def cmd_metrics(args) -> int:
         print("\nactors")
         for a, n in sorted(agents.items(), key=lambda x: -x[1]):
             print(f"  {a:<24} {n} events")
+    findings = finding_load_all(root)
+    if findings:
+        sev, cat, outcome = {}, {}, {}
+        for f in findings:
+            cl = f.get("classification") or {}
+            sev[cl.get("severity", "?")] = sev.get(cl.get("severity", "?"), 0) + 1
+            dom = str(f.get("category", "?")).split(".")[0]
+            cat[dom] = cat.get(dom, 0) + 1
+            outcome[f.get("outcome", "?")] = outcome.get(f.get("outcome", "?"), 0) + 1
+        print("\nfindings by severity")
+        for k in SEVERITIES:
+            if k in sev:
+                print(f"  {k:<10} {sev[k]}")
+        print("findings by taxonomy domain")
+        for k, v in sorted(cat.items(), key=lambda x: -x[1])[:12]:
+            print(f"  {k:<10} {v}")
+
+        # The outcome measures the brief asks for, computed only from what is recorded.
+        # Each is labelled with what it actually counts, because a metric whose definition is
+        # unstated is how a dashboard starts lying.
+        closed = sum(outcome.get(w, 0) for w in ("fixed", "refused", "deferred", "escalated"))
+        attempted = outcome.get("fixed", 0) + outcome.get("unexecuted", 0)
+        print("\noutcomes")
+        print(f"  verified repair rate   "
+              f"{100 * outcome.get('fixed', 0) // max(attempted, 1)}%  "
+              f"({outcome.get('fixed', 0)} fixed with proof / {attempted} repairs attempted)")
+        print(f"  human intervention     "
+              f"{100 * outcome.get('escalated', 0) // max(len(findings), 1)}%  "
+              f"({outcome.get('escalated', 0)} escalated / {len(findings)} findings)")
+        repro = sum(1 for f in findings if (f.get("evidence") or {}).get("repro"))
+        print(f"  reproducible           "
+              f"{100 * repro // max(len(findings), 1)}%  "
+              f"({repro} carry a reproduction)")
+        unex = outcome.get("unexecuted", 0)
+        if unex:
+            print(f"  UNVERIFIED             {unex} finding(s) closed as unexecuted — the fix "
+                  f"was never proved. These are not closed.")
+        if outcome.get("open"):
+            print(f"  still open             {outcome['open']}")
+
+        # A finding re-raised after being closed as fixed did not stay fixed.
+        fixed_then, refixed = set(), 0
+        for r in rows:
+            # Matched on the structured field, not on free text: the old `" fixed" in detail`
+            # counted a close whose note said "could not be fixed yet" as a fix.
+            if r["event"] == "finding.close" and "outcome=fixed" in r["detail"]:
+                fixed_then.add(r["detail"].split()[0])
+            elif r["event"] == "finding.write" and r["detail"].split()[0] in fixed_then:
+                refixed += 1
+        if fixed_then:
+            print(f"  false-fix rate         "
+                  f"{100 * refixed // max(len(fixed_then), 1)}%  "
+                  f"({refixed} of {len(fixed_then)} came back after being closed fixed)")
+
+    regress = [r for r in rows if r["event"] == "baseline.compare"]
+    if regress:
+        withnew = sum(1 for r in regress if not r["detail"].startswith("0 new"))
+        print(f"\nattribution ({len(regress)} comparisons)")
+        print(f"  changes that introduced a new failure  "
+              f"{100 * withnew // max(len(regress), 1)}%  ({withnew} of {len(regress)})")
+    weakened = [r for r in rows if r["event"] == "suite.weakened"]
+    if weakened:
+        print(f"  diffs that weakened a check            {len(weakened)}")
+
     print("\nA low first-pass rate is not a problem by itself — it is the gate doing its job.\n"
           "A first-pass rate of 100% means the gate is not checking anything.")
+    if findings:
+        print("Detection precision and recall are NOT here: they need a corpus of seeded\n"
+              "defects with known answers, which no repository has about itself. See\n"
+              "docs/maturity.md for how to measure them if you need to.")
     return 0
 
 
@@ -1489,6 +2657,87 @@ def main() -> int:
         q.add_argument("--any-commit", action="store_true",
                        help="do not require the receipt to name the current HEAD")
     r.set_defaults(fn=cmd_receipt)
+
+    fd = sub.add_parser("finding", help="raise, list and close a structured finding")
+    fds = fd.add_subparsers(dest="finding_action", required=True)
+
+    fw = fds.add_parser("write", help="raise a finding (validated against the contract)")
+    fw.add_argument("--rule", required=True, help="a ruleId from docs/control-spec.md")
+    fw.add_argument("--category", required=True, help="taxonomy address, e.g. D.31 or X7")
+    fw.add_argument("--summary", required=True, help="one sentence: the defect")
+    fw.add_argument("--file", required=True)
+    fw.add_argument("--line", type=int)
+    fw.add_argument("--severity", required=True, choices=SEVERITIES)
+    fw.add_argument("--confidence", required=True, choices=CONFIDENCES)
+    fw.add_argument("--detection", default="llm", choices=DETECTIONS)
+    fw.add_argument("--exploitability", choices=EXPLOITABILITY)
+    fw.add_argument("--component", default="")
+    fw.add_argument("--code", default="", help="the relevant lines, quoted")
+    fw.add_argument("--tool-output", default="", help="the deterministic output behind the claim")
+    fw.add_argument("--repro", default="", help="the smallest reproduction, as commands")
+    fw.add_argument("--impact", default="")
+    fw.add_argument("--root-cause", default="", help="why it exists, not the symptom")
+    fw.add_argument("--repair", default="", help="the minimal proposed change")
+    fw.add_argument("--expected", default="", help="what is true after the repair")
+    fw.add_argument("--side-effects", default="")
+    fw.add_argument("--verification-plan", default="",
+                    help="the check that would establish the repair worked")
+    fw.add_argument("--tool-version", default="")
+    fw.add_argument("--by", default=os.environ.get("CLAUDE_AGENT", "agent"))
+
+    fl = fds.add_parser("list", help="what has been found")
+    fl.add_argument("--open", dest="open_only", action="store_true")
+    fl.add_argument("--severity", choices=SEVERITIES)
+    fl.add_argument("--json", action="store_true")
+
+    fsh = fds.add_parser("show")
+    fsh.add_argument("id")
+
+    fc = fds.add_parser("close", help="record what became of a finding")
+    fc.add_argument("id")
+    fc.add_argument("--outcome", required=True,
+                    choices=[w for w in FINDING_OUTCOMES if w != "open"])
+    fc.add_argument("--commit", default="")
+    fc.add_argument("--detail", default="")
+    fc.add_argument("--by", default=os.environ.get("CLAUDE_AGENT", "agent"),
+                    help="who is closing it; recorded on the finding and in the audit log")
+    fd.set_defaults(fn=cmd_finding)
+
+    bl = sub.add_parser("baseline", help="what was already broken before the work started")
+    bls = bl.add_subparsers(dest="baseline_action", required=True)
+    bls.add_parser("capture", help="record the verify result at the branch point")
+    bls.add_parser("compare", help="classify each failure as new, pre-existing or fixed")
+    bls.add_parser("show", help="what was captured, and when")
+    bl.set_defaults(fn=cmd_baseline)
+
+    ts = sub.add_parser("tests", help="has this diff made the gate easier to pass?")
+    tss = ts.add_subparsers(dest="tests_action", required=True)
+    ta = tss.add_parser("audit", help="deleted tests, weakened assertions, skips, suppressions")
+    ta.add_argument("--base", default="", help="compare against this ref instead of the merge base")
+    ta.add_argument("--acknowledge", action="store_true",
+                    help="record that a human decided each of these is correct")
+    ta.add_argument("--as", dest="as_person", default="",
+                    help="who is accepting them; required with --acknowledge")
+    ts.set_defaults(fn=cmd_tests)
+
+    bg = sub.add_parser("budget", help="what this task has spent, and its ceiling")
+    bgs = bg.add_subparsers(dest="budget_action", required=True)
+    bgs.add_parser("show")
+    bgr = bgs.add_parser("reset", help="a person clears the counter for this task")
+    bgr.add_argument("--as", dest="as_person", default="")
+    bg.set_defaults(fn=cmd_budget)
+
+    cp = sub.add_parser("checkpoint", help="resume a long task without assuming it is safe to")
+    cps = cp.add_subparsers(dest="checkpoint_action", required=True)
+    cw = cps.add_parser("write")
+    cw.add_argument("--task", default="")
+    cw.add_argument("--done", action="append", help="a step already finished; repeatable")
+    cw.add_argument("--next", dest="next_step", default="", help="the next step")
+    cw.add_argument("--note", default="")
+    cw.add_argument("--file", action="append", help="a file whose state this assumes; repeatable")
+    cps.add_parser("resume", help="re-check the assumptions before continuing")
+    cps.add_parser("show")
+    cp.set_defaults(fn=cmd_checkpoint)
 
     args = ap.parse_args()
     return args.fn(args)

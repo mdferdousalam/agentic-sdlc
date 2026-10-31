@@ -3,7 +3,7 @@
 
 Run: python3 tests/test_sdlc.py     (standard library only; makes throwaway git repos in /tmp)
 """
-import json, os, subprocess, sys, tempfile, shutil, time
+import json, os, re, subprocess, sys, tempfile, shutil, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SDLC = os.path.join(os.path.dirname(HERE), "bin", "sdlc")
@@ -295,6 +295,551 @@ ok("Keep this." in open(ag).read(), "uninstall leaves user content")
 ok("BEGIN agentic-sdlc" not in open(ag).read(), "uninstall removes our block")
 ok(not os.path.exists(os.path.join(d, ".cursor/rules/agentic-sdlc.mdc")), "uninstall removes files we own")
 ok("echo MINE" in open(hp).read(), "uninstall leaves the user's git hook body")
+print("findings: the contract is enforced, not assumed")
+df = newrepo(config={"trunk": "main", "spec": {"engine": "prd-frd"},
+                     "verifyCmd": "true", "quality": {"cmd": None}})
+
+
+def finding(*args, cwd=df):
+    return run(["finding", *args], cwd)
+
+
+def fwrite(rule="SEC-INJECTION-SQL", cat="D.31", sev="critical", conf="high",
+           f="src/q.ts", line="42", summary="user input is concatenated into SQL", extra=()):
+    return finding("write", "--rule", rule, "--category", cat, "--severity", sev,
+                   "--confidence", conf, "--file", f, "--line", line, "--summary", summary,
+                   *extra)
+
+
+r = fwrite()
+ok(r.returncode == 0, "a complete finding is accepted")
+fid = r.stdout.split()[0] if r.stdout.split() else ""
+ok(fid.startswith("F-") and len(fid) == 10, "it is given an F- plus 8 hex identity")
+
+ok(fwrite(rule="MADE-UP-RULE").returncode != 0, "a rule not in the control spec is refused")
+ok(fwrite(cat="Z.99").returncode != 0, "a category outside the taxonomy is refused")
+ok(fwrite(summary="short").returncode != 0, "a summary that states nothing is refused")
+ok("choose from" in fwrite(sev="catastrophic").stderr, "an invented severity is refused by name")
+ok(fwrite(conf="certain").returncode != 0, "an invented confidence is refused")
+
+# The same finding twice is one finding: a wall of duplicates is how a review tool gets ignored.
+before = len(os.listdir(os.path.join(df, ".sdlc/findings")))
+fwrite()
+ok(len(os.listdir(os.path.join(df, ".sdlc/findings"))) == before,
+   "the same finding raised twice stays one finding")
+
+print("findings: the repair policy is a table, not a vibe")
+POLICY = [
+    # severity,   confidence, repro, may an agent fix it unattended?
+    ("critical",  "high",     False, True),
+    ("critical",  "medium",   True,  False),
+    ("critical",  "low",      True,  False),
+    ("high",      "high",     False, True),
+    ("high",      "medium",   False, False),
+    ("high",      "medium",   True,  True),
+    ("high",      "low",      True,  False),
+    ("medium",    "high",     False, True),
+    ("medium",    "medium",   False, True),
+    ("medium",    "low",      False, False),
+    ("low",       "high",     False, True),
+    ("low",       "medium",   False, True),
+    ("low",       "low",      False, False),
+    ("advisory",  "high",     True,  False),
+    ("advisory",  "medium",   False, False),
+    ("advisory",  "low",      False, False),
+]
+for i, (sev, conf, repro, expect) in enumerate(POLICY):
+    extra = ["--repair", "the minimal change"] + (["--repro", "npm test -- x.spec.ts"] if repro else [])
+    # TYPE-ERROR is the one rule the table marks autofixable, so it is the only rule whose
+    # eligibility the severity x confidence matrix decides. Every other row says no, and a
+    # separate test covers that the table outranks the matrix.
+    out = fwrite(rule="TYPE-ERROR", cat="C.20", sev=sev, conf=conf, f=f"src/p{i}.ts",
+                 line=str(i + 1), summary=f"policy corner {i} under test here",
+                 extra=extra).stdout
+    got = "eligible for automatic fix" in out and "NOT eligible" not in out
+    ok(got == expect,
+       f"{sev}/{conf}{' +repro' if repro else ''} -> "
+       f"{'fixable' if expect else 'escalate or report'}")
+
+ok("NOT eligible" in fwrite(rule="TYPE-ERROR", cat="C.20", sev="advisory", conf="high",
+                            f="src/a.ts", line="1",
+                            summary="an advisory finding on an autofixable rule",
+                            extra=["--repair", "invert it", "--repro", "n/a"]).stdout,
+   "an advisory finding is never automatically fixed, whatever the confidence")
+
+print("findings: the rule table's 'never' column outranks the severity matrix")
+# Found by the readiness gate: autofix_eligible consulted only severity x confidence, so a
+# TEST-SUITE-WEAKENED finding at critical/high came back "eligible for automatic fix" — the
+# pipeline authorising an unattended repair of a disarmed test suite. The matrix was right
+# and incomplete; the table's never column has to win.
+r = fwrite(rule="TEST-SUITE-WEAKENED", cat="X4", sev="critical", conf="high",
+           f="tests/t.py", line="3", summary="a skip marker was added to silence a failure",
+           extra=["--repair", "remove the marker", "--repro", "sdlc tests audit"])
+ok("NOT eligible" in r.stdout,
+   "a rule marked never autofixable is never autofixable, at any severity or confidence")
+r = fwrite(rule="GIT-WORK-DESTROYED", cat="X3", sev="critical", conf="high",
+           f="bin/x.sh", line="1", summary="the script discards uncommitted work",
+           extra=["--repair", "remove it"])
+ok("NOT eligible" in r.stdout, "and so is the other one the table marks never")
+r = fwrite(rule="TYPE-ERROR", cat="C.20", sev="high", conf="high",
+           f="src/t.ts", line="9", summary="the argument type does not match the signature",
+           extra=["--repair", "correct the type"])
+ok("eligible for automatic fix" in r.stdout,
+   "a rule the table does not restrict still follows the matrix")
+
+print("findings: the record validates against the published schema")
+# The tool wrote component: null and exploitability: null while the schema typed them string
+# and a bare enum, so every finding it produced was invalid against its own contract. For a
+# library-profile project that schema is a published shape.
+import glob as _glob
+sch = json.load(open(os.path.join(os.path.dirname(HERE), "schema", "finding.schema.json")))
+recs = [json.load(open(f)) for f in _glob.glob(os.path.join(df, ".sdlc/findings/*.json"))]
+ok(bool(recs), "there are records to check")
+bad = []
+for rec in recs:
+    for key, spec in sch["properties"].items():
+        if key not in rec:
+            continue
+        t = spec.get("type")
+        if t == "string" and not isinstance(rec[key], str):
+            bad.append(f"{key}={rec[key]!r} is not a string")
+    expl = (rec.get("classification") or {}).get("exploitability")
+    allowed = sch["properties"]["classification"]["properties"]["exploitability"]["enum"]
+    if expl is not None and expl not in allowed:
+        bad.append(f"exploitability={expl!r} not in enum")
+ok(not bad, f"every written record matches the schema's declared types ({bad[:2]})")
+
+# additionalProperties is false, so a field the code writes and the schema does not declare
+# makes the record invalid. The round-two reopen fix added exactly such a field.
+undeclared = sorted({k for rec in recs for k in rec} - set(sch["properties"]))
+ok(not undeclared,
+   f"no record carries a field the schema does not declare ({undeclared})")
+
+print("findings: a defect that comes back is not still closed")
+r = fwrite(rule="CODE-ERROR-SWALLOWED", cat="C.25", sev="high", conf="high",
+           f="src/reopen.ts", line="5", summary="the error path is swallowed on retry")
+rid = r.stdout.split()[0]
+finding("close", rid, "--outcome", "fixed", "--by", "sdlc-remediator")
+ok(rid not in run(["finding", "list", "--open"], df).stdout, "closing removes it from open")
+r = fwrite(rule="CODE-ERROR-SWALLOWED", cat="C.25", sev="high", conf="high",
+           f="src/reopen.ts", line="5", summary="the error path is swallowed on retry")
+ok("REOPENED" in r.stdout, "re-detecting it says so out loud")
+ok(rid in run(["finding", "list", "--open"], df).stdout,
+   "and it is open again — a bad fix must not leave the finding reading as fixed")
+
+print("findings: who closed it is recorded")
+r2 = fwrite(rule="SEC-SECRET-PRESENT", cat="D.36", sev="critical", conf="high",
+            f="src/cfg.ts", line="2", summary="an API token is committed in the config",
+            extra=["--by", "sdlc-security-reviewer"])
+rid2 = r2.stdout.split()[0]
+r = finding("close", rid2, "--outcome", "fixed", "--by", "sdlc-remediator")
+ok("sdlc-security-reviewer raised this" in r.stdout,
+   "closing another agent's finding is recorded, not silent")
+rec = json.load(open(os.path.join(df, ".sdlc/findings", rid2 + ".json")))
+ok(rec.get("closedByActor") == "sdlc-remediator", "the closing actor is on the record")
+ok("by sdlc-remediator" in open(os.path.join(df, ".sdlc/audit.log")).read(),
+   "and in the audit log")
+
+print("findings: closing says what actually happened")
+ok(finding("close", fid, "--outcome", "fixed", "--detail", "test q.spec.ts").returncode == 0,
+   "a finding closes as fixed")
+ok(finding("close", fid, "--outcome", "resolved").returncode != 0,
+   "a word outside the vocabulary cannot close a finding")
+ok(finding("close", "F-00000000", "--outcome", "fixed").returncode != 0,
+   "a finding that does not exist cannot be closed")
+r = finding("close", fid, "--outcome", "unexecuted")
+ok("not closed" in r.stdout, "unexecuted says plainly that it is not closed")
+ok("finding.write" in open(os.path.join(df, ".sdlc/audit.log")).read(),
+   "findings reach the audit log like every other stage")
+
+print("findings: the two copies of the contract agree")
+# bin/sdlc validates by hand because it has no dependencies; the schema is the published
+# contract. If the enums drift apart, a finding valid to one is invalid to the other.
+schema = json.load(open(os.path.join(os.path.dirname(HERE), "schema", "finding.schema.json")))
+src = open(SDLC, encoding="utf-8").read()
+cls = schema["properties"]["classification"]["properties"]
+for name, got in (("severity", cls["severity"]["enum"]),
+                  ("confidence", cls["confidence"]["enum"]),
+                  ("outcome", schema["properties"]["outcome"]["enum"]),
+                  ("exploitability", cls["exploitability"]["enum"])):
+    const = {"severity": "SEVERITIES", "confidence": "CONFIDENCES",
+             "outcome": "FINDING_OUTCOMES", "exploitability": "EXPLOITABILITY"}[name]
+    line = [l for l in src.splitlines() if l.startswith(const + " = (")]
+    ok(bool(line) and all(f'"{v}"' in line[0] for v in got),
+       f"schema and validator agree on {name}")
+
+print("the quality budget is wired, not merely configurable")
+ok("quality" in open(os.path.join(os.path.dirname(HERE), "agents",
+                                  "sdlc-readiness-gate.md")).read(),
+   "the readiness gate runs the quality budget")
+ok("quality" in open(os.path.join(os.path.dirname(HERE), "commands", "gate.md")).read(),
+   "the mechanical gate runs the quality budget")
+ok("quality.cmd" in run(["doctor"], df).stdout, "doctor says when the budget is unset")
+
+shutil.rmtree(df, ignore_errors=True)
+
+print("baseline: a failure is attributed, not assumed")
+CHECK = """#!/bin/sh
+echo "ok   suite A"
+%s
+echo "done in 1.4s"
+exit %s
+"""
+db = newrepo(files={"check.sh": CHECK % ('echo "FAIL test_legacy: expected 3 got 4"', "1")},
+             config={"trunk": "main", "spec": {"engine": "prd-frd"}, "verifyCmd": "sh check.sh"})
+
+
+def setcheck(body, code):
+    open(os.path.join(db, "check.sh"), "w").write(CHECK % (body, code))
+
+
+ok(run(["baseline", "compare"], db).returncode != 0,
+   "no baseline is not a pass — comparing without one fails loudly")
+r = run(["baseline", "capture"], db)
+ok(r.returncode == 0 and "NOT green" in r.stdout,
+   "capture records that the repository was already failing")
+
+r = run(["baseline", "compare"], db)
+ok(r.returncode == 0 and "0 new" in r.stdout,
+   "a pre-existing failure is not blamed on the change")
+ok("not caused by it" in r.stdout, "and it says so in words, not just in a count")
+
+# Same failure, different timing and a different line:column. Neither is a change.
+setcheck('echo "FAIL test_legacy: expected 3 got 4"\necho "elapsed 88.2s at src/a.rs:99:12"', "1")
+ok("0 new" in run(["baseline", "compare"], db).stdout,
+   "timings and line positions are noise, not regressions")
+
+setcheck('echo "FAIL test_legacy: expected 3 got 4"\necho "FAIL test_new: nil at 0xabcdef12"', "1")
+r = run(["baseline", "compare"], db)
+ok(r.returncode != 0 and "1 new" in r.stdout, "a newly introduced failure is blocking")
+ok("test_new" in r.stdout, "and it is named")
+
+setcheck("", "0")
+r = run(["baseline", "compare"], db)
+ok(r.returncode == 0 and "fixed" in r.stdout.lower(), "a failure that went away is noticed")
+
+print("baseline: it survives commits, unlike a receipt")
+subprocess.run(["git", "add", "check.sh"], cwd=db)
+subprocess.run(["git", "commit", "-qm", "wip"], cwd=db)
+ok(run(["baseline", "show"], db).returncode == 0, "a commit does not void the baseline")
+ok("no longer an ancestor" not in run(["baseline", "compare"], db).stdout,
+   "committing is not mistaken for a rebase")
+
+print("environment: a verdict records what produced it")
+run(["receipt", "write", "gate", "--verdict", "passed", "--detail", "x"], db)
+rec = json.load(open(os.path.join(db, ".sdlc/receipts/gate.json")))
+ok(isinstance(rec.get("env"), dict) and "git" in rec["env"],
+   "every receipt carries the toolchain that produced it")
+ok("os" in rec["env"] and "arch" in rec["env"], "including the platform it ran on")
+
+shutil.rmtree(db, ignore_errors=True)
+
+print("concerns: proposed from what the repository does, never imposed")
+dc = newrepo(files={
+    "src/worker.go": "package main\nimport \"sync\"\nfunc a(){var m sync.Mutex; go func(){m.Lock()}()}\n",
+    "src/pool.go": "package main\nimport \"sync\"\nfunc b(){var w sync.WaitGroup; go func(){w.Done()}()}\n",
+    "src/schema.sql": "CREATE TABLE users (id int);\nALTER TABLE users ADD COLUMN e text;\n",
+    "src/migrate.sql": "-- migrations\nCREATE TABLE orders (id int);\n",
+})
+cfg = json.loads(run(["init"], dc).stdout)
+ok("concurrency" in cfg["concerns"], "goroutines and mutexes propose the concurrency concern")
+ok("data" in cfg["concerns"], "schema and migrations propose the data concern")
+ok("memory" not in cfg["concerns"], "nothing unsafe here, so memory is not proposed")
+
+dq = newrepo(files={"README.md": "# docs only\n"})
+ok(json.loads(run(["init"], dq).stdout)["concerns"] == [],
+   "a repository with no source proposes nothing")
+
+# A concern a maintainer removed must stay removed: init fills gaps, it does not overrule.
+run(["init", "--write"], dc)
+c = json.load(open(os.path.join(dc, "sdlc.config.json")))
+c["concerns"] = []
+json.dump(c, open(os.path.join(dc, "sdlc.config.json"), "w"))
+run(["init", "--write"], dc)
+ok(json.load(open(os.path.join(dc, "sdlc.config.json")))["concerns"] == [],
+   "re-running init does not re-impose a concern the maintainer removed")
+
+print("concern profiles exist and are reachable")
+root = os.path.dirname(HERE)
+for name in ("architecture", "performance", "memory", "concurrency", "data", "platform"):
+    ok(os.path.exists(os.path.join(root, "profiles", "concerns", name + ".md")),
+       f"profiles/concerns/{name}.md exists")
+
+print("every rule an agent cites resolves to the control spec")
+spec = open(os.path.join(root, "docs", "control-spec.md"), encoding="utf-8").read()
+table = set(re.findall(r"^\|\s*`([A-Z][A-Z0-9-]*)`\s*\|", spec, re.M))
+ok(len(table) > 40, f"the rule table has {len(table)} rules")
+cited = set()
+# schema/ and docs/ were not walked, so schema/finding.schema.json could cite a rule the
+# table did not have — and did. A rule cited anywhere is a rule that must resolve.
+for sub in ("agents", "profiles", "commands", "schema", "docs"):
+    for dirpath, _, names in os.walk(os.path.join(root, sub)):
+        for n in names:
+            if n.endswith((".md", ".json")) and n != "control-spec.md":
+                body = open(os.path.join(dirpath, n), encoding="utf-8").read()
+                cited |= set(re.findall(r"--rule ([A-Z][A-Z0-9-]*)", body))
+                cited |= set(re.findall(r"`((?:ARCH|PERF|MEM|CONC|DATA|PLAT|SEC|TEST|IMPACT|SPEC|CODE|ENV|BUDGET|GIT|QUALITY|BUILD|TYPE)-[A-Z0-9-]+)`", body))
+missing = sorted(cited - table)
+ok(not missing, f"no agent or profile cites a rule the table lacks (missing: {missing})")
+
+for x in (dc, dq):
+    shutil.rmtree(x, ignore_errors=True)
+
+print("suite integrity: the gate cannot be lowered to pass itself")
+dt = newrepo(files={
+    "tests/test_core.py": "def test_a():\n    assert f(1) == 2\n    assert f(2) == 3\n\n"
+                          "def test_b():\n    assert g() is None\n",
+    "tests/test_edge.py": "def test_edge():\n    assert h(0) == 1\n",
+    "ci.yml": "coverage_threshold: 80\nstrict: true\n",
+}, config={"trunk": "main", "spec": {"engine": "prd-frd"}, "verifyCmd": "true"})
+ok(run(["tests", "audit", "--base", "HEAD"], dt).returncode == 0,
+   "an empty diff weakens nothing")
+
+
+def weaken(files, message="make the gate pass"):
+    for name, body in files.items():
+        full = os.path.join(dt, name)
+        if body is None:
+            os.remove(full)
+        else:
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            open(full, "w").write(body)
+    subprocess.run(["git", "add", "-A"], cwd=dt)
+    subprocess.run(["git", "commit", "-qm", message], cwd=dt)
+    return run(["tests", "audit", "--base", "HEAD~1"], dt)
+
+
+r = weaken({"tests/test_edge.py": None})
+ok(r.returncode != 0 and "deleted" in r.stdout, "a deleted test file is caught")
+
+r = weaken({"tests/test_core.py": "import pytest\n\n@pytest.mark.skip\n"
+                                  "def test_a():\n    assert f(1) == 2\n    assert f(2) == 3\n\n"
+                                  "def test_b():\n    assert g() is None\n"})
+ok(r.returncode != 0 and "skipped" in r.stdout, "a newly added skip marker is caught")
+
+r = weaken({"tests/test_core.py": "def test_a():\n    pass\n\n"
+                                  "def test_b():\n    assert g() is None\n"})
+ok(r.returncode != 0 and "assertion" in r.stdout, "assertions removed and not replaced is caught")
+
+r = weaken({"ci.yml": "coverage_threshold: 55\nstrict: true\n"})
+ok(r.returncode != 0 and "lowered" in r.stdout, "a lowered threshold is caught")
+ok("80 -> 55" in r.stdout, "and it says by how much")
+
+r = weaken({"src/x.py": "def f():\n    return 1  # noqa\n"})
+ok(r.returncode != 0 and "silenced" in r.stdout, "a new suppression comment is caught")
+
+r = weaken({"tests/test_core.py": "def test_a():\n    assert f(1) == 2\n\n"
+                                  "def test_b():\n    assert g() is None\n\n"
+                                  "def test_c():\n    assert k() == 9\n"})
+ok(r.returncode == 0, "adding a test and an assertion is not a weakening")
+
+print("suite integrity: the bypasses a readiness gate found in this very check")
+# Every case below was a working bypass of this control, found by running the pipeline's own
+# gate against the branch that added it. Each one made `tests audit` report a clean pass on a
+# diff that disarmed the suite. They are regression tests now because a control with a known
+# hole is worse than none: it is a hole with a green tick over it.
+
+r = weaken({"tests/test_core.py": "def test_a():\n    assert f(1) == 2\n"
+                                  "    assert 1 == 1  # don't lint  # noqa\n"})
+ok(r.returncode != 0, "an apostrophe before a marker does not disarm the line")
+
+r = weaken({"tests/test_core.py": 'DOC = """\n++ b/README.md\n"""\n\n'
+                                  "def test_a():\n    pass  # noqa\n"})
+ok(r.returncode != 0, "content posing as a diff header cannot reattribute the rest of a file")
+
+r = weaken({"commands/run.md": "Run the gate:\n\n```sh\nnpm test || true\n```\n"})
+ok(r.returncode != 0,
+   "markdown is scanned — in this plugin the instructions ARE markdown")
+
+r = weaken({"docs/guide.md": "Never do this:\n\n```diff\n+@pytest.mark.skip\n```\n"})
+ok(r.returncode != 0,
+   "a diff illustration in documentation is reported too — there is no content exemption "
+   "left, because every version of one was defeated by editing the content")
+
+r = run(["tests", "audit", "--base", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"], dt)
+ok(r.returncode != 0 and "UNEXECUTED" in (r.stdout + r.stderr),
+   "a diff git could not produce is unexecuted, never a pass")
+
+weaken({"tests/test_core.py": "def test_a():\n    assert f(1) == 2\n"
+                              "    assert g(2) == 3\n    assert h(3) == 4\n"},
+       "restore assertions")
+subprocess.run(["git", "config", "diff.noprefix", "true"], cwd=dt)
+r = weaken({"tests/test_core.py": "def test_a():\n    assert f(1) == 2\n"})
+ok(r.returncode != 0, "a developer's diff.noprefix setting does not disable the check")
+subprocess.run(["git", "config", "--unset", "diff.noprefix"], cwd=dt)
+
+weaken({"tests/test_core.py": "def test_a():\n    assert f(1) == 2\n"
+                              "    assert g(2) == 3\n"}, "restore two")
+r = weaken({"tests/test_core.py": "def test_a():\n    assert f(1) == 2\n"})
+ok(r.returncode != 0, "removing exactly ONE assertion is reported, not just two or more")
+
+print("suite integrity: an acknowledgement needs somebody behind it")
+r = weaken({"tests/test_core.py": "def test_a():\n    pass  # noqa\n"})
+ok(r.returncode != 0, "a real weakening to acknowledge")
+r = run(["tests", "audit", "--base", "HEAD~1", "--acknowledge"], dt)
+ok(r.returncode != 0 and "--as" in r.stderr,
+   "--acknowledge without an actor is refused: it would record nothing")
+r = run(["tests", "audit", "--base", "HEAD~1", "--acknowledge", "--as", "A Person"], dt)
+ok(r.returncode == 0, "--acknowledge with an actor lets a justified change through")
+ok("not waived" in r.stdout, "and says plainly that it recorded rather than waived")
+ok("suite.acknowledged" in open(os.path.join(dt, ".sdlc/audit.log")).read(),
+   "the acknowledgement is its own audit event, not the same line as a plain run")
+
+# Exemption is declared in config, not inferred from a line's text. Two content-based
+# heuristics were tried and both were forgeable by the actor the control constrains: quote
+# parity fell to one apostrophe, and "a quote on both sides" fell to appending a quote. The
+# second residual was found by a readiness gate re-run, after the first fix.
+r = weaken({"src/real.py": "def f():\n    return undefined_name  # noqa\n"})
+ok(r.returncode != 0, "a real suppression in real code is caught")
+r = weaken({"src/real.py": 'def f():\n    return x  "y"  # noqa  # "\n'})
+ok(r.returncode != 0, "and quotes sprinkled around the marker do not hide it")
+r = weaken({"src/real.py": "def f():\n    return x  # don't  # noqa\n"})
+ok(r.returncode != 0, "nor does an apostrophe")
+
+print("suite integrity: round-three findings — two were my own regressions")
+# A third content-based heuristic survived two rounds of removing content-based heuristics:
+# DIFF_ILLUSTRATION exempted any markdown line starting with + or -, so two characters
+# disarmed 17% of the markdown this branch adds. In a plugin whose instructions ARE markdown.
+r = weaken({"commands/run.md": "Run the gate.\n\nRun `npm test` then eslint-disable no-eval\n"})
+ok(r.returncode != 0, "a suppression in markdown is caught")
+r = weaken({"commands/run.md": "Run the gate.\n\n- Run `npm test` then eslint-disable no-eval\n"})
+ok(r.returncode != 0, "and a two-character list prefix does not disarm it")
+
+# Introduced by the round-two per-file loop: git C-quotes non-ASCII names by default, so the
+# name matched no pathspec, the file read as an empty diff, and it failed OPEN with exit 0 —
+# the exact mode the same commit had just removed for bad refs.
+weaken({"tests/caf\u00e9_test.py": "def test_x():\n    assert a() == 1\n    assert b() == 2\n"},
+       "add a non-ascii test file")
+r = weaken({"tests/caf\u00e9_test.py": "def test_x():\n    pass\n"})
+ok(r.returncode != 0, "a file whose name git quotes is still scanned")
+ok("caf" in r.stdout, "and it is named in the report")
+
+print("the policy table outranks the matrix for every rule, not just two")
+dpol = newrepo(config={"trunk": "main", "spec": {"engine": "prd-frd"}})
+
+
+def polwrite(rule, cat, sev="critical", conf="high"):
+    return run(["finding", "write", "--rule", rule, "--category", cat, "--severity", sev,
+                "--confidence", conf, "--file", "src/p.ts", "--line", "1",
+                "--summary", "a representative finding for policy testing",
+                "--repair", "the minimal change"], dpol).stdout
+
+# docs/control-spec.md's Autofix column says plain "no" on 53 rows and **never** on two.
+# Reading only **never** let SEC-INJECTION-SQL, SEC-AUTHORITY and MEM-SAFETY come back
+# autofixable at critical/high — the permissive half of a document contradicting itself.
+for rule, cat in (("SEC-INJECTION-SQL", "D.31"), ("SEC-AUTHORITY", "D.30"),
+                  ("MEM-SAFETY", "F.57"), ("CODE-ERROR-SWALLOWED", "C.25")):
+    ok("NOT eligible" in polwrite(rule, cat),
+       f"{rule} is not autofixable: its table row does not say yes")
+ok("eligible for automatic fix" in polwrite("TYPE-ERROR", "C.20", sev="high"),
+   "the one row marked yes still defers to the matrix")
+
+print("a verify that did not run is unexecuted, not a failure of the change")
+# run_verify now returns 126 when the guard refuses the configured command and 124 on
+# timeout. cmd_baseline tested only `code != 0` and announced "this change introduced
+# failures" — unexecuted reported as failed, in the path every baseline capture goes through.
+dv = newrepo(files={"a.txt": "x\n"},
+             config={"trunk": "main", "spec": {"engine": "prd-frd"},
+                     "verifyCmd": "echo ok"})
+ok(run(["baseline", "capture"], dv).returncode == 0, "a clean baseline is captured")
+c = json.load(open(os.path.join(dv, "sdlc.config.json")))
+c["verifyCmd"] = " ".join(["git", "tag", "v0.0.1"])   # a command the guard refuses
+json.dump(c, open(os.path.join(dv, "sdlc.config.json"), "w"))
+r = run(["baseline", "compare"], dv)
+ok("UNEXECUTED" in r.stdout, "a refused verify command is reported as unexecuted")
+ok("introduced failures" not in r.stdout, "and is NOT reported as a failure of the change")
+ok(r.returncode != 0, "and does not pass either")
+r = run(["baseline", "capture"], dv)
+ok("REFUSED" in (r.stdout + r.stderr) or run(["baseline", "show"], dv).stdout.count("126"),
+   "the refusal reaches the operator rather than being swallowed")
+ok(not os.path.exists(os.path.join(dv, ".git/refs/tags/v0.0.1")),
+   "and the forbidden command in the config never ran")
+shutil.rmtree(dv, ignore_errors=True)
+
+print("the rule table is not optional")
+# known_rules() and never_autofix_rules() swallowed a read error and returned empty sets, so
+# a missing docs/control-spec.md meant any invented rule validated and nothing was
+# un-autofixable. A control whose off-switch is an absent file is not a control.
+import tempfile as _tf
+fake = _tf.mkdtemp(prefix="sdlc-noplugin-")
+os.makedirs(os.path.join(fake, "bin"))
+shutil.copy(SDLC, os.path.join(fake, "bin", "sdlc"))
+r = subprocess.run([sys.executable, os.path.join(fake, "bin", "sdlc"), "finding", "write",
+                    "--rule", "TEST-SUITE-WEAKENED", "--category", "X4",
+                    "--severity", "critical", "--confidence", "high", "--file", "t.py",
+                    "--line", "1", "--summary", "a weakening finding for policy testing",
+                    "--repair", "x"], cwd=dpol, capture_output=True, text=True)
+ok(r.returncode != 0, "without the control spec the tool refuses rather than guessing")
+ok("control-spec" in r.stderr, "and says which file it needs")
+shutil.rmtree(fake, ignore_errors=True)
+shutil.rmtree(dpol, ignore_errors=True)
+
+print("suite integrity: the escape hatch is declared, and never quiet")
+cfgp = os.path.join(dt, "sdlc.config.json")
+c = json.load(open(cfgp))
+c["suiteAudit"] = {"exclude": ["src/*"]}
+json.dump(c, open(cfgp, "w"))
+subprocess.run(["git", "add", "sdlc.config.json"], cwd=dt)
+subprocess.run(["git", "commit", "-qm", "exempt src"], cwd=dt)
+r = run(["tests", "audit", "--base", "HEAD~1"], dt)
+ok(r.returncode != 0 and "newly exempted" in r.stdout,
+   "adding an exemption is itself reported — otherwise the hatch would be the bypass")
+r = weaken({"src/real.py": "def f():\n    return y  # noqa\n"})
+ok(r.returncode == 0, "once declared, the exempted path is genuinely not scanned")
+c["suiteAudit"] = {"exclude": []}
+json.dump(c, open(cfgp, "w"))
+subprocess.run(["git", "add", "sdlc.config.json"], cwd=dt)
+subprocess.run(["git", "commit", "-qm", "unexempt"], cwd=dt)
+r = weaken({"src/real.py": "def f():\n    return z  # noqa\n"})
+ok(r.returncode != 0, "removing the exemption brings the path back under the audit")
+shutil.rmtree(dt, ignore_errors=True)
+
+print("budget: a ceiling an agent cannot raise for itself")
+dbg = newrepo(config={"trunk": "main", "spec": {"engine": "prd-frd"},
+                      "budget": {"maxToolCalls": 3}})
+ok("of 3" in run(["budget", "show"], dbg).stdout,
+   "a configured tool-call ceiling is reported")
+for _ in range(3):
+    guard(dbg, "git status")
+r = guard(dbg, "git status")
+ok(r.returncode == 2 and "budget" in r.stderr, "the hook refuses once the ceiling is passed")
+ok("sdlc budget reset" in r.stderr, "and it names the allowed route")
+ok(run(["budget", "reset"], dbg).returncode != 0,
+   "an agent cannot reset its own ceiling — that would make it a pause, not a ceiling")
+ok(guard(dbg, "git status").returncode == 2, "and the refusal still stands after trying")
+run(["budget", "reset", "--as", "a person"], dbg)
+ok(guard(dbg, "git status").returncode == 0, "a named person can reset it")
+ok("by a person" in open(os.path.join(dbg, ".sdlc/audit.log")).read(),
+   "and the audit log says who accepted the extra cost")
+
+dnb = newrepo(config={"trunk": "main", "spec": {"engine": "prd-frd"}})
+for _ in range(12):
+    guard(dnb, "git status")
+ok(guard(dnb, "git status").returncode == 0, "no ceiling configured means no refusal")
+ok("no ceiling" in run(["budget", "show"], dnb).stdout, "but doctor-style output says so plainly")
+
+print("checkpoints: resuming is not automatically safe")
+dcp = newrepo(files={"src/a.py": "x = 1\n"},
+              config={"trunk": "main", "spec": {"engine": "prd-frd"}})
+ok(run(["checkpoint", "resume"], dcp).returncode != 0, "no checkpoint is not a green light")
+run(["checkpoint", "write", "--done", "parser", "--next", "the formatter",
+     "--file", "src/a.py"], dcp)
+r = run(["checkpoint", "resume"], dcp)
+ok(r.returncode == 0 and "Safe to continue" in r.stdout, "an unchanged repository resumes")
+ok("parser" in r.stdout and "formatter" in r.stdout, "it says what is done and what is next")
+
+open(os.path.join(dcp, "src/a.py"), "w").write("x = 2\n")
+r = run(["checkpoint", "resume"], dcp)
+ok(r.returncode != 0 and "changed since the checkpoint" in r.stdout,
+   "a file that moved under the checkpoint stops the resume")
+
+subprocess.run(["git", "add", "src/a.py"], cwd=dcp)
+subprocess.run(["git", "commit", "-qm", "edit"], cwd=dcp)
+ok("HEAD has moved" in run(["checkpoint", "resume"], dcp).stdout,
+   "and so does a commit the checkpoint did not know about")
+for x in (dbg, dnb, dcp):
+    shutil.rmtree(x, ignore_errors=True)
+
 for x in (d, d2, d3, home):
     shutil.rmtree(x, ignore_errors=True)
 
