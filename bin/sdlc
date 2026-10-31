@@ -750,6 +750,9 @@ def guard_problem(root: str, command: str, cfg: dict) -> str | None:
     return None
 
 
+ENFORCE_FLAGS = ("pushToTrunkNeedsGate", "mergeNeedsReadiness", "branchNeedsApprovedSpec",
+                 "blockDestructiveGit", "blockPublishing", "blockCredentialReads")
+
 # The shape the guard depends on. A key with the wrong type here is not a typo to shrug at:
 # these are the keys the guard reads to decide whether to refuse, and reading them is what
 # used to raise.
@@ -792,11 +795,29 @@ def guard_decide(root: str, command: str, cfg: dict) -> str | None:
                 "not a control. Fix the type and the refusals resume. The shape is in "
                 "schema/sdlc.config.schema.json.")
     try:
-        return guard_problem(root, command, cfg)
+        problem = guard_problem(root, command, cfg)
     except Exception as e:
         return (f"the guard failed while evaluating its rules: {e.__class__.__name__}: {e}\n"
                 "Refused rather than allowed. This is a defect in agentic-sdlc — please report "
                 "it, with the command that triggered it.")
+    # Switching a flag off is a legitimate configuration choice, and it left no trace: the
+    # four canonical refusals went from exit 2 to exit 0 and the audit log gained nothing. A
+    # choice nobody can see is indistinguishable from a bypass, so record what the
+    # configuration let through. Only re-evaluated when a flag is actually off, because this
+    # runs on every tool call.
+    enf = cfg.get("enforce") if isinstance(cfg.get("enforce"), dict) else {}
+    if problem is None and command and any(enf.get(f) is False for f in ENFORCE_FLAGS):
+        strict = dict(cfg)
+        strict.pop("enforce", None)
+        try:
+            would = guard_problem(root, command, strict)
+        except Exception:
+            would = None
+        if would:
+            off = ", ".join(f for f in ENFORCE_FLAGS if enf.get(f) is False)
+            audit(root, "guard.allowed-by-config",
+                  f"{would.splitlines()[0]} :: allowed because {off} is off :: {command}")
+    return problem
 
 
 def cmd_guard(args) -> int:
@@ -1970,6 +1991,74 @@ def audit_excluded(cfg: dict, path: str) -> bool:
     return False
 
 
+def config_loosenings(before: dict, after: dict) -> list:
+    """Every way `after` makes this pipeline easier to pass than `before`.
+
+    The configuration is editable by the actor the configuration constrains, so a change to
+    it belongs in the diff a reviewer reads, named as what it is. Absent keys compare as
+    their defaults, so deleting `enforce` reads as switching all six flags off — which is
+    what it does.
+    """
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return []
+    out = []
+    b_enf = before.get("enforce") if isinstance(before.get("enforce"), dict) else {}
+    a_enf = after.get("enforce") if isinstance(after.get("enforce"), dict) else {}
+    for flag in ENFORCE_FLAGS:
+        if b_enf.get(flag, True) and not a_enf.get(flag, True):
+            out.append((f"the {flag} refusal was switched off",
+                        f"enforce.{flag}: true -> false"))
+
+    for key, what in (("protected", "a branch is no longer protected"),
+                      ("neverByAgent", "an action an agent may not take became allowed"),
+                      ("reviewers", "a reviewer the gate fans out to was removed"),
+                      ("concerns", "a concern's review standards no longer apply")):
+        b_list = before.get(key) if isinstance(before.get(key), list) else []
+        a_list = after.get(key) if isinstance(after.get(key), list) else []
+        for gone in [x for x in b_list if x not in a_list]:
+            out.append((what, f'{key} -= "{gone}"'))
+
+    b_ap = before.get("approvals") if isinstance(before.get("approvals"), dict) else {}
+    a_ap = after.get("approvals") if isinstance(after.get("approvals"), dict) else {}
+    for what in ("merge", "release"):
+        if b_ap.get(what) == "human" and a_ap.get(what, "agent") != "human":
+            out.append((f"a human approval for {what} was downgraded to an agent's",
+                        f'approvals.{what}: human -> {a_ap.get(what, "agent")}'))
+
+    b_age = (before.get("receipts") or {}).get("maxAgeMin") if isinstance(
+        before.get("receipts"), dict) else None
+    a_age = (after.get("receipts") or {}).get("maxAgeMin") if isinstance(
+        after.get("receipts"), dict) else None
+    if isinstance(b_age, int) and isinstance(a_age, int) and a_age > b_age:
+        out.append(("receipts now stay valid for longer",
+                    f"receipts.maxAgeMin: {b_age} -> {a_age}"))
+
+    b_bud = before.get("budget") if isinstance(before.get("budget"), dict) else {}
+    a_bud = after.get("budget") if isinstance(after.get("budget"), dict) else {}
+    for k in ("maxToolCalls", "maxWallClockMin", "maxRetries"):
+        was, now = b_bud.get(k) or 0, a_bud.get(k) or 0
+        if was and (now == 0 or now > was):
+            out.append((f"the {k} ceiling was raised or removed",
+                        f"budget.{k}: {was} -> {now or 'no ceiling'}"))
+    if b_bud.get("stopPolicy", "refuse") == "refuse" and \
+            a_bud.get("stopPolicy", "refuse") != "refuse":
+        out.append(("the budget now warns instead of refusing",
+                    f'budget.stopPolicy: refuse -> {a_bud.get("stopPolicy")}'))
+
+    b_ex = set(((before.get("suiteAudit") or {}).get("exclude")) or []) if isinstance(
+        before.get("suiteAudit"), dict) else set()
+    a_ex = set(((after.get("suiteAudit") or {}).get("exclude")) or []) if isinstance(
+        after.get("suiteAudit"), dict) else set()
+    for glob_added in sorted(a_ex - b_ex):
+        out.append(("a path was newly exempted from the suite audit's "
+                    "suppression-marker checks", f'suiteAudit.exclude += "{glob_added}"'))
+
+    if before.get("trunk") and after.get("trunk") != before.get("trunk"):
+        out.append(("the trunk branch changed, which changes what is protected",
+                    f'trunk: {before.get("trunk")} -> {after.get("trunk")}'))
+    return out
+
+
 def suite_findings(root: str, base: str, cfg: dict = None):
     """Everything in this diff that makes the gate easier to pass, or None if git failed."""
     cfg = cfg if cfg is not None else load_config(root)
@@ -1987,29 +2076,29 @@ def suite_findings(root: str, base: str, cfg: dict = None):
     if files is None:
         return None
 
-    # Widening the exemption list is itself a weakening — otherwise the escape hatch IS the
-    # bypass: add one glob and the check goes quiet everywhere. Compared as parsed lists at
-    # the two revisions rather than by pattern-matching the diff, so reformatting the config
-    # neither hides an addition nor invents one.
+    # Loosening the configuration is itself a weakening — otherwise the escape hatch IS the
+    # bypass. This began as the suiteAudit.exclude check and the argument never was specific
+    # to that key: every refusal in the guard is switched off by editing `enforce`, and that
+    # edit used to pass the suite audit in silence. Compared as parsed configs at the two
+    # revisions rather than by pattern-matching the diff, so reformatting neither hides a
+    # change nor invents one.
     cfg_path = config_path(root)
     if cfg_path:
         name = os.path.relpath(cfg_path, root)
-        before, after = set(), set()
+        was = {}
         r = subprocess.run(["git", "show", f"{base}:{name}"], cwd=root,
                            capture_output=True, text=True)
         if r.returncode == 0:
             try:
-                before = set(((json.loads(r.stdout).get("suiteAudit") or {}).get("exclude")) or [])
+                was = json.loads(r.stdout)
             except Exception:
-                pass
+                was = {}
         try:
-            after = set(((load_config(root).get("suiteAudit") or {}).get("exclude")) or [])
+            now = load_config(root)
         except Exception:
-            after = set()
-        for added_glob in sorted(after - before):
-            found.append((name, "a path was newly exempted from the suite audit's "
-                                "suppression-marker checks",
-                          f'suiteAudit.exclude += "{added_glob}"'))
+            now = {}
+        for why, detail in config_loosenings(was, now):
+            found.append((name, why, detail))
 
     for path, added, removed in files:
         if TEST_PATH_RE.search(path or ""):

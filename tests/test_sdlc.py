@@ -165,6 +165,56 @@ doff = newrepo(config={"version": 2, "enforce": {"blockDestructiveGit": False}})
 ok(guard(doff, "git stash").returncode == 0, "a rule switched off in a sound config still allows")
 shutil.rmtree(doff)
 
+print("guard: switching a refusal off is a choice, and the choice is visible")
+# Setting all six enforce flags to false turned every refusal into an allow and the audit log
+# gained nothing — a choice nobody can see is indistinguishable from a bypass.
+ALL_OFF = {f: False for f in ("pushToTrunkNeedsGate", "mergeNeedsReadiness",
+                              "branchNeedsApprovedSpec", "blockDestructiveGit",
+                              "blockPublishing", "blockCredentialReads")}
+doff2 = newrepo(config={"version": 2, "trunk": "main", "enforce": ALL_OFF})
+for cmd in ["git push origin main", "git stash", "git reset --hard HEAD~1",
+            "cat ~/.aws/credentials"]:
+    ok(guard(doff2, cmd).returncode == 0, f"still allowed, as configured: {cmd}")
+alog2 = open(os.path.join(doff2, ".sdlc", "audit.log")).read()
+ok(all(c in alog2 for c in ["git stash", "cat ~/.aws/credentials"]) and
+   "allowed-by-config" in alog2, "and every one of them is recorded as allowed by the config")
+guard(doff2, "git status")
+ok("git status" not in open(os.path.join(doff2, ".sdlc", "audit.log")).read(),
+   "a command no rule would have refused is not logged")
+shutil.rmtree(doff2)
+
+print("suite audit: loosening the config is itself a weakening")
+# This began as the suiteAudit.exclude check. The argument was never specific to that key.
+tight = {"version": 2, "trunk": "main", "enforce": {f: True for f in ALL_OFF},
+         "protected": ["main", "release/*"], "approvals": {"merge": "human"},
+         "receipts": {"maxAgeMin": 60}, "budget": {"maxToolCalls": 500, "stopPolicy": "refuse"},
+         "reviewers": ["sdlc-code-reviewer", "sdlc-security-reviewer"]}
+dloose = newrepo(config=tight)
+# newrepo writes the config after the initial commit, and the comparison is against what the
+# base revision holds — so main must actually carry the tight config for this to mean anything.
+subprocess.run(["git", "add", "sdlc.config.json"], cwd=dloose)
+subprocess.run(["git", "commit", "-qm", "the tight config"], cwd=dloose)
+subprocess.run(["git", "checkout", "-q", "-b", "feat/loosen"], cwd=dloose)
+open(os.path.join(dloose, "sdlc.config.json"), "w").write(json.dumps(
+    {"version": 2, "trunk": "main", "enforce": ALL_OFF, "protected": ["main"],
+     "approvals": {"merge": "agent"}, "receipts": {"maxAgeMin": 10080},
+     "budget": {"maxToolCalls": 0, "stopPolicy": "warn"},
+     "reviewers": ["sdlc-code-reviewer"], "suiteAudit": {"exclude": ["bin/*"]}}, indent=2))
+subprocess.run(["git", "add", "sdlc.config.json"], cwd=dloose)
+subprocess.run(["git", "commit", "-qm", "tidy the config"], cwd=dloose)
+raudit = run(["tests", "audit", "--base", "main"], dloose)
+ok(raudit.returncode == 1, "a config-only diff that loosens the pipeline fails the audit")
+for needle, what in [("blockDestructiveGit", "a refusal switched off"),
+                     ("no longer protected", "a branch dropped from protected"),
+                     ("downgraded", "a human approval downgraded to an agent's"),
+                     ("stay valid for longer", "receipts given a longer life"),
+                     ("ceiling was raised", "a budget ceiling removed"),
+                     ("warns instead", "a budget that stops refusing"),
+                     ("reviewer the gate fans out to", "a reviewer removed"),
+                     ("newly exempted", "a path exempted from the suite audit")]:
+    ok(needle in raudit.stdout + raudit.stderr, f"and names it: {what}")
+shutil.rmtree(dloose)
+
 print("guard: push to trunk needs a passed gate receipt")
 ok(guard(d, "git push origin main").returncode == 2, "blocked: push main, no receipt")
 ok(guard(d, "git push -u origin feat/x").returncode == 0, "allowed: push a feature branch")
