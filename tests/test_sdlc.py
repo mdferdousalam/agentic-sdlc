@@ -144,6 +144,27 @@ ok(guard(d, "cat .env.example").returncode == 0, "allowed: cat .env.example")
 ok(guard(d, "", tool="Edit", file_path=".env").returncode == 2, "blocked: editing .env")
 ok(guard(d, "", tool="Edit", file_path="src/main.rs").returncode == 0, "allowed: editing source")
 
+print("guard: a control that cannot evaluate its rules refuses rather than shrugs")
+# Every host reads exit 2 as a block and anything else as "carry on", so an exception in the
+# guard was an allow — and the config that produces one is editable by the actor the guard
+# exists to constrain. `"enforce": "all"` was enough: a string has no .get.
+for label, cfg in [("enforce is a string", {"version": 2, "enforce": "all"}),
+                   ("enforce is a list", {"version": 2, "enforce": ["all"]}),
+                   ("an enforce value is a string",
+                    {"version": 2, "enforce": {"blockDestructiveGit": "yes"}}),
+                   ("protected is a string", {"version": 2, "protected": "main"}),
+                   ("approvals is a string", {"version": 2, "approvals": "human"}),
+                   ("receipts is a number", {"version": 2, "receipts": 180})]:
+    dbad = newrepo(config=cfg)
+    r = guard(dbad, "git stash")
+    ok(r.returncode == 2, f"refused, not allowed: {label}")
+    ok("cannot read sdlc.config.json" in r.stderr, f"and says which key: {label}")
+    shutil.rmtree(dbad)
+# The repair must not turn a legitimately disabled rule into a refusal.
+doff = newrepo(config={"version": 2, "enforce": {"blockDestructiveGit": False}})
+ok(guard(doff, "git stash").returncode == 0, "a rule switched off in a sound config still allows")
+shutil.rmtree(doff)
+
 print("guard: push to trunk needs a passed gate receipt")
 ok(guard(d, "git push origin main").returncode == 2, "blocked: push main, no receipt")
 ok(guard(d, "git push -u origin feat/x").returncode == 0, "allowed: push a feature branch")

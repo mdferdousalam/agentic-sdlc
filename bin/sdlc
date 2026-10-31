@@ -718,6 +718,55 @@ def guard_problem(root: str, command: str, cfg: dict) -> str | None:
     return None
 
 
+# The shape the guard depends on. A key with the wrong type here is not a typo to shrug at:
+# these are the keys the guard reads to decide whether to refuse, and reading them is what
+# used to raise.
+GUARD_CONFIG_TYPES = {
+    "trunk": str, "enforce": dict, "protected": list, "neverByAgent": list,
+    "approvals": dict, "receipts": dict, "budget": dict, "quality": dict,
+    "suiteAudit": dict, "reviewers": list, "concerns": list,
+}
+
+
+def config_type_problems(cfg) -> list:
+    """Keys the guard reads whose type it cannot work with."""
+    if not isinstance(cfg, dict):
+        return [f"the configuration is {type(cfg).__name__}, not an object"]
+    out = []
+    for key, want in GUARD_CONFIG_TYPES.items():
+        got = cfg.get(key)
+        if key in cfg and got is not None and not isinstance(got, want):
+            out.append(f'"{key}" is {type(got).__name__}, expected {want.__name__}')
+    enforce = cfg.get("enforce")
+    if isinstance(enforce, dict):
+        for k, v in enforce.items():
+            if not isinstance(v, bool):
+                out.append(f'"enforce.{k}" is {type(v).__name__}, expected true or false')
+    return out
+
+
+def guard_decide(root: str, command: str, cfg: dict) -> str | None:
+    """Evaluate the rules, and refuse when they cannot be evaluated.
+
+    Every host reads exit 2 as a block and anything else as "something went wrong, carry on".
+    So an unhandled exception in here was an *allow* — and the configuration that produces one
+    is editable by the actor the guard exists to constrain, which makes a crash a bypass
+    rather than a bug. `"enforce": "all"` was enough: a string has no `.get`.
+    """
+    bad = config_type_problems(cfg)
+    if bad:
+        return ("the guard cannot read sdlc.config.json — " + "; ".join(bad) + ".\n"
+                "Refused rather than allowed: a control that cannot evaluate its own rules is "
+                "not a control. Fix the type and the refusals resume. The shape is in "
+                "schema/sdlc.config.schema.json.")
+    try:
+        return guard_problem(root, command, cfg)
+    except Exception as e:
+        return (f"the guard failed while evaluating its rules: {e.__class__.__name__}: {e}\n"
+                "Refused rather than allowed. This is a defect in agentic-sdlc — please report "
+                "it, with the command that triggered it.")
+
+
 def cmd_guard(args) -> int:
     """The refusal point. Reads a host's tool JSON on stdin, or one command with --command.
 
@@ -726,7 +775,7 @@ def cmd_guard(args) -> int:
     """
     if getattr(args, "command", None):
         root = repo_root()
-        problem = guard_problem(root, args.command, load_config(root))
+        problem = guard_decide(root, args.command, load_config(root))
         if problem:
             audit(root, "blocked", f"{problem.splitlines()[0]} :: {args.command}")
             print(f"BLOCKED by agentic-sdlc: {problem}", file=sys.stderr)
@@ -746,7 +795,7 @@ def cmd_guard(args) -> int:
         command = str(inp.get("command", ""))
         if not command:
             return 0
-        problem = guard_problem(root, command, cfg)
+        problem = guard_decide(root, command, cfg)
         if problem:
             audit(root, "blocked", f"{problem.splitlines()[0]} :: {command}")
             print(f"BLOCKED by agentic-sdlc: {problem}\n"
@@ -2126,7 +2175,7 @@ def run_verify(root: str, cfg: dict):
     cmd = cfg.get("gateCmd") or cfg.get("verifyCmd")
     if not cmd:
         return None, None, None
-    problem = guard_problem(root, cmd, cfg)
+    problem = guard_decide(root, cmd, cfg)
     if problem:
         audit(root, "blocked", f"verifyCmd: {problem.splitlines()[0]} :: {cmd}")
         return cmd, 126, (f"REFUSED before running: the configured command is not allowed.\n"
