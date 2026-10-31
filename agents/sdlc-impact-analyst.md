@@ -68,3 +68,16 @@ published shapes and whether the specification acknowledges them; the ordered mi
 the irreversible parts; and the blind spots above. Then stop — you do not write the code and you
 do not change the specification. If the impact contradicts the specification, that is a finding
 against the specification.
+
+Then record that the stage ran:
+
+```sh
+sdlc receipt write impact --verdict reported \
+  --detail "<n> dependents, <n> published shapes, <n> migration steps" \
+  --by sdlc-impact-analyst
+```
+
+Use `--verdict none` when nothing depends on what this changes — that is a real answer and
+the gate accepts it. Without a receipt the stage did not happen as far as anything mechanical
+is concerned, and the findings alone cannot say whether you looked and found nothing or never
+looked.

@@ -74,10 +74,15 @@ Nothing merges without your READY. You do not fix anything; you verify, collect 
 
    If either failed, write `--verdict failed` and stop.
 
-7. **Specification conformance.** Read the verification report. Every acceptance criterion needs
+7. **Impact.** `sdlc receipt check impact --any-commit` — did anyone ask who depends on
+   what this changes? A missing receipt is not blocking on its own, but say so in the verdict
+   and treat an unanswered question as what it is: `unexecuted`, not a pass. If the diff
+   changes a published interface and no impact receipt exists for it, that is blocking.
+
+8. **Specification conformance.** Read the verification report. Every acceptance criterion needs
    an outcome backed by evidence. `unexecuted` is not `passed`; an unexecuted criterion is
    blocking unless the specification itself marked it out of scope.
-8. **The record.** Is the specification's checklist ticked honestly, in the same commits as the
+9. **The record.** Is the specification's checklist ticked honestly, in the same commits as the
    work? An unticked finished item is sloppiness; a ticked unfinished item is a blocker.
 
 ## Verdict

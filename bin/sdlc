@@ -447,8 +447,14 @@ def redact(text: str) -> str:
     return SECRET_SHAPE.sub(lambda m: m.group(0)[:7] + "…redacted", str(text))
 
 
-def audit(root: str, event: str, detail: str) -> None:
-    """Append-only record of everything the pipeline decided. Never rotated by this tool."""
+def audit(root: str, event: str, detail: str, data: dict | None = None) -> None:
+    """Append-only record of everything the pipeline decided. Never rotated by this tool.
+
+    `detail` is prose, for a person reading the log. `data` is the same facts as JSON in a
+    seventh field, for anything that counts them: `sdlc metrics` used to re-parse the prose,
+    so rewording a message changed a number, and a message that did not match the expected
+    shape was silently counted as nothing.
+    """
     try:
         p = os.path.join(root, AUDIT_LOG)
         os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -459,7 +465,8 @@ def audit(root: str, event: str, detail: str) -> None:
             branch(root) or "-",
             os.environ.get("CLAUDE_AGENT") or os.environ.get("OPENCODE_AGENT") or "-",
             redact(re.sub(r"\s+", " ", str(detail)))[:400],
-        ])
+        ] + ([redact(json.dumps(data, separators=(",", ":"), sort_keys=True))[:400]]
+             if data else []))
         with open(p, "a") as fh:
             fh.write(line + "\n")
     except Exception:
@@ -486,7 +493,8 @@ def receipt_write(root: str, kind: str, verdict: str, subject: str, detail: str,
     with open(p, "w") as fh:
         json.dump(r, fh, indent=2)
         fh.write("\n")
-    audit(root, f"receipt.{kind}", f"{verdict} by {by}: {detail}")
+    audit(root, f"receipt.{kind}", f"{verdict} by {by}: {detail}",
+          {"kind": kind, "verdict": verdict, "by": by})
     print(f"{kind}: {verdict}  ->  {os.path.relpath(p, root)}")
     return 0
 
@@ -3187,7 +3195,9 @@ def cmd_finding(args) -> int:
         with open(existing, "w") as fh:
             json.dump(rec, fh, indent=2)
             fh.write("\n")
-        audit(root, "finding.write", f"{rid} {args.rule} {severity}/{confidence} by {args.by}")
+        audit(root, "finding.write", f"{rid} {args.rule} {severity}/{confidence} by {args.by}",
+              {"id": rid, "rule": args.rule, "severity": severity,
+               "confidence": confidence, "by": args.by})
         auto = rec["proposedRepair"]["autofixEligible"]
         print(f"{rid}  {args.rule}  {severity}/{confidence}  {args.file}"
               f"{':' + str(args.line) if args.line else ''}")
@@ -3270,7 +3280,9 @@ def cmd_finding(args) -> int:
         json.dump(rec, fh, indent=2)
         fh.write("\n")
     audit(root, "finding.close",
-          f"{args.id} outcome={args.outcome} by {args.by}: {args.detail or ''}")
+          f"{args.id} outcome={args.outcome} by {args.by}: {args.detail or ''}",
+          {"id": args.id, "outcome": args.outcome, "by": args.by,
+           "commit": args.commit or None})
     print(f"{args.id}: {args.outcome}")
     if args.outcome == "unexecuted":
         print("unexecuted is not closed — the fix was not verified. It stays on the gate's list.")
@@ -3290,7 +3302,17 @@ def cmd_metrics(args) -> int:
     for line in open(p, errors="replace"):
         parts = line.rstrip("\n").split("\t")
         if len(parts) >= 6:
-            rows.append(dict(zip(("at", "event", "commit", "branch", "agent", "detail"), parts)))
+            r = dict(zip(("at", "event", "commit", "branch", "agent", "detail"), parts[:6]))
+            # The seventh field is the same facts as JSON. Prefer it: re-parsing the prose
+            # meant rewording a message changed a number, and a message that did not match
+            # the expected shape counted as nothing at all.
+            r["data"] = {}
+            if len(parts) >= 7:
+                try:
+                    r["data"] = json.loads(parts[6]) or {}
+                except Exception:
+                    r["data"] = {}
+            rows.append(r)
     if args.since:
         rows = [r for r in rows if r["at"][:10] >= args.since]
     if not rows:
@@ -3301,7 +3323,7 @@ def cmd_metrics(args) -> int:
     for r in rows:
         if r["event"].startswith("receipt."):
             kind = r["event"].split(".", 1)[1]
-            verdict = r["detail"].split(" by ")[0]
+            verdict = r["data"].get("verdict") or r["detail"].split(" by ")[0]
             stages.setdefault(kind, {}).setdefault(verdict, 0)
             stages[kind][verdict] += 1
         elif r["event"] == "blocked":
@@ -3372,9 +3394,12 @@ def cmd_metrics(args) -> int:
         for r in rows:
             # Matched on the structured field, not on free text: the old `" fixed" in detail`
             # counted a close whose note said "could not be fixed yet" as a fix.
-            if r["event"] == "finding.close" and "outcome=fixed" in r["detail"]:
-                fixed_then.add(r["detail"].split()[0])
-            elif r["event"] == "finding.write" and r["detail"].split()[0] in fixed_then:
+            if r["event"] == "finding.close" and (
+                    r["data"].get("outcome") == "fixed"
+                    or (not r["data"] and "outcome=fixed" in r["detail"])):
+                fixed_then.add(r["data"].get("id") or r["detail"].split()[0])
+            elif r["event"] == "finding.write" and (
+                    r["data"].get("id") or r["detail"].split()[0]) in fixed_then:
                 refixed += 1
         if fixed_then:
             print(f"  false-fix rate         "
