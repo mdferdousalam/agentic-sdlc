@@ -18,7 +18,6 @@
   "secretScan": "gitleaks git --no-banner --redact --log-opts=\"-n 50\"",
   "suiteAudit": {
     "exclude": [
-      "bin/sdlc",
       "tests/test_sdlc.py",
       "evals/*/prompt.md"
     ]

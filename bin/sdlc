@@ -2278,25 +2278,49 @@ ASSERT_RE = re.compile(
     re.I)
 
 # A marker that stops a test running, or runs only one. Added, these are how a suite goes quiet.
-SKIP_ADDED = (
-    (re.compile(r"\.(skip|only)\s*\(|\bx(it|describe|test)\s*\("), "a test is skipped or isolated"),
-    (re.compile(r"@pytest\.mark\.(skip|xfail)"), "a test is skipped or expected to fail"),
-    (re.compile(r"\bt\.Skip\w*\("), "a Go test skips itself"),
-    (re.compile(r"#\[ignore\]"), "a Rust test is ignored"),
-    (re.compile(r"@(Disabled|Ignore)\b"), "a JVM test is disabled"),
-    (re.compile(r"\breturn\s*;?\s*//\s*(TODO|FIXME|skip)", re.I), "a test returns early"),
-)
+SUPPRESSION_PATTERNS = "schema/suppression-patterns.json"
 
-# Silencing a tool rather than satisfying it.
-SUPPRESS_ADDED = (
-    (re.compile(r"eslint-disable(-next-line)?"), "an eslint rule is disabled"),
-    (re.compile(r"#\s*noqa|#\s*type:\s*ignore|#\s*pylint:\s*disable"), "a Python check is silenced"),
-    (re.compile(r"#\[allow\("), "a Rust lint is allowed"),
-    (re.compile(r"//\s*nolint|//lint:ignore"), "a Go linter is silenced"),
-    (re.compile(r"@SuppressWarnings|@ts-(ignore|expect-error|nocheck)"), "a type or compiler check is suppressed"),
-    (re.compile(r"\bcontinue-on-error:\s*true"), "a CI step is allowed to fail"),
-    (re.compile(r"\|\|\s*true\s*$"), "a command's failure is swallowed"),
-)
+
+def _marker_bank():
+    """The skip and suppression markers, loaded from data.
+
+    They used to be regex literals here, which meant the file implementing every control
+    contained the strings the control scans for -- so `sdlc tests audit` reported itself and
+    `suiteAudit.exclude` had to exempt the whole of bin/sdlc. Exempting that file is a poor
+    trade for a detector that cannot read its own source, and the fix is structural rather
+    than a heuristic about quoting: two such heuristics were tried here before and both were
+    forgeable by the actor the control constrains.
+
+    Missing or empty is a stop, for the same reason the rule table is: a detector with no
+    patterns reports nothing and looks exactly like a clean diff.
+    """
+    raw = read_plugin(SUPPRESSION_PATTERNS)
+    try:
+        data = json.loads(raw) if raw else {}
+        skip = tuple((re.compile(e["pattern"], re.I if "i" in e.get("flags", "") else 0),
+                      e["why"]) for e in data["skip"])
+        sup = tuple((re.compile(e["pattern"], re.I if "i" in e.get("flags", "") else 0),
+                     e["why"]) for e in data["suppress"])
+    except Exception as e:
+        skip = sup = ()
+        print(f"sdlc: {SUPPRESSION_PATTERNS} is unreadable ({e})", file=sys.stderr)
+    if not skip or not sup:
+        print(f"sdlc: {SUPPRESSION_PATTERNS} is missing or empty, so the suite audit would "
+              f"report nothing and a gutted diff would look clean. Refusing rather than "
+              f"scanning for nothing.", file=sys.stderr)
+        raise SystemExit(3)
+    return skip, sup
+
+
+_MARKERS = None
+
+
+def markers():
+    global _MARKERS
+    if _MARKERS is None:
+        _MARKERS = _marker_bank()
+    return _MARKERS
+
 
 NUM_SETTING = re.compile(r"([A-Za-z_][\w.\- ]{2,40})\s*[:=]\s*(\d{1,3})(?:\.\d+)?\s*%?\s*$")
 
@@ -2357,7 +2381,7 @@ def audit_excluded(cfg: dict, path: str) -> bool:
     """Is this path declared exempt from the suite audit?
 
     Content-based exemption was tried twice and is not defensible. Counting quote parity let
-    one apostrophe disarm a line; requiring a quote on both sides let `# noqa  # "` do it.
+    one apostrophe disarm a line, and requiring a quote on both sides fell to appending one.
     Anything decided from the text of a line can be forged by writing different text, and the
     actor writing it is the one the control exists to constrain.
 
@@ -2532,7 +2556,7 @@ def suite_findings(root: str, base: str, cfg: dict = None):
         exempt = audit_excluded(cfg, path or "")
         for line in added:
             if not exempt:
-                for pat, why in SKIP_ADDED + SUPPRESS_ADDED:
+                for pat, why in markers()[0] + markers()[1]:
                     if pat.search(line):
                         found.append((path, why, line.strip()))
                         break
