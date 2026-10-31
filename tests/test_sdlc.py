@@ -227,13 +227,17 @@ ok(guard(dfb, "gh pr merge --squash").returncode == 0, "an open advisory does no
 shutil.rmtree(dfb)
 
 print("fail-closed: a question git could not answer is not a reassuring answer")
+# A fresh directory, not /tmp: /tmp is inside a git repository on some machines, and then
+# this asserts the opposite of what it means to.
+_nonrepo = tempfile.mkdtemp(prefix="sdlc-nonrepo-")
 _sd = subprocess.run([sys.executable, "-c",
                       "import sys;m=type(sys)('m');"
                       "exec(compile(open(%r).read().split('def main(')[0],'b','exec'),m.__dict__);"
-                      "print(m.tree_clean('/tmp'), m.tree_digest('/tmp'))" % SDLC],
+                      "print(m.tree_clean(%r), m.tree_digest(%r))" % (SDLC, _nonrepo, _nonrepo)],
                      capture_output=True, text=True).stdout.strip()
 ok(_sd.startswith("False"), "git failing to run is not a clean tree")
 ok("unreadable-working-tree" in _sd, "and the digest says so rather than matching")
+shutil.rmtree(_nonrepo, ignore_errors=True)
 
 print("guard: publishing")
 for cmd in ["git tag v1.0", "npm publish", "cargo publish", "gh release create v1",
@@ -1257,6 +1261,11 @@ for what, args_ in [("a new branch", ["checkout", "-q", "-b", "other"]),
     ok(guard(dbr, "git status").returncode == 2, f"the ceiling survives {what}")
 ok("budget.task-started" in open(os.path.join(dbr, ".sdlc/audit.log")).read(),
    "and a task beginning its own budget is recorded")
+# Assert on the key itself. Window summing would mask a regression to the branch-name key,
+# so "the ceiling survived a rename" alone would pass against the thing this replaced.
+_keys = list(json.load(open(os.path.join(dbr, ".sdlc/budget.json")))["tasks"].keys())
+ok(all(k not in ("main", "other", "and-another", "renamed", "HEAD") for k in _keys),
+   f"the budget key is not the branch name: {_keys}")
 # Genuinely new work, from a trunk that has moved on, does get its own ceiling.
 subprocess.run(["git", "checkout", "-q", "main"], cwd=dbr, capture_output=True)
 open(os.path.join(dbr, "next.txt"), "w").write("x\n")
