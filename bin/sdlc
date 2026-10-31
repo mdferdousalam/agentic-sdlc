@@ -791,7 +791,7 @@ COMMAND_RUNNERS = {"ssh", "su", "doas", "flock", "watch", "parallel", "script", 
 # because a shell is an interpreter, and these are the same shape without the name.
 STDIN_RUNNERS = {"at", "batch", "xargs", "parallel", "entr", "expect", "script"}
 PIPE_INTO_RUNNER = re.compile(
-    r"\|\s*(?:sudo\s+|command\s+|env\s+\S+=\S+\s+)*(?:\S*/)?(%s)\b" % "|".join(
+    r"\|\s*(?:sudo\s+|command\s+|env\s+\S+=\S+\s+)*(?:/(?:usr/)?(?:local/)?s?bin/)?(%s)(?![\w./-])" % "|".join(
         sorted(STDIN_RUNNERS)))
 # `!` in operand position is the shell escape, and it is a convention rather than one
 # program's flag: a git or gh alias beginning with it, `less +!cmd`, `vi +!cmd`, `psql \!cmd`.
@@ -805,8 +805,8 @@ DOT_SHELL = re.compile(r"^\s*\.(?:shell|system|once\s+\||excel)\s+(\S.*)$", re.S
 # sed's `e` runs the rest of the line as a command, and the `s///e` flag runs what it
 # substituted. `-e` already reads its value as code; a bare script operand did not.
 SED_PROGS = {"sed", "gsed", "ssed"}
-SED_EXEC = re.compile(r"(?:(?:^|[;{\n])\s*[0-9,$~+!]*\s*|/(?:\\.|[^/])*/\s*)e\s+\S"
-                      r"|s(.)(?:\\.|(?!\1).)*\1(?:\\.|(?!\1).)*\1[a-zA-Z0-9]*e", re.S)
+SED_EXEC = re.compile(r"(?:(?:^|[;{\n])\s*[0-9,$~+!]*\s*|/(?:\\.|[^/\\])*/\s*)e\s+\S"
+                      r"|s(.)(?:\\.|(?!\1)[^\\])*\1(?:\\.|(?!\1)[^\\])*\1[a-zA-Z0-9]*e", re.S)
 SHELL_OPERATORS = {";", "&&", "||", "|", "|&", "&", "(", ")", "{", "}", "<", ">", ">>", "<<",
                    "<<<"}
 ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=", re.S)

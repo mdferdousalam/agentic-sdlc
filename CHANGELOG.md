@@ -195,12 +195,21 @@ string-matching guard over shell can promise.
   dot-commands; `sed`'s `e` command and `s///e` flag run what they read; and a pipe into a
   runner that takes its command from stdin makes the whole line code, exactly as a pipe into
   a shell already did.
+- **The guard cannot be made to hang.** The `sed` pattern added for the seventh review had two
+  ambiguous alternations: both branches could consume a backslash, so a failing search tried
+  every way of splitting a run of them — 34 backslashes took six seconds, 40 would take
+  minutes, in a hook that runs before every tool call. The alternatives are disjoint now and
+  a test bounds the time.
+- **A pipe into a runner makes the line suspect, and that has a cost.** `xargs git commit -m
+  "never use <refused phrase>"` is refused, because the raw line is matched once a pipe feeds
+  a stdin runner. That is the same prose-versus-code trade the heredoc rule makes, taken on
+  the safe side; the runner must now be the whole word, so `./scripts/at-deploy` is not one.
 - **The credential rule** missed several real reads: the PostgreSQL password file, the
   process environment under `/proc`, gh's stored hosts file, git's credential store, a bare
   `printenv`, `gh auth token`, reading a dotenv file out of git with `git show`, and a glob
   standing in for the name. Using `env` to set a variable before a command is untouched.
 
-All 77 findings raised against this branch are closed. The test suite is 526 assertions, up
+All 77 findings raised against this branch are closed. The test suite is 531 assertions, up
 from 248 at 3.0.0.
 
 ### Known, and not fixed here

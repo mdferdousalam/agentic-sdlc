@@ -208,6 +208,17 @@ for cmd in ["git config alias.co checkout", "gh alias set co 'pr checkout'",
             "ls | xargs rm -f", "find . -newer x | entr make test"]:
     ok(guard(d, cmd).returncode == 0, f"allowed: {cmd!r}")
 
+print("guard: a hostile operand cannot hang the guard")
+# SED_EXEC had two ambiguous alternations; a run of backslashes took exponential time, and the
+# guard runs before every tool call, so a hang there stops the session.
+import time as _t
+_t0 = _t.time()
+guard(d, "sed -n 's/" + "\\" * 60 + "x/y/p' f")
+ok(_t.time() - _t0 < 5, "sixty backslashes in a sed script is answered, not searched forever")
+for cmd in ["ls | ./scripts/at-deploy --run", "cat f | ./script.sh arg", "ls | npx at now",
+            "ls | /usr/bin/at now"]:
+    ok(guard(d, cmd).returncode == 0, f"a runner is the whole word, not a path prefix: {cmd!r}")
+
 print("guard: who reads a heredoc body decides whether it is data")
 # The list of consumers that RUN a body cannot be kept complete — `python3 - <<X`,
 # `at now <<X` and `make -f - <<X` were each missing from it. The allowlist is inverted:
