@@ -685,7 +685,7 @@ CREDENTIALS = [
      r"\b[^\n]*"
      r"(\.env(?!\.(?:example|sample|template|dist))[\w.-]*|/\.ssh/|/\.aws/|/\.gnupg/|/\.kube/|"
      r"/\.docker/|\.npmrc|\.pypirc|\.netrc|id_rsa|id_ed25519|\.pem|\.p12|\.kdbx|"
-     r"credentials(\.json)?|secrets?\.ya?ml|service[-_]account[\w.-]*\.json)",
+     r"credentials(\.json)?|secrets?\.ya?ml|service[-_]account[\w.-]*\.json|\.pgpass|/proc/self/environ|/\.config/gh/hosts\.ya?ml|\.git-credentials|\.docker/config\.json|\.kube/config|\.e\*|\.en\?|\.e\[n\]v)",
      "reading a credential file is forbidden"),
     (r"(^|[\s;|&(])(printenv|env)\b[^\n]*\b\w*(SECRET|TOKEN|PASSWORD|PASSWD|"
      r"API[-_]?KEY|PRIVATE[-_]?KEY|CREDENTIAL)\w*",
@@ -709,6 +709,11 @@ CREDENTIAL_PATHS = [
 SECRETS_IN_LINE = [
     (r"\b(sk-[A-Za-z0-9]{12,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{12,})",
      "a credential appears in this command line"),
+    # Printing the whole environment, and the shorthands for fetching a live token.
+    (r"(^|[\s;|&(])(printenv|env)\s*(\||>|$)", "printing the environment exposes every secret in it"),
+    (r"\bgh\s+auth\s+token\b", "this prints a live credential"),
+    (r"\bgit\s+(show|cat-file)\b[^\n]*:[\w./-]*\.env\b", "this reads a credential file out of git"),
+    (r"(^|[\s;|&(=\"'])cat\s+[\w./-]*\.e(\*|\?|\[)", "a glob that matches a credential file"),
 ]
 
 
@@ -760,17 +765,27 @@ SHELL_KEYWORDS = {"if", "then", "elif", "else", "fi", "do", "done", "while", "un
 SHELL_INTERPRETERS = {"sh", "bash", "zsh", "dash", "ksh", "fish", "eval", "source", "."}
 # Flags whose value is a command, whatever the program.
 CODE_OPTIONS = {"-c", "--command", "-e", "--eval", "-x", "--exec", "-exec", "-S", "--execute",
-                "--eval-command", "-execdir"}
+                "--eval-command", "-execdir", "-o", "--to-command", "--checkpoint-action",
+                "-P", "--pager", "--rsh", "--ssh-command", "--upload-pack",
+                "--receive-pack", "--editor"}
 # Interpreters whose code operand is not shell, so shell parsing cannot reach inside it.
 # `python3 -c 'os.system("git stash")'` is a real invocation and the payload sits in a
 # string literal; the operand is matched raw rather than parsed, because it is code and not
 # somebody's prose.
 SCRIPT_INTERPRETERS = {"python", "python3", "node", "deno", "bun", "ruby", "perl", "php",
                        "Rscript", "osascript", "pwsh", "powershell"}
+# Consumers that write a heredoc body down rather than running it. Everything else gets
+# its body parsed, because the list of things that RUN one cannot be kept complete:
+# `python3 - <<X`, `at now <<X` and `make -f - <<X` were each missing from it.
+INERT_CONSUMERS = {"cat", "tee", "echo", "printf", "sdlc", "bat", "head", "tail", "wc",
+                   "less", "more", "sort", "uniq", "grep", "diff", "jq", "yq", "column",
+                   "fold", "nl", "md5sum", "shasum", "sha256sum", "base64", "tr", "rev"}
 # Programs that run what they are handed, without being a shell themselves.
 COMMAND_RUNNERS = {"ssh", "su", "doas", "flock", "watch", "parallel", "script", "chroot",
                    "nsenter", "docker", "podman", "kubectl", "oc", "vagrant", "ansible",
-                   "rsh", "telnet", "expect", "screen", "tmux", "at", "batch"}
+                   "rsh", "telnet", "expect", "screen", "tmux", "at", "batch", "awk", "gawk",
+                   "mawk", "xargs", "entr", "systemd-run", "runuser", "setpriv", "lldb",
+                   "gdb", "man", "git-submodule", "make", "ninja", "just", "task"}
 SHELL_OPERATORS = {";", "&&", "||", "|", "|&", "&", "(", ")", "{", "}", "<", ">", ">>", "<<",
                    "<<<"}
 ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=", re.S)
@@ -837,7 +852,7 @@ def quote_spans(text: str):
 HEREDOC = re.compile(r"(?<!<)<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1(?!<)")  # not a here-string
 
 
-def strip_heredocs(command: str):
+def strip_heredocs(command: str, kept: list | None = None):
     """Drop heredoc bodies, or None if the line cannot be parsed.
 
     A heredoc body is text being written, not a command run. But the marker has to be found
@@ -869,6 +884,7 @@ def strip_heredocs(command: str):
     while i < len(lines):
         out.append(lines[i])
         word, quoted = starts.get(i, (None, False))
+        hd_line = lines[i]
         i += 1
         if word is None:
             continue
@@ -878,10 +894,26 @@ def strip_heredocs(command: str):
             i += 1
         if i >= len(lines):
             return None          # no terminator: a parse failure, not an invitation
-        # A quoted delimiter (<<'EOF') makes the body inert. An unquoted one does not: the
-        # shell expands $(...) and backticks in it before a single byte is written, so those
-        # run. Keep just the substitutions; the rest of the body stays data.
-        if not quoted:
+        # Whether the body is data depends on who is reading it. `cat > notes.md <<EOF` writes
+        # it down; `python3 - <<X`, `at now <<X` and `make -f - <<X` execute it. The list of
+        # consumers that run a body cannot be kept complete, so the allowlist is the other
+        # way round: inert consumers are named, and everything else has its body parsed.
+        consumer = ""
+        toks = [t for t in re.split(r"[\s;|&<>()]+", hd_line) if t]
+        for t in toks:
+            if not t.startswith("-") and "=" not in t:
+                consumer = program_name(t)
+                break
+        if consumer and consumer not in INERT_CONSUMERS:
+            out.extend(body)
+            if kept is not None:
+                # Also raw: a body fed to python3, awk or make is code in another language,
+                # and shell parsing cannot see inside its string literals.
+                kept.append("\n".join(body))
+        # A quoted delimiter (<<'EOF') makes the body inert as far as EXPANSION goes. An
+        # unquoted one does not: the shell expands $(...) and backticks in it before a byte
+        # is written, so those run.
+        elif not quoted:
             for b in body:
                 for mm in re.finditer(r"\$\(([^)]*)\)|`([^`]*)`", b):
                     out.append(mm.group(1) or mm.group(2) or "")
@@ -1068,12 +1100,14 @@ def command_units(command: str, depth: int = 0) -> list[tuple[str, bool]]:
     refused command reached through `find -exec`, `ssh host`, `git submodule foreach` or a
     shell keyword sits in argument position and is still run.
     """
-    body = strip_heredocs(command)
+    kept_bodies = []
+    body = strip_heredocs(command, kept_bodies)
     body = strip_comments(body) if body is not None else None
     parsed = simple_commands(newlines_to_separators(body)) if body is not None else None
     if parsed is None:
         return [(command, False)]
     units, nested, suspect = [], False, False
+    units += [(b, False) for b in kept_bodies if b.strip()]
     # An expansion is a word separator the shell has not performed yet: `git${IFS}stash` is
     # one token here and two words to bash, and `{git,stash}` is a brace list that expands to
     # a real command. Widen the line and parse it again -- it has to happen before lexing,
@@ -1123,6 +1157,9 @@ def command_units(command: str, depth: int = 0) -> list[tuple[str, bool]]:
                             else (form[n + 1] if n + 1 < len(form) else None))
                 elif prog in COMMAND_RUNNERS and " " in arg and not arg.startswith("-"):
                     code = arg
+                elif (prog == "git" and " " in arg and not arg.startswith("-")
+                      and any(v in form for v in ("foreach", "bisect", "filter-branch"))):
+                    code = arg          # git subcommands that run a shell command
                 elif prog == "git" and name == "-c":
                     val = (arg.split("=", 1)[1] if "=" in arg
                            else (form[n + 1] if n + 1 < len(form) else "")) or ""
@@ -1134,8 +1171,7 @@ def command_units(command: str, depth: int = 0) -> list[tuple[str, bool]]:
                     # argument we could not reach, and adding it here made every quoted
                     # sentence on the line readable as a command again.
                     units += command_units(code, depth + 1)
-                    if prog in SCRIPT_INTERPRETERS:
-                        units.append((code, False))
+                    units.append((code, False))
     if nested or suspect:
         units.append((command, False))
     return units or [(command, False)]

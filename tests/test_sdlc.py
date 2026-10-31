@@ -192,6 +192,29 @@ for _c, _want in [("cat <<'MD'\nprose\nMD\ngit stash", 2),
     ok(guard(d, _c).returncode == _want,
        ("blocked" if _want else "allowed") + f" after the ordering change: {_c!r}")
 
+print("guard: who reads a heredoc body decides whether it is data")
+# The list of consumers that RUN a body cannot be kept complete — `python3 - <<X`,
+# `at now <<X` and `make -f - <<X` were each missing from it. The allowlist is inverted:
+# inert consumers are named, and everything else has its body parsed and matched raw.
+for cmd in ['python3 - <<X\nimport os; os.system("git stash")\nX',
+            "at now <<X\ngit stash\nX",
+            "make -f - <<X\nall:\n\tgit stash\nX",
+            "awk 'BEGIN{system(\"git stash\")}'",
+            'tar --to-command="git stash" -xf a.tar',
+            'git submodule foreach "git stash"',
+            "man -P 'git stash' ls", "lldb -o 'git stash'"]:
+    ok(guard(d, cmd).returncode == 2, f"blocked: {cmd!r}")
+for cmd in ["cat > notes.md <<EOF\ngit stash\nEOF", "tee notes.md <<EOF\ngit stash\nEOF",
+            "cat <<'EOF'\ngit stash\nEOF"]:
+    ok(guard(d, cmd).returncode == 0, f"allowed, the consumer writes it down: {cmd!r}")
+# credential reads that the verb list and the standalone-path rule both missed
+for cmd in ["cat ~/.pgpass", "cat /proc/self/environ", "cat ~/.config/gh/hosts.yml",
+            "printenv", "env | grep X", "gh auth token", "git show HEAD:.env",
+            "cat .e*", "cat ~/.git-credentials"]:
+    ok(guard(d, cmd).returncode == 2, f"blocked: {cmd!r}")
+ok(guard(d, "env NODE_ENV=production npm start").returncode == 0,
+   "but env used to set a variable is not env used to dump one")
+
 print("guard: the credential rule is about the file, not the verb that reads it")
 # Keying on a verb list meant the next reader of the same path was allowed: xxd was listed
 # and base64 was not. The path is a subject in its own right now.
