@@ -114,6 +114,45 @@ ok(guard(d, 'sdlc receipt write --kind readiness --verdict not-ready '
              '--detail "18 of 18 refusals bypassed: git stash, git clean -fd, npm publish"'
          ).returncode == 0, "allowed: the gate can write its own NOT-READY receipt")
 
+print("guard: a refused command is refused wherever in the line it sits")
+# Round two. The first parser rewrite anchored each rule at position 0 of a simple command.
+# That closed the quoted-prose false positive and reopened the bypass class it was written
+# for: 24 refusals that held before it were allowed after. Every shape below was one of them,
+# and they all shipped green because every blocked case in the suite was a single line.
+for cmd in [
+        # an unquoted newline ends a command; shlex eats it as whitespace
+        "echo hello\ngit stash", "echo hello\nnpm publish", "echo hello\ncat ~/.ssh/id_rsa",
+        "echo hello\ngit push --force origin main",
+        # the refused command in argument position, and still run
+        "git submodule foreach git clean -fd", "find . -exec git clean -fd \\;",
+        "ssh host git clean -fd", "npm exec -- npm publish", "docker run --rm img npm publish",
+        "git rebase -i --exec 'git clean -fd' main",
+        # a wrapper option taking a separate value shifted the program out of place
+        "sudo -u ci git clean -fd", "xargs -I {} git stash", "timeout 5 bash -c 'git stash'",
+        "sudo sh -c 'git stash'", "env sh -c 'git clean -fd'",
+        # shell keywords occupy command position
+        "for f in a b; do git clean -fd; done", "if git stash; then echo x; fi",
+        "while true; do git reset --hard; done",
+        # a quoted << is not a heredoc, and an unterminated one is a parse failure
+        'echo "see <<EOF for details"\ngit stash', 'echo "<<NOTE"\nrm -rf /',
+        'python3 -c "x = 1 << shift"\ngit clean -fd',
+        # an expansion is a word separator the shell has not performed yet
+        "git${IFS}stash", "{git,stash}", "npm${IFS}publish",
+        # env is a wrapper and also the subject of a credential rule
+        "env MY_TOKEN",
+        # a filename with a space, now that the credential rules are anchored
+        "cat 'my secrets.yaml'", 'cat "/home/me/My Project/.env"',
+        # --all and --mirror push the trunk without naming it; -f is as much a force
+        "git push --all origin", "git push --mirror origin", "git branch -f main HEAD"]:
+    ok(guard(d, cmd).returncode == 2, f"blocked: {cmd!r}")
+# and none of that may cost the false-positive repair it was traded against
+for cmd in ['sdlc finding write --detail "git stash is refused by the guard"',
+            "cat > notes.md <<EOF\ngit stash\nnpm publish\nEOF",
+            "echo $HOME", "ls ${HOME}/x", "npm install a,b", "git log --format=%h,%s",
+            "curl -H 'Accept: a,b' https://example.com", "git diff --stat HEAD~1",
+            "git status\ngit log --oneline -5"]:
+    ok(guard(d, cmd).returncode == 0, f"allowed: {cmd!r}")
+
 print("guard: publishing")
 for cmd in ["git tag v1.0", "npm publish", "cargo publish", "gh release create v1",
             "docker push x/y", "git push --tags origin"]:
@@ -278,6 +317,33 @@ alog = open(os.path.join(dforge, ".sdlc", "audit.log")).read()
 ok("receipt.gate.accepted" in alog, "an accepted receipt is recorded, not only a refused one")
 ok("receipt.readiness.refused" in alog, "and a refused one still is")
 shutil.rmtree(dforge)
+
+print("receipts: the working tree a verdict saw")
+# treeClean was a boolean from --untracked-files=no, which failed in both directions: an
+# untracked file never dirtied the tree, so a verifyCmd satisfied by a file that was never
+# committed kept its receipt after the file was removed; and the check only applied when the
+# flag was true, so a receipt written over a dirty tree was never re-checked at all.
+dtd = newrepo(config={"version": 2, "trunk": "main", "verifyCmd": "test -f ok.marker"})
+open(os.path.join(dtd, "ok.marker"), "w").write("x\n")          # untracked
+run(["receipt", "write", "gate", "--verdict", "passed", "--by", "t", "--detail", "v"], dtd)
+ok(run(["receipt", "check", "gate", "--verdict", "passed"], dtd).returncode == 0,
+   "a receipt holds while the tree it saw is unchanged")
+os.remove(os.path.join(dtd, "ok.marker"))
+ok(run(["receipt", "check", "gate", "--verdict", "passed"], dtd).returncode == 1,
+   "removing an untracked file the verify depended on voids it")
+ok(guard(dtd, "git push origin main").returncode == 2,
+   "and the protected push is refused again")
+shutil.rmtree(dtd)
+
+dtd2 = newrepo(config={"version": 2, "trunk": "main"})
+open(os.path.join(dtd2, "README.md"), "a").write("edited\n")    # dirty before the receipt
+run(["receipt", "write", "gate", "--verdict", "passed", "--by", "t", "--detail", "v"], dtd2)
+ok(run(["receipt", "check", "gate", "--verdict", "passed"], dtd2).returncode == 0,
+   "a receipt written over a dirty tree holds while that tree is unchanged")
+open(os.path.join(dtd2, "README.md"), "a").write("more\n")
+ok(run(["receipt", "check", "gate", "--verdict", "passed"], dtd2).returncode == 1,
+   "and stops holding when more work piles up — the check is not opt-out")
+shutil.rmtree(dtd2)
 
 print("receipts: bound to the subject's content")
 spec = os.path.join(d, "spec.md")
@@ -486,9 +552,15 @@ print("findings: an id is an id, not a path")
 # everything before one.
 dtrav = newrepo(config={"version": 2, "trunk": "main"})
 os.makedirs(os.path.join(dtrav, ".sdlc", "findings"), exist_ok=True)
-victim = os.path.join(dtrav, "..", "victim-of-traversal.json")
+# Two victims, because the ids below resolve to two different places: `../../x` climbs
+# from .sdlc/findings to the repo root, `../x` to its parent. The first version of this
+# test wrote only the outer one, so twelve of its fourteen assertions passed against the
+# vulnerable code as well and only the absolute-path id exercised the defect.
 VICTIM = '{"secret": "do not touch"}'
-open(victim, "w").write(VICTIM)
+victims = [os.path.join(dtrav, "..", "victim-of-traversal.json"),
+           os.path.join(dtrav, "victim-of-traversal.json")]
+for v in victims:
+    open(v, "w").write(VICTIM)
 for bad_id in ["../../victim-of-traversal", "../victim-of-traversal",
                os.path.join(dtrav, "..", "victim-of-traversal"),
                "F-deadbeef/../../../victim-of-traversal", "F-DEADBEEF", "F-dead",
@@ -497,8 +569,9 @@ for bad_id in ["../../victim-of-traversal", "../victim-of-traversal",
     ok(rs.returncode == 1 and "do not touch" not in rs.stdout, f"show refuses {bad_id!r}")
     ok(run(["finding", "close", bad_id, "--outcome", "fixed", "--by", "x"],
            dtrav).returncode == 1, f"close refuses {bad_id!r}")
-ok(open(victim).read() == VICTIM, "and the file outside the repository is untouched")
-os.remove(victim)
+for v in victims:
+    ok(open(v).read() == VICTIM, f"untouched: {os.path.relpath(v, dtrav)}")
+    os.remove(v)
 shutil.rmtree(dtrav)
 
 print("findings: the repair policy is a table, not a vibe")
@@ -1009,6 +1082,37 @@ subprocess.run(["git", "add", "next.txt"], cwd=dbr)
 subprocess.run(["git", "commit", "-qm", "trunk moves on"], cwd=dbr)
 ok(guard(dbr, "git status").returncode == 0, "work from a new trunk point gets its own budget")
 shutil.rmtree(dbr)
+
+# The guard evaluates the rules a second time to ask what the defaults would have done.
+# That question counted a tool call and logged a refusal that never happened, so a ceiling
+# fired at half its value whenever any enforce flag was off.
+dbd = newrepo(config={"trunk": "main", "spec": {"engine": "prd-frd"},
+                      "budget": {"maxToolCalls": 10},
+                      "enforce": {"blockPublishing": False}})
+for _ in range(3):
+    guard(dbd, "echo hello")
+_st = json.load(open(os.path.join(dbd, ".sdlc/budget.json")))
+ok(sum(t.get("toolCalls", 0) for t in _st.get("tasks", {}).values()) == 3,
+   "three tool calls count as three, not six")
+shutil.rmtree(dbd)
+dbp = newrepo(config={"trunk": "main", "spec": {"engine": "prd-frd"},
+                      "enforce": {"pushToTrunkNeedsGate": False}})
+guard(dbp, "git push origin main")
+_al = open(os.path.join(dbp, ".sdlc/audit.log")).read()
+ok("receipt.gate.refused" not in _al, "an allowed push logs no refusal that never happened")
+ok("allowed-by-config" in _al, "but the config allowance is still recorded")
+shutil.rmtree(dbp)
+# No merge base — a clone whose trunk is not a local ref — must not fall back to the branch
+# name, which is the key the merge base replaced.
+dmb = newrepo(config={"trunk": "main", "spec": {"engine": "prd-frd"},
+                      "budget": {"maxToolCalls": 3}})
+subprocess.run(["git", "branch", "-m", "work"], cwd=dmb, capture_output=True)
+for _ in range(4):
+    guard(dmb, "echo hi")
+ok(guard(dmb, "echo hi").returncode == 2, "the ceiling holds with no merge base")
+subprocess.run(["git", "branch", "-m", "other"], cwd=dmb, capture_output=True)
+ok(guard(dmb, "echo hi").returncode == 2, "and a rename still does not mint a fresh one")
+shutil.rmtree(dmb)
 
 dnb = newrepo(config={"trunk": "main", "spec": {"engine": "prd-frd"}})
 for _ in range(12):

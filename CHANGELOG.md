@@ -32,8 +32,30 @@ produced it, as a test.
   (`sk-…`, `ghp_…`, `AKIA…`) are still matched anywhere on the line: a secret is a secret
   wherever it sits.
 
-  Closes the critical `F-d0c13a07` and the `F-67811454` false positives. One line caused
-  both, and one repair fixes both.
+  Closes the critical `F-d0c13a07` and the `F-67811454` false positives.
+
+  **The first attempt at this made things worse, and the history is worth keeping.** It
+  anchored each rule at position 0 of a simple command, which closed the false positive and
+  reopened the bypass class it was written for: an independent code review and security
+  review, run against the branch, each found it separately and measured 24 refusals that
+  held before the change and were allowed after. `echo hello` followed by a newline and
+  `git stash` was enough, with no intent to evade, because `shlex` reads an unquoted newline
+  as whitespace and the two commands collapsed into one unit anchored on `echo`. So did
+  `sudo -u ci git clean -fd`, `for f in a b; do git clean -fd; done`, `find . -exec`,
+  `git submodule foreach`, and a quoted `<<` that read as a heredoc and discarded every
+  following line unscanned.
+
+  The anchoring was never needed. Collapsing an argument's own whitespace already stops a
+  quoted sentence reading as the command it describes, so the rules are matched across the
+  whole of a simple command. Unquoted newlines end commands; heredoc markers are found with
+  the same quote-aware scan, and an unterminated one is a parse failure rather than licence
+  to swallow the rest; wrapper options that take a separate value are stepped over; shell
+  keywords are stripped; `--exec` values are parsed as the code they are; and an unperformed
+  expansion is widened to the word separator the shell will make of it, so `git${IFS}stash`
+  and `{git,stash}` are refused — both of which 3.0.0 allowed.
+
+  Net of all that, the branch refuses three things 3.0.0 did not: `git push --all` and
+  `git push --mirror`, which push the trunk without naming it, and `git branch -f`.
 
 - **A publish route the maintainer did not authorise.** `.github/workflows/publish.yml`
   carried `workflow_dispatch` as a convenience, and a dispatch has no release tag, so the
@@ -66,8 +88,18 @@ produced it, as a test.
   refusal switched off, a branch dropped from `protected`, an action removed from
   `neverByAgent`, a human approval downgraded to an agent's, receipts given a longer life, a
   budget ceiling raised or removed, a budget that warns instead of refusing, a reviewer or
-  concern dropped, and a trunk change. And when a non-default flag lets a command through
-  that the defaults would have refused, the audit log records which rule and which flag.
+  concern dropped, and a trunk change — plus the keys that decide what the gate *runs*:
+  `verifyCmd`, `gateCmd`, `secretScan`, `quality.cmd`, `quality.coverageNewPct` and
+  `spec.strict`. Replacing `verifyCmd` with `true` weakens the pipeline more completely than
+  any flag, and nothing reported it. And when a non-default flag lets a command through that
+  the defaults would have refused, the audit log records which rule and which flag.
+
+  A correction: an earlier draft of this entry said deleting `enforce` "reads as switching
+  all six off — which is what it does". That was wrong twice over. `enforce.get(flag, True)`
+  defaults every flag to *on*, so deleting the key changes nothing, and the detector
+  correctly reports nothing. The detector's defaults now mirror the guard's exactly, which
+  also fixes a real miss: `approvals.release` defaults to `human` in the guard, so an
+  explicit downgrade to `agent` from an absent key is a loosening and was not reported.
 
 - **A finding id is an id, not a path.** `finding show` and `finding close` joined the id
   straight into a path, so `../../../elsewhere/victim` read a file outside the repository and

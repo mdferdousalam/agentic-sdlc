@@ -95,6 +95,29 @@ def tree_clean(root: str) -> bool:
     return git("status", "--porcelain", "--untracked-files=no", cwd=root) == ""
 
 
+def tree_digest(root: str) -> str:
+    """A digest of the working tree a receipt saw, untracked files included.
+
+    `treeClean` was a boolean from `--untracked-files=no`, which fails in both directions.
+    A brand-new untracked file never made the tree dirty, so `verifyCmd` could be satisfied
+    by a file that was never committed and then removed, with the receipt still holding.
+    And the check only applied when the flag was true, so a receipt written over a dirty
+    tree recorded false and was never re-checked however much work piled up afterwards --
+    the control was opt-out by the actor it constrains.
+
+    `.sdlc/` is excluded by path rather than by switching the whole untracked class off,
+    because the receipts and findings written during a stage are not the subject of it.
+    """
+    out = git("status", "--porcelain", "--untracked-files=normal", cwd=root)
+    lines = sorted(l for l in out.split("\n")
+                   if l.strip() and ".sdlc/" not in l and not l.endswith(".sdlc"))
+    # The status list alone records only that a file is modified, so a second edit to an
+    # already-modified file left the digest unchanged. The diff carries the content.
+    content = git("diff", "HEAD", "--", ".", ":(exclude).sdlc", cwd=root)
+    blob = "\n".join(lines) + "\0" + content
+    return hashlib.sha256(blob.encode()).hexdigest()[:16]
+
+
 # ------------------------------------------------------------------------------------ config
 
 
@@ -366,6 +389,7 @@ def receipt_write(root: str, kind: str, verdict: str, subject: str, detail: str,
         "by": by,
         "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "treeClean": tree_clean(root),
+        "treeDigest": tree_digest(root),
         "env": environment(root),
     }
     p = receipt_path(root, kind)
@@ -413,12 +437,28 @@ def receipt_problem(root: str, kind: str, verdict: str | None, max_age_min: int,
                 f"cannot be granted before the work it attests to")
     if age > max_age_min:
         return f"the {kind} receipt is {int(age)} minutes old (limit {max_age_min})"
-    # `treeClean` was written on every receipt and read by nothing. A receipt granted over a
-    # clean tree says nothing about work that was never committed.
-    if r.get("treeClean") and not tree_clean(root):
+    # The tree the receipt saw, compared in both directions. A verdict describes a state of
+    # the working tree, and any change to that state — including an untracked file appearing
+    # or disappearing — is work the verdict did not see.
+    was = r.get("treeDigest")
+    if was and was != tree_digest(root):
+        return (f"the {kind} receipt was granted over a different working tree — "
+                f"there is uncommitted work it did not see")
+    if was is None and r.get("treeClean") and not tree_clean(root):
         return (f"the {kind} receipt was granted over a clean tree, and the tree is dirty now — "
                 f"there is uncommitted work it did not see")
     return None
+
+
+def receipt_quiet(root: str, kind: str, verdict: str | None, max_age_min: int,
+                  require_commit: bool = True, why: str = "") -> str | None:
+    """`receipt_problem` with the same signature as `receipt_holds`, and no audit line.
+
+    The guard evaluates the rules a second time to ask what the defaults would have done.
+    That question must not leave a trace of a refusal that never happened, nor count a tool
+    call that was never made.
+    """
+    return receipt_problem(root, kind, verdict, max_age_min, require_commit)
 
 
 def receipt_holds(root: str, kind: str, verdict: str | None, max_age_min: int,
@@ -444,7 +484,8 @@ DESTRUCTIVE = [
     (r"\bgit\s+reset\s+(--hard|--merge|--keep)\b", "git reset --hard destroys uncommitted work"),
     (r"\bgit\s+clean\b", "git clean deletes untracked files"),
     (r"\bgit\s+(checkout|restore)\s+(--\s+)?\.(\s|$)", "this discards every uncommitted change"),
-    (r"\bgit\s+(push|branch)\b[^|;&\n]*--force(-with-lease)?\b", "force-push rewrites published history"),
+    (r"\bgit\s+(push|branch)\b[^|;&\n]*(--force(-with-lease)?\b|\s-\w*f)",
+     "force-push rewrites published history"),
     (r"\bgit\s+filter-(branch|repo)\b", "history rewriting is the maintainer's decision"),
     (r"\brm\s+(-[a-zA-Z]*\s+)*(-rf|-fr)\s+(/|~|\$HOME)(\s|$)", "refusing rm -rf of a root or home path"),
 ]
@@ -491,12 +532,12 @@ CREDENTIALS = [
     # command a reader verb on line 1 paired with a credential word forty lines later. The
     # verb list stays to tools whose whole job is to emit a file's contents -- adding
     # interpreters made it fire on any script that merely mentions one.
-    (r"(^|[\s;|&(])(cat|bat|less|more|head|tail|strings|xxd|od|cp|scp|rsync|curl)\b[^|;&\n]*"
+    (r"(^|[\s;|&(])(cat|bat|less|more|head|tail|strings|xxd|od|cp|scp|rsync|curl)\b[^\n]*"
      r"(\.env(?!\.(?:example|sample|template|dist))[\w.-]*|/\.ssh/|/\.aws/|/\.gnupg/|/\.kube/|"
      r"/\.docker/|\.npmrc|\.pypirc|\.netrc|id_rsa|id_ed25519|\.pem|\.p12|\.kdbx|"
      r"credentials(\.json)?|secrets?\.ya?ml|service[-_]account[\w.-]*\.json)",
      "reading a credential file is forbidden"),
-    (r"(^|[\s;|&(])(printenv|env)\b[^|;&\n]*\b\w*(SECRET|TOKEN|PASSWORD|PASSWD|"
+    (r"(^|[\s;|&(])(printenv|env)\b[^\n]*\b\w*(SECRET|TOKEN|PASSWORD|PASSWD|"
      r"API[-_]?KEY|PRIVATE[-_]?KEY|CREDENTIAL)\w*",
      "printing a secret from the environment is forbidden"),
     (r"(^|[\s;|&(])echo\s+\"?\$\{?\w*(SECRET|TOKEN|PASSWORD|API[-_]?KEY|"
@@ -530,36 +571,128 @@ SECRETS_IN_LINE = [
 # git's own options, which may appear between `git` and the subcommand.
 GIT_GLOBAL_VALUE_OPTS = {"-c", "-C", "--exec-path", "--git-dir", "--work-tree", "--namespace",
                          "--super-prefix", "--config-env", "--attr-source"}
-# Wrappers that run another command: the rule applies to what they run, not to them.
-COMMAND_WRAPPERS = {"sudo", "doas", "env", "nohup", "time", "command", "builtin", "exec",
-                    "xargs", "nice", "ionice", "stdbuf", "setsid", "timeout"}
-# Interpreters whose argument is code rather than data. Their line is also matched raw.
+# Wrappers that run another command: the rule applies to what they run, not to them. The
+# second element is the wrapper's own options that take a SEPARATE value -- `sudo -u ci git
+# clean -fd` left `ci` in command position, which is how anchoring lost the refusal.
+COMMAND_WRAPPERS = {
+    "sudo": {"-u", "-g", "-C", "-h", "-p", "-U", "-r", "-t"},
+    "doas": {"-u", "-C"},
+    "env": {"-u", "-C", "-S"},
+    "nohup": set(),
+    "time": {"-o", "-f"},
+    "command": set(),
+    "builtin": set(),
+    "exec": {"-a"},
+    "xargs": {"-I", "-i", "-a", "-d", "-E", "-e", "-L", "-l", "-n", "-P", "-s", "--replace"},
+    "nice": {"-n"},
+    "ionice": {"-c", "-n", "-p"},
+    "stdbuf": {"-i", "-o", "-e"},
+    "setsid": set(),
+    "timeout": {"-s", "-k", "--signal", "--kill-after"},
+}
+# Wrappers that are themselves the subject of a rule. Stripping `env` removed the very word
+# the credential rule matches, so `env MY_TOKEN` stopped being refused.
+WRAPPERS_THAT_ARE_RULE_SUBJECTS = {"env", "printenv"}
+# Shell keywords in command position. `for f in a b; do git clean -fd; done` put `do` where
+# the program goes.
+SHELL_KEYWORDS = {"if", "then", "elif", "else", "fi", "do", "done", "while", "until", "for",
+                  "case", "esac", "select", "function", "!", "{", "}", "time"}
+# Interpreters whose argument is code rather than data.
 SHELL_INTERPRETERS = {"sh", "bash", "zsh", "dash", "ksh", "fish", "eval", "source", "."}
-SHELL_OPERATORS = {";", "&&", "||", "|", "|&", "&", "(", ")", "{", "}",
-                   "<", ">", ">>", "<<", "<<<", "2>", "&>", "$"}
+SHELL_OPERATORS = {";", "&&", "||", "|", "|&", "&", "(", ")", "{", "}", "<", ">", ">>", "<<",
+                   "<<<"}
 ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=", re.S)
+# A token still carrying an unexpanded expansion is one the shell will rewrite before running
+# it, so what we parsed is not what runs. `git${IFS}stash` is a real command.
+UNEXPANDED = re.compile(r"\$[({\w]|`|\{[^}\s]*,[^}\s]*\}")
+# What an expansion becomes, for the widened form: a word separator.
+EXPANSION = re.compile(r"\$\{[^}]*\}|\$\([^)]*\)|\$\w+|`[^`]*`")
+BRACE_LIST = re.compile(r"\{([^}\s]*,[^}\s]*)\}")
+
+
+def widen_expansions(text: str) -> str:
+    """Each unperformed expansion standing in for the separator the shell will make it."""
+    return BRACE_LIST.sub(lambda m: " " + m.group(1).replace(",", " ") + " ",
+                          EXPANSION.sub(" ", text))
+
+
+def quote_spans(text: str):
+    """Walk `text` once, yielding (index, char, in_quote) with shell quoting state.
+
+    Everything structural in this file -- where a line ends, where a heredoc starts -- has to
+    agree about what is inside quotes, or the parts disagree and the gap between them is the
+    bypass. One scan, used by all of them.
+    """
+    quote = None
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if quote != "'" and c == "\\" and i + 1 < len(text):
+            yield i, c, quote
+            yield i + 1, text[i + 1], quote
+            i += 2
+            continue
+        if quote:
+            if c == quote:
+                quote = None
+                yield i, c, None
+                i += 1
+                continue
+        elif c in "\"'":
+            quote = c
+            yield i, c, None
+            i += 1
+            continue
+        yield i, c, quote
+        i += 1
+
+
 HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 
 
-def strip_heredocs(command: str) -> str:
-    """Drop heredoc bodies. A heredoc body is text being written, not a command run."""
+def strip_heredocs(command: str):
+    """Drop heredoc bodies, or None if the line cannot be parsed.
+
+    A heredoc body is text being written, not a command run. But the marker has to be found
+    outside quotes: `echo "see <<EOF for details"` is not a heredoc, and reading it as one
+    discarded every following line unscanned -- which is to say it hid them from every rule.
+    An unterminated heredoc is a parse failure and says so, rather than silently swallowing
+    the rest of the input.
+    """
     if "<<" not in command:
         return command
-    lines = command.split("\n")
-    out, i = [], 0
+    unquoted = {i for i, _c, q in quote_spans(command) if q is None}
+    lines, out, i, offset = command.split("\n"), [], 0, 0
+    starts = {}
+    pos = 0
+    for n, line in enumerate(lines):
+        m = HEREDOC.search(line)
+        if m and (pos + m.start()) in unquoted:
+            starts[n] = m.group(2)
+        pos += len(line) + 1
     while i < len(lines):
         out.append(lines[i])
-        m = HEREDOC.search(lines[i])
+        word = starts.get(i)
         i += 1
-        if not m:
+        if word is None:
             continue
-        word = m.group(2)
         while i < len(lines) and lines[i].strip() != word:
-            i += 1          # the body: data, so it is not scanned
-        if i < len(lines):
-            out.append(lines[i])
             i += 1
+        if i >= len(lines):
+            return None          # no terminator: a parse failure, not an invitation
+        out.append(lines[i])
+        i += 1
     return "\n".join(out)
+
+
+def newlines_to_separators(command: str) -> str:
+    """An unquoted newline ends a command. shlex treats it as whitespace, so two commands on
+    two lines became one argv list anchored on the first program -- and `echo hello` on line
+    one hid anything on line two. Routine multi-line input, no evasion required."""
+    out = []
+    for _i, c, q in quote_spans(command):
+        out.append(" ; " if (c == "\n" and q is None) else c)
+    return "".join(out)
 
 
 def program_name(token: str) -> str:
@@ -567,16 +700,33 @@ def program_name(token: str) -> str:
 
 
 def strip_wrappers(argv: list[str]) -> list[str]:
-    """Look through `sudo`, `env VAR=x`, `timeout 5` and the like to the real command."""
-    while argv:
-        if ASSIGNMENT.match(argv[0]):
+    """Look through `sudo -u ci`, `env VAR=x`, `timeout 5`, `do`, `if` to the real command."""
+    seen = 0
+    while argv and seen < 12:
+        seen += 1
+        head = argv[0]
+        if ASSIGNMENT.match(head):
             argv = argv[1:]
             continue
-        if program_name(argv[0]) in COMMAND_WRAPPERS:
+        name = program_name(head)
+        if name in SHELL_KEYWORDS and name not in COMMAND_WRAPPERS:
+            argv = argv[1:]
+            continue
+        if name in COMMAND_WRAPPERS:
+            takes_value = COMMAND_WRAPPERS[name]
             rest = argv[1:]
-            while rest and (rest[0].startswith("-") or ASSIGNMENT.match(rest[0])
-                            or re.fullmatch(r"[\d.]+[smhd]?", rest[0])):
-                rest = rest[1:]
+            while rest:
+                tok = rest[0]
+                if ASSIGNMENT.match(tok):
+                    rest = rest[1:]
+                elif tok.split("=", 1)[0] in takes_value and "=" not in tok:
+                    rest = rest[2:]          # the option and its separate value
+                elif tok.startswith("-"):
+                    rest = rest[1:]
+                elif re.fullmatch(r"[\d.]+[smhd]?", tok):
+                    rest = rest[1:]          # timeout 5, nice 10
+                else:
+                    break
             if not rest:
                 return []
             argv = rest
@@ -594,7 +744,7 @@ def strip_git_globals(rest: list[str]) -> list[str]:
     return rest[i:]
 
 
-def simple_commands(command: str) -> list[list[str]] | None:
+def simple_commands(command: str):
     """The line as a list of argv lists, or None if it cannot be parsed."""
     lex = shlex.shlex(command, posix=True, punctuation_chars=True)
     lex.whitespace_split = True
@@ -602,8 +752,7 @@ def simple_commands(command: str) -> list[list[str]] | None:
         tokens = list(lex)
     except ValueError:
         return None                     # an unbalanced quote: the caller matches raw
-    out: list[list[str]] = []
-    cur: list[str] = []
+    out, cur = [], []
     for tok in tokens:
         tok = tok.strip("`")
         if not tok:
@@ -620,7 +769,6 @@ def simple_commands(command: str) -> list[list[str]] | None:
 
 
 def rebuild(argv: list[str]) -> str:
-    argv = strip_wrappers(argv)
     if not argv:
         return ""
     if program_name(argv[0]) == "git":
@@ -628,47 +776,82 @@ def rebuild(argv: list[str]) -> str:
     else:
         argv = [program_name(argv[0])] + argv[1:]
     # An argument's own whitespace is data, never a boundary between words of a command.
-    # Collapsing it keeps a quoted sentence from reading as the command it describes.
+    # Collapsing it is what keeps a quoted sentence from reading as the command it describes,
+    # and it is why the rules do not also need anchoring to position 0.
     return " ".join(re.sub(r"\s+", ";", a) for a in argv)
 
 
 def command_units(command: str, depth: int = 0) -> list[tuple[str, bool]]:
-    """The line as (text, anchored) units to match rules against.
+    """The line as (text, parsed) units to match rules against.
 
-    `anchored` means the text begins at the command's program, so a rule is matched from
-    position 0 and cannot fire on a word that merely appears among the arguments.
+    `parsed` is False for a unit that is the raw line, kept whenever parsing could not be
+    trusted. Rules are matched across the whole of a unit, not anchored at its start: a
+    refused command reached through `find -exec`, `ssh host`, `git submodule foreach` or a
+    shell keyword sits in argument position and is still run.
     """
-    parsed = simple_commands(strip_heredocs(command))
+    body = strip_heredocs(command)
+    parsed = simple_commands(newlines_to_separators(body)) if body is not None else None
     if parsed is None:
         return [(command, False)]
-    units = [(rebuild(argv), True) for argv in parsed if argv]
-    units = [u for u in units if u[0]]
-    nested = False
+    units, nested, suspect = [], False, False
+    # An expansion is a word separator the shell has not performed yet: `git${IFS}stash` is
+    # one token here and two words to bash, and `{git,stash}` is a brace list that expands to
+    # a real command. Widen the line and parse it again -- it has to happen before lexing,
+    # because an argument's own whitespace is collapsed afterwards.
+    if depth < 3 and UNEXPANDED.search(command):
+        widened_line = widen_expansions(command)
+        if widened_line != command:
+            units += [u for u in command_units(widened_line, depth + 1) if u[1]]
     for argv in parsed:
-        if not argv or program_name(argv[0]) not in SHELL_INTERPRETERS:
+        if not argv:
             continue
-        nested = True
-        if depth >= 3:
-            continue
-        # `sh -c "<code>"` carries a command line in an argument. It is code, not data, so
-        # it is parsed in turn -- otherwise an interpreter is a hole straight through.
-        for arg in argv[1:]:
-            if not arg.startswith("-"):
-                units += command_units(arg, depth + 1)
-    if nested:
-        units.append((command, False))  # and the raw line too, for what parsing cannot see
+        if any(UNEXPANDED.search(t) for t in argv):
+            # The shell rewrites this before running it, so what we parsed is not what runs.
+            # `git${IFS}stash` is one token here and two words to bash, so offer the form
+            # with each expansion standing in for the separator it will become.
+            suspect = True
+        stripped = strip_wrappers(argv)
+        for form in ({tuple(argv), tuple(stripped)} if stripped else {tuple(argv)}):
+            text = rebuild(list(form))
+            if text:
+                units.append((text, True))
+        head = program_name(stripped[0]) if stripped else ""
+        if head in SHELL_INTERPRETERS:
+            nested = True
+            if depth < 3:
+                for arg in stripped[1:]:
+                    if not arg.startswith("-"):
+                        units += command_units(arg, depth + 1)
+        # `git rebase --exec '<cmd>'` and friends carry a command in an argument, exactly as
+        # `sh -c` does. The quoted token is code; parse it rather than reading it as text.
+        if depth < 3:
+            for n, arg in enumerate(stripped[:-1]):
+                if arg in ("--exec", "-exec", "--command") or arg.startswith("--exec="):
+                    code = arg.split("=", 1)[1] if "=" in arg else stripped[n + 1]
+                    nested = True
+                    units += command_units(code, depth + 1)
+    if nested or suspect:
+        units.append((command, False))
     return units or [(command, False)]
 
 
-def hit(units: list[tuple[str, bool]], pattern: str) -> str | None:
-    """The first unit this rule fires on, or None."""
-    for text, anchored in units:
+def hit(units, pattern: str, anchored: bool = False) -> str | None:
+    """The first unit this rule fires on, or None.
+
+    `anchored` is for the credential rules alone. They span from a reading verb to a filename
+    across arbitrary argument text, so they match from the start of a command: `cat` as the
+    program means a read, `cat` inside somebody's prose does not.
+    """
+    for text, is_parsed in units:
+        if anchored and not is_parsed:
+            continue
         if (re.match(pattern, text) if anchored else re.search(pattern, text)):
             return text
     return None
 
 
-def guard_problem(root: str, command: str, cfg: dict) -> str | None:
+
+def guard_problem(root: str, command: str, cfg: dict, record: bool = True) -> str | None:
     enforce = cfg.get("enforce") or {}
     units = command_units(command)
     groups = []
@@ -676,12 +859,13 @@ def guard_problem(root: str, command: str, cfg: dict) -> str | None:
         groups += DESTRUCTIVE + STAGING
     if enforce.get("blockPublishing", True):
         groups += PUBLISHING
-    if enforce.get("blockCredentialReads", True):
-        groups += CREDENTIALS
     for pattern, why in groups:
         if hit(units, pattern):
             return f"{why}."
     if enforce.get("blockCredentialReads", True):
+        for pattern, why in CREDENTIALS:
+            if hit(units, pattern, anchored=True):
+                return f"{why}."
         for pattern, why in SECRETS_IN_LINE:
             if re.search(pattern, command):
                 return f"{why}."
@@ -696,10 +880,13 @@ def guard_problem(root: str, command: str, cfg: dict) -> str | None:
     pushed = hit(units, r"\bgit\s+push\b") if enforce.get("pushToTrunkNeedsGate", True) else None
     if pushed:
         named = re.search(r"\bgit\s+push\b\s+\S+\s+\S", pushed)
-        targets_protected = bool(re.search(rf"\b({prot_re})\b", pushed)) or (
+        # --all and --mirror push every branch, including the trunk, and name none of them.
+        # --mirror also deletes remote refs that are absent locally.
+        sweeping = bool(re.search(r"\bgit\s+push\b[^\n]*--(all|mirror)\b", pushed))
+        targets_protected = sweeping or bool(re.search(rf"\b({prot_re})\b", pushed)) or (
             not named and re.fullmatch(rf"({prot_re})", cur or "") is not None)
         if targets_protected:
-            why = receipt_holds(root, "gate", "passed", max_age,
+            why = (receipt_holds if record else receipt_quiet)(root, "gate", "passed", max_age,
                                 why="pushing a protected branch")
             if why:
                 return (f"pushing a protected branch needs a passed gate receipt, and {why}.\n"
@@ -714,13 +901,13 @@ def guard_problem(root: str, command: str, cfg: dict) -> str | None:
             merging = bool(gm) and not re.search(r"--(abort|continue|quit)\b", gm) \
                 and re.fullmatch(rf"({prot_re})", cur or "") is not None
         if merging:
-            why = receipt_holds(root, "readiness", "ready", max_age, why="merging")
+            why = (receipt_holds if record else receipt_quiet)(root, "readiness", "ready", max_age, why="merging")
             if why:
                 return (f"merging needs a READY readiness receipt, and {why}.\n"
                         f"Run `/agentic-sdlc:readiness`. It runs the reviewers, the secret scan and "
                         f"the verify command, and checks every acceptance criterion against evidence.")
             if approvals.get("merge") == "human":
-                why = receipt_holds(root, "approval_merge", "granted", max_age,
+                why = (receipt_holds if record else receipt_quiet)(root, "approval_merge", "granted", max_age,
                                     why="merging")
                 if why:
                     return (f"this project requires a human to approve a merge, and {why}.\n"
@@ -730,7 +917,7 @@ def guard_problem(root: str, command: str, cfg: dict) -> str | None:
 
     # X7: a ceiling the agent cannot raise for itself. Checked last, so a destructive command
     # is still refused for the right reason when the budget also happens to be spent.
-    over = budget_problem(root, cfg)
+    over = budget_problem(root, cfg) if record else None
     if over:
         return over
 
@@ -738,13 +925,13 @@ def guard_problem(root: str, command: str, cfg: dict) -> str | None:
     deploying = any(hit(units, pat) for pat in DEPLOY_PATTERNS)
     if deploying:
         if approvals.get("release", "human") == "human":
-            why = receipt_holds(root, "approval_release", "granted", max_age,
+            why = (receipt_holds if record else receipt_quiet)(root, "approval_release", "granted", max_age,
                                 why="deploying")
             if why:
                 return (f"deploying needs a human approval, and {why}.\n"
                         f"A person runs:  sdlc approve release --as '<their name>'\n"
                         f"Deployment changes what users are running. No agent grants itself that.")
-        why = receipt_holds(root, "readiness", "ready", max_age, why="deploying")
+        why = (receipt_holds if record else receipt_quiet)(root, "readiness", "ready", max_age, why="deploying")
         if why:
             return f"deploying needs a READY readiness receipt, and {why}."
     return None
@@ -810,7 +997,7 @@ def guard_decide(root: str, command: str, cfg: dict) -> str | None:
         strict = dict(cfg)
         strict.pop("enforce", None)
         try:
-            would = guard_problem(root, command, strict)
+            would = guard_problem(root, command, strict, record=False)
         except Exception:
             would = None
         if would:
@@ -1706,7 +1893,14 @@ def budget_task_key(root: str, cfg: dict) -> str:
     """
     trunk = cfg.get("trunk") or detect_trunk(root) or "main"
     base = git("merge-base", trunk, "HEAD", cwd=root)
-    return base[:12] if base else (branch(root) or "default")
+    if base:
+        return base[:12]
+    # No merge base: a single-branch or shallow clone, unrelated history, or a trunk named
+    # differently from the config. Falling back to the branch name would restore exactly the
+    # key this function replaced, so fall back to the root commit, which a rename cannot
+    # move. An empty repository has neither, and gets one shared key.
+    root_commit = git("rev-list", "--max-parents=0", "HEAD", cwd=root).split("\n")[-1].strip()
+    return ("root-" + root_commit[:12]) if root_commit else "default"
 
 
 def budget_state(root: str) -> dict:
@@ -2053,19 +2247,24 @@ def config_loosenings(before: dict, after: dict) -> list:
             out.append((f"the {flag} refusal was switched off",
                         f"enforce.{flag}: true -> false"))
 
+    # protected defaults to ["main", "master"] in guard_problem, so dropping to ["main"]
+    # from an absent key loses master.
     for key, what in (("protected", "a branch is no longer protected"),
                       ("neverByAgent", "an action an agent may not take became allowed"),
                       ("reviewers", "a reviewer the gate fans out to was removed"),
                       ("concerns", "a concern's review standards no longer apply")):
-        b_list = before.get(key) if isinstance(before.get(key), list) else []
-        a_list = after.get(key) if isinstance(after.get(key), list) else []
+        fallback = ["main", "master"] if key == "protected" else []
+        b_list = before.get(key) if isinstance(before.get(key), list) else fallback
+        a_list = after.get(key) if isinstance(after.get(key), list) else fallback
         for gone in [x for x in b_list if x not in a_list]:
             out.append((what, f'{key} -= "{gone}"'))
 
     b_ap = before.get("approvals") if isinstance(before.get("approvals"), dict) else {}
     a_ap = after.get("approvals") if isinstance(after.get("approvals"), dict) else {}
-    for what in ("merge", "release"):
-        if b_ap.get(what) == "human" and a_ap.get(what, "agent") != "human":
+    # guard_problem reads approvals.get("merge") -- absent means agent -- and
+    # approvals.get("release", "human") -- absent means human. Mirror both exactly.
+    for what, default in (("merge", "agent"), ("release", "human")):
+        if b_ap.get(what, default) == "human" and a_ap.get(what, default) != "human":
             out.append((f"a human approval for {what} was downgraded to an agent's",
                         f'approvals.{what}: human -> {a_ap.get(what, "agent")}'))
 
@@ -2073,7 +2272,9 @@ def config_loosenings(before: dict, after: dict) -> list:
         before.get("receipts"), dict) else None
     a_age = (after.get("receipts") or {}).get("maxAgeMin") if isinstance(
         after.get("receipts"), dict) else None
-    if isinstance(b_age, int) and isinstance(a_age, int) and a_age > b_age:
+    b_age = b_age if isinstance(b_age, int) else DEFAULT_MAX_AGE_MIN
+    a_age = a_age if isinstance(a_age, int) else DEFAULT_MAX_AGE_MIN
+    if a_age > b_age:
         out.append(("receipts now stay valid for longer",
                     f"receipts.maxAgeMin: {b_age} -> {a_age}"))
 
@@ -2097,6 +2298,30 @@ def config_loosenings(before: dict, after: dict) -> list:
         out.append(("a path was newly exempted from the suite audit's "
                     "suppression-marker checks", f'suiteAudit.exclude += "{glob_added}"'))
 
+    # A gate is only as strong as the command it runs. Replacing verifyCmd with `true`
+    # weakens the pipeline more completely than any flag.
+    for key in ("verifyCmd", "gateCmd", "secretScan", "quality"):
+        b_v, a_v = before.get(key), after.get(key)
+        if key == "quality":
+            b_v = (before.get("quality") or {}).get("cmd") if isinstance(
+                before.get("quality"), dict) else None
+            a_v = (after.get("quality") or {}).get("cmd") if isinstance(
+                after.get("quality"), dict) else None
+            key = "quality.cmd"
+        if b_v and b_v != a_v:
+            out.append((f"{key} was weakened or removed", f"{key}: {b_v!r} -> {a_v!r}"))
+    b_cov = (before.get("quality") or {}).get("coverageNewPct") if isinstance(
+        before.get("quality"), dict) else None
+    a_cov = (after.get("quality") or {}).get("coverageNewPct") if isinstance(
+        after.get("quality"), dict) else None
+    if isinstance(b_cov, (int, float)) and (not isinstance(a_cov, (int, float))
+                                            or a_cov < b_cov):
+        out.append(("the new-code coverage floor was lowered or removed",
+                    f"quality.coverageNewPct: {b_cov} -> {a_cov}"))
+    if ((before.get("spec") or {}).get("strict") if isinstance(before.get("spec"), dict)
+            else None) and not ((after.get("spec") or {}).get("strict")
+                                if isinstance(after.get("spec"), dict) else None):
+        out.append(("specification validation is no longer strict", "spec.strict: true -> false"))
     if before.get("trunk") and after.get("trunk") != before.get("trunk"):
         out.append(("the trunk branch changed, which changes what is protected",
                     f'trunk: {before.get("trunk")} -> {after.get("trunk")}'))
