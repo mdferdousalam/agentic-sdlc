@@ -76,7 +76,7 @@ actually running it. Also the reverse — anything in the diff no requirement as
 **Exit:** a `verification` receipt and a report in which every requirement carries one of the
 five words. `unexecuted` is the honest answer for a test that was not run.
 
-## 6 · Review — `sdlc-code-reviewer`, `sdlc-security-reviewer`
+## 6 · Review — `sdlc-code-reviewer`, `sdlc-security-reviewer`, `sdlc-architecture-reviewer`
 
 Code review reads the diff against its specification, the project's standards and the profile.
 Security review covers authority, injection, untrusted input, secrets, dependencies, data

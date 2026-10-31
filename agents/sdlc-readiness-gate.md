@@ -56,12 +56,15 @@ Nothing merges without your READY. You do not fix anything; you verify, collect 
    project has no maintainability bar.
 
 6. **Reviewers.** Launch every agent named in `reviewers`, in one message so they run
-   concurrently, each scoped to the diff against the trunk. Always include
-   `sdlc-code-reviewer`; include `sdlc-security-reviewer` whenever the diff touches auth, input
-   parsing, dependencies, file or network I/O, or credentials; include
-   `sdlc-architecture-reviewer` when `concerns` includes `architecture` and the diff adds an
-   import, moves a module or introduces an abstraction. Name the reviewers you ran and the
-   ones you skipped, with the reason.
+   concurrently, each scoped to the diff against the trunk. `reviewers` is the authority on
+   who runs: do not add one this file happens to mention, and do not drop one because the
+   diff looks small. If the list is wrong for this project, say so and let a person change
+   the config — that is a decision about standards, not about this change.
+
+   Name every reviewer you ran and every one you skipped, with the reason, and record them
+   on the receipt: `sdlc receipt write readiness ... --reviewer <name>:<pass|fail|skipped>`.
+   A reviewer in the config with no verdict is a stage that did not happen, and the merge
+   gate reads the receipt for exactly that.
    Once steps 2 and 3 have both passed, record that much immediately — it is what a push to a
    protected branch needs, and it is true whatever the reviewers go on to find:
 

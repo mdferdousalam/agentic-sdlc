@@ -7,12 +7,19 @@ and — as a PreToolUse hook — refuses the actions that would skip a stage.
 
     sdlc init [--write]          detect the stack and write sdlc.config.json
     sdlc config                  print the effective configuration
-    sdlc receipt write KIND --verdict V [--subject S] [--detail D]
-    sdlc receipt check KIND [--verdict V] [--max-age-min N]
-    sdlc receipt show  KIND
+    sdlc doctor                  check the install, the config and the repo
     sdlc status                  where this unit of work stands
     sdlc guard                   PreToolUse hook: reads tool JSON on stdin, exit 2 blocks
-    sdlc doctor                  check the install, the config and the repo
+    sdlc install | uninstall     set this pipeline up for a host, or remove it
+    sdlc receipt write|check|show KIND      a stage's verdict, bound to a commit and a clock
+    sdlc finding write|list|show|close      a defect as a record, not as prose
+    sdlc baseline capture|compare|show      what verifyCmd said before the work began
+    sdlc tests audit             what in this diff makes the gate easier to pass
+    sdlc budget show|reset       the ceiling an agent cannot raise for itself
+    sdlc checkpoint write|resume|show       long work, and whether resuming is still safe
+    sdlc approve merge|release|exception    a named person accepting accountability
+    sdlc trace | metrics         the audit trail, and what the pipeline actually did
+    sdlc feedback                a failed attempt, so the next one carries the context
 
 Python 3.8+, standard library only, no network. Exit codes: 0 fine, 1 a check failed,
 2 blocked (the hook contract), 3 misuse.
@@ -42,6 +49,7 @@ RECEIPT_KINDS = ("spec", "impact", "verification", "review", "security", "qualit
 AUDIT_LOG = ".sdlc/audit.log"
 FEEDBACK = ".sdlc/feedback.json"
 DEFAULT_MAX_AGE_MIN = 180
+DOCS_BASE_URL = "https://github.com/mdferdousalam/agentic-sdlc/blob/main/docs/"
 RECEIPT_SKEW_MIN = 2        # clock skew between a CI runner and a laptop, no more
 FINDING_DIR = ".sdlc/findings"
 BASELINE = ".sdlc/baseline.json"
@@ -295,6 +303,7 @@ def detect(root: str) -> dict:
                    else "trufflehog git file://. --since-commit HEAD~50 --fail" if which("trufflehog")
                    else None)
 
+    concerns = suggest_concerns(root)
     cfg = {
         "$schema": "./schema/sdlc.config.schema.json",
         "version": 2,
@@ -315,7 +324,7 @@ def detect(root: str) -> dict:
         "secretScan": secret_scan,
         "heavy": None,
         "profile": None,
-        "concerns": suggest_concerns(root),
+        "concerns": concerns,
         "quality": {
             "cmd": None,
             "coverageNewPct": None,
@@ -331,7 +340,13 @@ def detect(root: str) -> dict:
         },
         "approvals": {"merge": "agent", "release": "human"},
         "attributeCommits": True,
-        "reviewers": ["sdlc-code-reviewer"] + (["sdlc-security-reviewer"] if stack in ("rust", "go", "node", "python", "java") else []),
+        # Seeded from what was detected, because `reviewers` is the single authority on
+        # who the gate fans out to — a list that never mentions the architecture reviewer
+        # means a prompt has to, and then two authorities disagree.
+        "reviewers": (["sdlc-code-reviewer"]
+                      + (["sdlc-security-reviewer"]
+                         if stack in ("rust", "go", "node", "python", "java") else [])
+                      + (["sdlc-architecture-reviewer"] if "architecture" in concerns else [])),
         "protected": ["main", "master", "release/*"],
         "receipts": {"maxAgeMin": DEFAULT_MAX_AGE_MIN},
         "enforce": {
@@ -1497,6 +1512,12 @@ def rules_body(cfg: dict) -> str:
     """The pipeline's rules, plus this project's bindings. One source: docs/rules.md."""
     rules = read_plugin("docs", "rules.md")
     rules = re.sub(r"^# .*\n+", "", rules, count=1)  # the host file supplies the title
+    # rules.md links its neighbours relatively. `install` places this text into a host's own
+    # rules file and never places those neighbours beside it, so every such link resolved to
+    # nothing — including the one to the normative control specification. Point them at the
+    # repository, which is reachable from wherever this lands.
+    rules = re.sub(r"\]\((?!https?://)([\w./-]+\.md)\)",
+                   lambda m: "](" + DOCS_BASE_URL + os.path.basename(m.group(1)) + ")", rules)
     lines = ["## The agentic SDLC pipeline", "",
              "This project uses the agentic-sdlc pipeline. Work moves through stages, each owned",
              "by one agent and closed by a receipt bound to a commit. Do not skip a stage: on some",
@@ -1512,6 +1533,12 @@ def rules_body(cfg: dict) -> str:
         lines.append(f"- specifications: {spec.get('engine', 'prd-frd')} in `{spec.get('docsRoot', 'docs/specs')}`")
         if cfg.get("profile"):
             lines.append(f"- profile: `{cfg['profile']}` — its standards apply to reviews")
+        if cfg.get("concerns"):
+            lines.append("- concerns: " + ", ".join(f"`{c}`" for c in cfg["concerns"])
+                         + " — cross-cutting standards, and they win over the profile")
+        if cfg.get("reviewers"):
+            lines.append("- reviewers: " + ", ".join(f"`{r}`" for r in cfg["reviewers"])
+                         + " — the gate fans out to these and no others")
         if cfg.get("heavy"):
             lines.append(f"- heavy work: {cfg['heavy']}")
         lines.append("")

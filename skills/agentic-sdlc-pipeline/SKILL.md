@@ -21,7 +21,7 @@ Read `${CLAUDE_PLUGIN_ROOT}/docs/rules.md` before running any stage. Read the pr
 | 3b | Impact | `/agentic-sdlc:impact` | `sdlc-impact-analyst` | who depends on this, and in what order |
 | 4 | Implement | `/agentic-sdlc:implement` | `sdlc-implementer` | code and tests |
 | 5 | Verify | `/agentic-sdlc:verify` | `sdlc-verifier` | `verification` receipt |
-| 6 | Review | `/agentic-sdlc:review` | `sdlc-code-reviewer`, `sdlc-security-reviewer` | `review`, `security` receipts |
+| 6 | Review | `/agentic-sdlc:review` | `sdlc-code-reviewer`, `sdlc-security-reviewer`, `sdlc-architecture-reviewer` | `review`, `security` receipts |
 | 7a | Mechanical gate | `/agentic-sdlc:gate` | — | `gate` receipt |
 | 7b | Readiness | `/agentic-sdlc:readiness` | `sdlc-readiness-gate` | `readiness` receipt |
 | 8 | Land | `/agentic-sdlc:land` | `sdlc-lander` | branch pushed, pull request |
