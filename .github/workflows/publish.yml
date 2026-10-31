@@ -20,17 +20,43 @@
 
 name: Publish
 
+# The release event is the only trigger, deliberately. `workflow_dispatch` was here for a
+# moment as a convenience — re-run the publish if a release went out before the trusted
+# publisher existed — and it was a hole: a dispatch carries no release tag, so the version
+# check below was guarded by `if: github.event_name == 'release'` and skipped on that path.
+# `gh workflow run publish.yml --ref <anything>` would then publish whatever version that ref
+# happened to carry, under the trusted-publisher identity, unchecked.
+#
+# A failed run is re-run from the Actions UI instead, which replays the original release
+# event with its tag intact. The convenience is not worth a second way in.
 on:
   release:
     types: [published]
-  workflow_dispatch:          # a re-run, if a release published before the setup existed
 
 permissions:
   contents: read
 
 jobs:
+  # The gate runs in its own job, with no id-token. It fetches markdownlint from the network,
+  # and a job that downloads anything has no business holding a credential that can publish.
+  # Splitting costs one runner and removes the whole class of problem.
+  gate:
+    name: The mechanical gate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - run: python3 tests/test_sdlc.py
+      - run: node .github/scripts/validate-plugin.mjs
+      - run: npx --yes markdownlint-cli2@0.24.0
+
   npm:
     name: npm
+    needs: gate               # no gate, no publish
     runs-on: ubuntu-latest    # trusted publishing does not support self-hosted runners
     permissions:
       contents: read
@@ -55,8 +81,9 @@ jobs:
             if (!ok) { console.error("npm >= 11.5.1 required for trusted publishing"); process.exit(1); }
           ' "$have"
 
+      # No `if:` on this step. It guarded the check to the release event, which is precisely
+      # how the dispatch path published unchecked. There is now one trigger and one check.
       - name: the release tag and package.json must agree
-        if: github.event_name == 'release'
         run: |
           tag="${GITHUB_REF_NAME#v}"
           pkg=$(node -p "require('./package.json').version")
@@ -65,12 +92,6 @@ jobs:
             echo "::error::release tag v$tag does not match package.json $pkg"
             exit 1
           fi
-
-      - name: the mechanical gate, re-run here rather than trusted
-        run: |
-          python3 tests/test_sdlc.py
-          node .github/scripts/validate-plugin.mjs
-          npx --yes markdownlint-cli2
 
       - name: publish
         # No --provenance: publishing through a trusted publisher attaches provenance

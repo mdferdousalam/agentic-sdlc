@@ -120,6 +120,23 @@ for cmd in ["git tag v1.0", "npm publish", "cargo publish", "gh release create v
     ok(guard(d, cmd).returncode == 2, f"blocked: {cmd}")
 ok(guard(d, "git tag --list").returncode == 0, "allowed: git tag --list")
 
+# A workflow run and the two API routes are remote publish entry points. They were allowed
+# because the only pattern that reached them decided from the words on the line, and
+# `publish.yml` carries none of them.
+for cmd in ["gh workflow run publish.yml --ref feat/x", "gh workflow run Publish",
+            "gh api -X POST /repos/o/r/actions/workflows/publish.yml/dispatches -f ref=main",
+            "gh api -X POST /repos/o/r/releases -f tag_name=v1",
+            "gh api /repos/o/r/releases -X POST -f tag_name=v1",
+            "gh api --method POST /repos/o/r/releases --field tag_name=v1",
+            "sudo gh workflow run publish.yml"]:
+    ok(guard(d, cmd).returncode == 2, f"blocked: {cmd}")
+# `gh api` defaults to GET, and reading is not publishing. A method or field flag is what
+# makes it a write; without one these must stay allowed.
+for cmd in ["gh api /repos/o/r/releases", "gh api /repos/o/r/releases/latest",
+            "gh api /repos/o/r/actions/workflows", "gh release list",
+            "gh run list --workflow publish.yml", "gh workflow view publish.yml"]:
+    ok(guard(d, cmd).returncode == 0, f"allowed, it only reads: {cmd}")
+
 print("guard: credentials")
 for cmd in ["cat .env", "cp ~/.ssh/id_rsa /tmp/x", "head -2 .env.production"]:
     ok(guard(d, cmd).returncode == 2, f"blocked: {cmd}")

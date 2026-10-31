@@ -426,6 +426,16 @@ PUBLISHING = [
     (r"\bcargo\s+publish\b", "publishing is the maintainer's call"),
     (r"\b(twine|poetry)\s+(upload|publish)\b", "publishing is the maintainer's call"),
     (r"\bgh\s+release\s+(create|edit|delete|upload)\b", "cutting a release is the maintainer's call"),
+    # A workflow run is a remote publish entry point. Refused by name rather than by keyword:
+    # the deploy patterns below decide from the words on the line, and `publish.yml` carries
+    # none of them, so a publishing workflow read as an ordinary command.
+    (r"\bgh\s+workflow\s+run\b", "running a workflow can publish or deploy — the maintainer's call"),
+    # The same two routes through the API. Write-shaped only: `gh api` defaults to GET, and
+    # listing releases is a read. A method flag or a field flag is what makes it a write.
+    (r"\bgh\s+api\b(?=[^\n]*\b(releases|dispatches)\b)"
+     r"(?=[^\n]*(-X\s*(POST|PUT|PATCH|DELETE)|--method[\s=]*(POST|PUT|PATCH|DELETE)|"
+     r"(\s|^)(-f|-F)\s|--field|--raw-field))",
+     "creating a release or dispatching a workflow through the API is the maintainer's call"),
     (r"\bdocker\s+push\b", "pushing an image is a deploy — the maintainer's call"),
 ]
 STAGING = [
