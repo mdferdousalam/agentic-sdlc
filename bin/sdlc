@@ -1691,12 +1691,44 @@ def budget_config(cfg: dict) -> dict:
     return b
 
 
+def budget_task_key(root: str, cfg: dict) -> str:
+    """What counts as one task, chosen so an agent cannot mint itself a fresh budget.
+
+    This was the branch name, and a branch name is the agent's to pick: with the ceiling
+    spent, `git checkout -b other` made the next call allowed, and coming back read a counter
+    of 2 — the state file had been overwritten rather than kept. A detached HEAD did the same,
+    because branch() returns the literal "HEAD".
+
+    The merge base against the trunk does not move when a branch is renamed, when another
+    branch is cut from the same point, or as the work commits. Starting genuinely new work
+    usually moves it, because the trunk has advanced; when it has not, `sdlc budget reset`
+    is the route, and it records who accepted the cost.
+    """
+    trunk = cfg.get("trunk") or detect_trunk(root) or "main"
+    base = git("merge-base", trunk, "HEAD", cwd=root)
+    return base[:12] if base else (branch(root) or "default")
+
+
 def budget_state(root: str) -> dict:
+    """Every task's counters, never overwritten by the arrival of a new one."""
     try:
-        return json.load(open(os.path.join(root, BUDGET)))
+        raw = json.load(open(os.path.join(root, BUDGET)))
     except Exception:
-        return {"toolCalls": 0, "startedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "task": branch(root)}
+        return {"tasks": {}}
+    if not isinstance(raw, dict):
+        return {"tasks": {}}
+    if isinstance(raw.get("tasks"), dict):
+        return raw
+    if "toolCalls" in raw:          # the single-task shape this replaced
+        return {"tasks": {str(raw.get("task") or "default"): raw}}
+    return {"tasks": {}}
+
+
+def budget_task(root: str, cfg: dict) -> dict:
+    """This task's counters, as they stand. Does not count a call."""
+    st = budget_state(root)
+    return (st.get("tasks") or {}).get(budget_task_key(root, cfg)) or {
+        "toolCalls": 0, "startedAt": None, "task": budget_task_key(root, cfg)}
 
 
 def budget_save(root: str, st: dict) -> None:
@@ -1714,12 +1746,19 @@ def budget_problem(root: str, cfg: dict) -> str | None:
     b = budget_config(cfg)
     if not (b.get("maxToolCalls") or b.get("maxWallClockMin")):
         return None
-    st = budget_state(root)
-    if st.get("task") != branch(root):  # a new branch is a new task
+    key = budget_task_key(root, cfg)
+    all_st = budget_state(root)
+    tasks = all_st.setdefault("tasks", {})
+    st = tasks.get(key)
+    if st is None:
         st = {"toolCalls": 0, "startedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-              "task": branch(root)}
+              "task": key}
+        tasks[key] = st
+        # A budget that silently starts over is the thing this finding was about.
+        audit(root, "budget.task-started", f"{key} on {branch(root)}")
     st["toolCalls"] = st.get("toolCalls", 0) + 1
-    budget_save(root, st)
+    st["branch"] = branch(root)
+    budget_save(root, all_st)
 
     warn_only = (b.get("stopPolicy") or "refuse") == "warn"
     limit = int(b.get("maxToolCalls") or 0)
@@ -1750,7 +1789,7 @@ def budget_problem(root: str, cfg: dict) -> str | None:
 def cmd_budget(args) -> int:
     root = repo_root()
     cfg = load_config(root)
-    b, st = budget_config(cfg), budget_state(root)
+    b, st = budget_config(cfg), budget_task(root, cfg)
     if args.budget_action == "reset":
         if not args.as_person:
             print("sdlc budget reset needs --as '<your name>'.\n"
@@ -1759,9 +1798,14 @@ def cmd_budget(args) -> int:
                   "`sdlc approve` does, and an agent must not run it on a person's behalf.",
                   file=sys.stderr)
             return 3
-        budget_save(root, {"toolCalls": 0, "task": branch(root),
-                           "startedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
-        audit(root, "budget.reset", f"by {args.as_person}")
+        key = budget_task_key(root, cfg)
+        all_st = budget_state(root)
+        spent = ((all_st.get("tasks") or {}).get(key) or {}).get("toolCalls", 0)
+        all_st.setdefault("tasks", {})[key] = {
+            "toolCalls": 0, "task": key, "branch": branch(root),
+            "startedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        budget_save(root, all_st)
+        audit(root, "budget.reset", f"task {key} at {spent} tool calls, by {args.as_person}")
         print(f"budget reset for this task by {args.as_person}")
         return 0
     spent_min = ""
@@ -2558,6 +2602,28 @@ def finding_problems(rec: dict) -> list:
     return out
 
 
+FINDING_ID_RE = re.compile(r"^F-[0-9a-f]{8}$")
+
+
+def finding_file(root: str, fid: str) -> str | None:
+    """The path for a finding id, or None if the id is not one.
+
+    `os.path.join(root, FINDING_DIR, fid + ".json")` took whatever it was given: an id of
+    `../../../elsewhere/victim` read a file outside the repository, and `close` rewrote it.
+    An absolute path worked too, because join discards everything before one. The id is a
+    content hash with a fixed shape, so checking the shape costs nothing — and the resolved
+    path is confirmed to be inside the findings directory regardless, because a shape check
+    alone is the kind of thing a later edit quietly loosens.
+    """
+    if not isinstance(fid, str) or not FINDING_ID_RE.match(fid):
+        return None
+    base = os.path.realpath(os.path.join(root, FINDING_DIR))
+    p = os.path.realpath(os.path.join(base, fid + ".json"))
+    if p != os.path.join(base, fid + ".json"):
+        return None
+    return p
+
+
 def finding_load_all(root: str) -> list:
     d = os.path.join(root, FINDING_DIR)
     if not os.path.isdir(d):
@@ -2696,16 +2762,16 @@ def cmd_finding(args) -> int:
         return 0
 
     if args.finding_action == "show":
-        p = os.path.join(root, FINDING_DIR, args.id + ".json")
-        if not os.path.exists(p):
+        p = finding_file(root, args.id)
+        if p is None or not os.path.exists(p):
             print(f"no finding {args.id}", file=sys.stderr)
             return 1
         print(open(p).read().rstrip())
         return 0
 
     # close
-    p = os.path.join(root, FINDING_DIR, args.id + ".json")
-    if not os.path.exists(p):
+    p = finding_file(root, args.id)
+    if p is None or not os.path.exists(p):
         print(f"no finding {args.id}", file=sys.stderr)
         return 1
     if args.outcome not in FINDING_OUTCOMES or args.outcome == "open":

@@ -480,6 +480,27 @@ fwrite()
 ok(len(os.listdir(os.path.join(df, ".sdlc/findings"))) == before,
    "the same finding raised twice stays one finding")
 
+print("findings: an id is an id, not a path")
+# The id was joined into a path unvalidated, so `show` read and `close` rewrote any json file
+# on the machine — `../../../victimdir/victim`, or an absolute path, because join discards
+# everything before one.
+dtrav = newrepo(config={"version": 2, "trunk": "main"})
+os.makedirs(os.path.join(dtrav, ".sdlc", "findings"), exist_ok=True)
+victim = os.path.join(dtrav, "..", "victim-of-traversal.json")
+VICTIM = '{"secret": "do not touch"}'
+open(victim, "w").write(VICTIM)
+for bad_id in ["../../victim-of-traversal", "../victim-of-traversal",
+               os.path.join(dtrav, "..", "victim-of-traversal"),
+               "F-deadbeef/../../../victim-of-traversal", "F-DEADBEEF", "F-dead",
+               "F-xyz12345"]:
+    rs = run(["finding", "show", bad_id], dtrav)
+    ok(rs.returncode == 1 and "do not touch" not in rs.stdout, f"show refuses {bad_id!r}")
+    ok(run(["finding", "close", bad_id, "--outcome", "fixed", "--by", "x"],
+           dtrav).returncode == 1, f"close refuses {bad_id!r}")
+ok(open(victim).read() == VICTIM, "and the file outside the repository is untouched")
+os.remove(victim)
+shutil.rmtree(dtrav)
+
 print("findings: the repair policy is a table, not a vibe")
 POLICY = [
     # severity,   confidence, repro, may an agent fix it unattended?
@@ -963,6 +984,31 @@ run(["budget", "reset", "--as", "a person"], dbg)
 ok(guard(dbg, "git status").returncode == 0, "a named person can reset it")
 ok("by a person" in open(os.path.join(dbg, ".sdlc/audit.log")).read(),
    "and the audit log says who accepted the extra cost")
+
+# The ceiling was keyed on the branch name, which is the agent's to pick: with the budget
+# spent, `git checkout -b other` made the next call allowed and overwrote the counter. It is
+# keyed on the merge base now, which a rename does not move.
+dbr = newrepo(config={"trunk": "main", "spec": {"engine": "prd-frd"},
+                      "budget": {"maxToolCalls": 3}})
+for _ in range(4):
+    guard(dbr, "git status")
+ok(guard(dbr, "git status").returncode == 2, "the ceiling is reached")
+for what, args_ in [("a new branch", ["checkout", "-q", "-b", "other"]),
+                    ("another new branch", ["checkout", "-q", "-b", "and-another"]),
+                    ("a branch rename", ["branch", "-m", "renamed"]),
+                    ("a detached HEAD", ["checkout", "-q", "--detach"]),
+                    ("coming back to the trunk", ["checkout", "-q", "main"])]:
+    subprocess.run(["git"] + args_, cwd=dbr, capture_output=True)
+    ok(guard(dbr, "git status").returncode == 2, f"the ceiling survives {what}")
+ok("budget.task-started" in open(os.path.join(dbr, ".sdlc/audit.log")).read(),
+   "and a task beginning its own budget is recorded")
+# Genuinely new work, from a trunk that has moved on, does get its own ceiling.
+subprocess.run(["git", "checkout", "-q", "main"], cwd=dbr, capture_output=True)
+open(os.path.join(dbr, "next.txt"), "w").write("x\n")
+subprocess.run(["git", "add", "next.txt"], cwd=dbr)
+subprocess.run(["git", "commit", "-qm", "trunk moves on"], cwd=dbr)
+ok(guard(dbr, "git status").returncode == 0, "work from a new trunk point gets its own budget")
+shutil.rmtree(dbr)
 
 dnb = newrepo(config={"trunk": "main", "spec": {"engine": "prd-frd"}})
 for _ in range(12):
