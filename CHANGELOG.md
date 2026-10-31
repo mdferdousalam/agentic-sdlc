@@ -9,7 +9,7 @@ A security release. Every finding below was found by this pipeline's own readine
 against 3.0.0, which returned NOT-READY. Five were critical. 3.0.0 is published and
 bypassable; upgrade.
 
-The test suite goes from 248 assertions to 341. Each fix carries the reproduction that
+The test suite goes from 248 assertions to 526. Each fix carries the reproduction that
 produced it, as a test.
 
 ### Fixed — the refusal path
@@ -157,7 +157,50 @@ through the rest of what the gate had raised against 3.0.0.
   re-parsing prose, the finding schema has a consumer in CI, secrets are redacted from the
   audit log, and the four GitHub Actions are pinned to commit SHAs.
 
-All 64 findings raised against this branch are closed. The test suite is 431 assertions, up
+### Fixed — rounds three to seven, and what they say about this control
+
+The parser above was rewritten six times. Rounds one, three, five and seven each introduced
+or left a bypass class that only an independent review found; the author's own probes passed
+every time, because they test the shapes the author is already thinking about. That record is
+kept here rather than summarised away, because it is the honest description of what a
+string-matching guard over shell can promise.
+
+- **A substitution inside double quotes still runs.** The critical of the fifth review, and
+  the fix for a false positive created it. Widening had been taught to leave quoted
+  expansions alone — correctly, since a quoted expansion is one word — but "not widened" was
+  then read as "nothing to look at", so `git commit -m "$(git push --force origin main)"`
+  exited 0. Substitution bodies are now parsed wherever the shell executes them, unquoted and
+  inside double quotes alike, separately from widening, which is only about word boundaries.
+  Single quotes and a backslash-escaped dollar or backtick stay inert, which is what keeps a
+  literal mention in a commit message allowed.
+- **A bound that returns one constant is not a bound.** Past 2000 untracked files the tree
+  digest returned the same string for every possible content, so the cap became the bypass.
+  Names are always hashed; content is hashed until the bounds are reached.
+- **A finding that vanishes is not a finding that was closed.** Corrupting one already read
+  as blocking; deleting one did not, because an absent file looks like a finding that never
+  existed. The readiness receipt records the ids open when the verdict was given and a merge
+  is refused when one of them is gone. Closing a critical or high as refused or deferred now
+  needs `--detail`.
+- **Who reads a heredoc body decides whether it is data — and that list was the wrong way
+  round.** The parser named the programs that *run* a body. `python3 - <<X`, `at now <<X` and
+  `make -f - <<X` were each missing from it, and each executed a body the parser had
+  discarded. The allowlist is inverted: consumers that write a body down are named, and every
+  other consumer has its body parsed and matched raw, because a body fed to `python3` or
+  `awk` is code in a language shell parsing cannot see inside.
+- **An operand another interpreter executes is code, whoever the program is.** A seventh
+  review found ten more: `git config alias.x '!…'`, `gh alias set x '!…'`, `less '+!…'`,
+  `vi '+!…'`, `sqlite3 '.shell …'`, `sed -n '1e …'` and a pipe into `at`. Rather than add
+  seven program names, the *shapes* are matched — a `!` operand is the shell escape by
+  convention across git aliases, pagers, editors and SQL clients; `.shell` and `.system` are
+  dot-commands; `sed`'s `e` command and `s///e` flag run what they read; and a pipe into a
+  runner that takes its command from stdin makes the whole line code, exactly as a pipe into
+  a shell already did.
+- **The credential rule** missed several real reads: the PostgreSQL password file, the
+  process environment under `/proc`, gh's stored hosts file, git's credential store, a bare
+  `printenv`, `gh auth token`, reading a dotenv file out of git with `git show`, and a glob
+  standing in for the name. Using `env` to set a variable before a command is untouched.
+
+All 77 findings raised against this branch are closed. The test suite is 526 assertions, up
 from 248 at 3.0.0.
 
 ### Known, and not fixed here
@@ -171,6 +214,16 @@ from 248 at 3.0.0.
   up to a pass.
 - Precision and recall are still unmeasured. That needs a seeded-defect corpus;
   `docs/maturity.md` says how.
+- **`COMMAND_RUNNERS` and `CODE_OPTIONS` are still denylists.** Heredoc consumers and the
+  shell-escape operand shapes were inverted in this release; those two were not. The next
+  program missing from either is the next finding, and it is named here rather than left to
+  be discovered.
+- **Three routes are outside what this control can see, by construction, and are not
+  defects to be filed again.** Writing a command into a file and then running that file;
+  storing an alias for later without invoking it (`gh alias set`); and anything an
+  interpreter assembles at runtime. A guard that reads the command line cannot read a
+  command that is not on it. The protected-branch and receipt gates, which do not depend on
+  text matching, are what stand behind it.
 
 ## [3.0.0] — 2026-10-25
 

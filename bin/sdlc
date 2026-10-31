@@ -786,6 +786,27 @@ COMMAND_RUNNERS = {"ssh", "su", "doas", "flock", "watch", "parallel", "script", 
                    "rsh", "telnet", "expect", "screen", "tmux", "at", "batch", "awk", "gawk",
                    "mawk", "xargs", "entr", "systemd-run", "runuser", "setpriv", "lldb",
                    "gdb", "man", "git-submodule", "make", "ninja", "just", "task"}
+# Runners that take the command to run from stdin, so a pipe into one makes everything
+# upstream of it code. `echo "git stash" | at now` runs it; `| sh` was already caught
+# because a shell is an interpreter, and these are the same shape without the name.
+STDIN_RUNNERS = {"at", "batch", "xargs", "parallel", "entr", "expect", "script"}
+PIPE_INTO_RUNNER = re.compile(
+    r"\|\s*(?:sudo\s+|command\s+|env\s+\S+=\S+\s+)*(?:\S*/)?(%s)\b" % "|".join(
+        sorted(STDIN_RUNNERS)))
+# `!` in operand position is the shell escape, and it is a convention rather than one
+# program's flag: a git or gh alias beginning with it, `less +!cmd`, `vi +!cmd`, `psql \!cmd`.
+# Matching the shape rather than naming the programs is the point — the list of programs that
+# honour it cannot be kept complete, and three of them were missing when this was written.
+BANG_ESCAPE = re.compile(r"^[+\\]!\s*(\S.*)$", re.S)
+BANG_ALIAS = re.compile(r"^!\s*(\S.*\s.*)$", re.S)
+BANG_ALIAS_PROGS = {"git", "gh", "hub"}
+# sqlite3 and duckdb run a dot-command operand; `.shell` and `.system` are a shell.
+DOT_SHELL = re.compile(r"^\s*\.(?:shell|system|once\s+\||excel)\s+(\S.*)$", re.S)
+# sed's `e` runs the rest of the line as a command, and the `s///e` flag runs what it
+# substituted. `-e` already reads its value as code; a bare script operand did not.
+SED_PROGS = {"sed", "gsed", "ssed"}
+SED_EXEC = re.compile(r"(?:(?:^|[;{\n])\s*[0-9,$~+!]*\s*|/(?:\\.|[^/])*/\s*)e\s+\S"
+                      r"|s(.)(?:\\.|(?!\1).)*\1(?:\\.|(?!\1).)*\1[a-zA-Z0-9]*e", re.S)
 SHELL_OPERATORS = {";", "&&", "||", "|", "|&", "&", "(", ")", "{", "}", "<", ">", ">>", "<<",
                    "<<<"}
 ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=", re.S)
@@ -1117,6 +1138,10 @@ def command_units(command: str, depth: int = 0) -> list[tuple[str, bool]]:
     if depth < 3:
         for sub in code_substitutions(command):
             units += [u for u in command_units(sub, depth + 1) if u[1]]
+    # A runner that reads its command from stdin makes the whole line code, the same way a
+    # shell does. Nothing downstream of the pipe can be read from the upstream argv.
+    if PIPE_INTO_RUNNER.search(command):
+        suspect = True
     widened_line = widen_expansions(command) if UNEXPANDED.search(command) else command
     if widened_line != command:
         # An expansion outside quotes is a word separator the shell has not performed yet.
@@ -1160,6 +1185,15 @@ def command_units(command: str, depth: int = 0) -> list[tuple[str, bool]]:
                 elif (prog == "git" and " " in arg and not arg.startswith("-")
                       and any(v in form for v in ("foreach", "bisect", "filter-branch"))):
                     code = arg          # git subcommands that run a shell command
+                elif BANG_ESCAPE.match(arg):
+                    code = BANG_ESCAPE.match(arg).group(1)
+                elif prog in BANG_ALIAS_PROGS and BANG_ALIAS.match(arg):
+                    code = BANG_ALIAS.match(arg).group(1)
+                elif DOT_SHELL.match(arg):
+                    code = DOT_SHELL.match(arg).group(1)
+                elif (prog in SED_PROGS and n and not arg.startswith("-")
+                      and SED_EXEC.search(arg)):
+                    code = arg
                 elif prog == "git" and name == "-c":
                     val = (arg.split("=", 1)[1] if "=" in arg
                            else (form[n + 1] if n + 1 < len(form) else "")) or ""

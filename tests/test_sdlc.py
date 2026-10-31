@@ -192,6 +192,22 @@ for _c, _want in [("cat <<'MD'\nprose\nMD\ngit stash", 2),
     ok(guard(d, _c).returncode == _want,
        ("blocked" if _want else "allowed") + f" after the ordering change: {_c!r}")
 
+print("guard: an operand another interpreter executes is code, whoever the program is")
+# A `!` operand is the shell escape by convention, not by one program's flag, and the list
+# of programs honouring it cannot be kept complete. The shape is matched instead.
+for cmd in ["git config alias.x '!git stash'", "gh alias set x '!git stash'",
+            "less '+!git stash'", "vi '+!git stash' f", "more '+!git stash'",
+            "sqlite3 :memory: '.shell git stash'", "duckdb -c '.system git stash'",
+            "sed -n '1e git stash' f", "sed '/x/e git stash' f",
+            'echo "git stash" | at now']:
+    ok(guard(d, cmd).returncode == 2, f"blocked: {cmd!r}")
+# and the ordinary uses of every one of those programs still run
+for cmd in ["git config alias.co checkout", "gh alias set co 'pr checkout'",
+            "less +G log.txt", "vim +42 src/main.rs", "echo '!important'",
+            "sqlite3 db '.tables'", "sed -n 's/foo/bar/p' f", "sed '1,5d' f",
+            "ls | xargs rm -f", "find . -newer x | entr make test"]:
+    ok(guard(d, cmd).returncode == 0, f"allowed: {cmd!r}")
+
 print("guard: who reads a heredoc body decides whether it is data")
 # The list of consumers that RUN a body cannot be kept complete — `python3 - <<X`,
 # `at now <<X` and `make -f - <<X` were each missing from it. The allowlist is inverted:
