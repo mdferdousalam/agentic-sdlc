@@ -71,11 +71,23 @@ AUTOFIX = {
 
 
 def git(*args: str, cwd: str | None = None) -> str:
+    """git's stdout, or "" when it failed. Ambiguous on purpose only where "" is also a
+    valid answer; where it is not, use `git_ok`."""
+    return git_ok(*args, cwd=cwd)[1]
+
+
+def git_ok(*args: str, cwd: str | None = None):
+    """(succeeded, stdout). For the callers where "" is a real answer and a failure is not.
+
+    `tree_clean` compared `git status --porcelain` to "" — so git failing to run at all read
+    as a clean tree, and the receipt check that depends on it passed. Any question whose
+    "no output" answer means "nothing is wrong" has to know the difference.
+    """
     try:
         p = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=20)
-        return p.stdout.strip()
+        return p.returncode == 0, p.stdout.strip()
     except Exception:
-        return ""
+        return False, ""
 
 
 def repo_root(start: str | None = None) -> str:
@@ -92,7 +104,8 @@ def branch(root: str) -> str:
 
 
 def tree_clean(root: str) -> bool:
-    return git("status", "--porcelain", "--untracked-files=no", cwd=root) == ""
+    ok, out = git_ok("status", "--porcelain", "--untracked-files=no", cwd=root)
+    return ok and out == ""      # git failing is not a clean tree
 
 
 def tree_digest(root: str) -> str:
@@ -108,7 +121,11 @@ def tree_digest(root: str) -> str:
     `.sdlc/` is excluded by path rather than by switching the whole untracked class off,
     because the receipts and findings written during a stage are not the subject of it.
     """
-    out = git("status", "--porcelain", "--untracked-files=normal", cwd=root)
+    ok, out = git_ok("status", "--porcelain", "--untracked-files=normal", cwd=root)
+    if not ok:
+        # A digest nothing can match, so the receipt stops holding rather than the check
+        # quietly succeeding against an answer git never gave.
+        return "unreadable-working-tree"
     lines = sorted(l for l in out.split("\n")
                    if l.strip() and ".sdlc/" not in l and not l.endswith(".sdlc"))
     # The status list alone records only that a file is modified, so a second edit to an
@@ -336,21 +353,59 @@ def receipt_path(root: str, kind: str) -> str:
     return os.path.join(root, RECEIPT_DIR, f"{kind}.json")
 
 
+SUBJECT_MAX_FILES = 2000
+SUBJECT_MAX_BYTES = 64 * 1024 * 1024
+SUBJECT_CHUNK = 1 << 20
+
+
 def subject_digest(root: str, subject: str) -> str | None:
-    if not subject:
+    """A digest of what a receipt was granted over, or None.
+
+    The subject comes from a receipt file, which is to say from whatever wrote one. It was
+    joined to the root unchecked and read whole into memory, on every guard call that
+    consults that receipt: `"subject": "/dev/zero"` or a path outside the repository was a
+    read the guard performed on request. It is resolved inside the root, and the walk is
+    bounded. Exceeding a bound returns a digest that cannot match, so the receipt stops
+    holding rather than the check being skipped.
+    """
+    if not subject or not isinstance(subject, str):
         return None
-    p = os.path.join(root, subject)
-    h = hashlib.sha256()
-    if os.path.isfile(p):
-        h.update(open(p, "rb").read())
+    base = os.path.realpath(root)
+    p = os.path.realpath(os.path.join(root, subject))
+    if p != base and not p.startswith(base + os.sep):
+        return "sha256:outside-the-repository"
+    h, seen, total = hashlib.sha256(), 0, 0
+
+    def eat(f):
+        nonlocal total
+        with open(f, "rb") as fh:
+            while True:
+                chunk = fh.read(SUBJECT_CHUNK)
+                if not chunk:
+                    return True
+                total += len(chunk)
+                if total > SUBJECT_MAX_BYTES:
+                    return False
+                h.update(chunk)
+
+    if os.path.isfile(p) and not os.path.islink(p):
+        if not eat(p):
+            return "sha256:subject-too-large"
     elif os.path.isdir(p):
         for dirpath, dirnames, names in os.walk(p):
             dirnames.sort()
             for n in sorted(names):
+                seen += 1
+                if seen > SUBJECT_MAX_FILES:
+                    return "sha256:subject-too-many-files"
                 f = os.path.join(dirpath, n)
                 h.update(os.path.relpath(f, p).encode())
+                if os.path.islink(f):
+                    h.update(b"<symlink>")
+                    continue
                 try:
-                    h.update(open(f, "rb").read())
+                    if not eat(f):
+                        return "sha256:subject-too-large"
                 except OSError:
                     pass
     else:
@@ -550,7 +605,11 @@ CREDENTIALS = [
     # command a reader verb on line 1 paired with a credential word forty lines later. The
     # verb list stays to tools whose whole job is to emit a file's contents -- adding
     # interpreters made it fire on any script that merely mentions one.
-    (r"(^|[\s;|&(])(cat|bat|less|more|head|tail|strings|xxd|od|cp|scp|rsync|curl)\b[^\n]*"
+    (r"(^|[\s;|&(])(cat|bat|less|more|head|tail|strings|xxd|od|cp|scp|rsync|curl|base64|"
+     r"cut|awk|sed|tr|sort|uniq|grep|egrep|fgrep|rg|ag|tar|gzip|gunzip|zip|dd|tee|install|mv|"
+     r"vi|vim|nano|emacs|open|python|python3|node|ruby|perl|php|go|java|docker|kubectl|aws|"
+     r"gcloud|az|wget|nc|openssl|gpg|jq|yq|xmllint|file|wc|diff|md5sum|shasum|sha256sum)"
+     r"\b[^\n]*"
      r"(\.env(?!\.(?:example|sample|template|dist))[\w.-]*|/\.ssh/|/\.aws/|/\.gnupg/|/\.kube/|"
      r"/\.docker/|\.npmrc|\.pypirc|\.netrc|id_rsa|id_ed25519|\.pem|\.p12|\.kdbx|"
      r"credentials(\.json)?|secrets?\.ya?ml|service[-_]account[\w.-]*\.json)",
@@ -565,6 +624,15 @@ CREDENTIALS = [
 # A secret is a secret wherever it sits on the line -- in an argument, in a quoted string,
 # in a comment. This group alone is matched against the whole command rather than only in
 # command position.
+# A credential path standing alone as an argument. The verb list above is a convenience for
+# the message and will always be incomplete, so the path itself is also a subject: whoever is
+# reading it, naming one as a bare argument is refused. Matched unanchored but space-
+# delimited, which is what keeps it out of prose -- a path inside a quoted sentence is
+# joined by ";" in a rebuilt unit, never by a space.
+CREDENTIAL_PATHS = [
+    (r"(^| )[\w./~-]*(\.env(?!\.(?:example|sample|template|dist))[\w.-]*|/\.ssh/|/\.aws/|/\.gnupg/|/\.kube/|/\.docker/|\.npmrc|\.pypirc|\.netrc|id_rsa|id_ed25519|\.pem|\.p12|\.kdbx|credentials(\.json)?|secrets?\.ya?ml|service[-_]account[\w.-]*\.json)( |$)",
+     "this command names a credential file"),
+]
 SECRETS_IN_LINE = [
     (r"\b(sk-[A-Za-z0-9]{12,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{12,})",
      "a credential appears in this command line"),
@@ -869,6 +937,24 @@ def hit(units, pattern: str, anchored: bool = False) -> str | None:
 
 
 
+def findings_blocking(root: str) -> list:
+    """Open findings severe enough to stop a merge, worst first.
+
+    Read at the enforcement boundary rather than only reported by `sdlc finding list`, so a
+    READY receipt and an open critical cannot both be true at a merge.
+    """
+    rank = {"critical": 0, "high": 1}
+    out = []
+    for rec in finding_load_all(root):
+        if rec.get("outcome") != "open":
+            continue
+        sev = (rec.get("classification") or {}).get("severity")
+        if sev in rank:
+            out.append(rec)
+    out.sort(key=lambda r: rank[r["classification"]["severity"]])
+    return out
+
+
 def guard_problem(root: str, command: str, cfg: dict, record: bool = True) -> str | None:
     enforce = cfg.get("enforce") or {}
     units = command_units(command)
@@ -883,6 +969,9 @@ def guard_problem(root: str, command: str, cfg: dict, record: bool = True) -> st
     if enforce.get("blockCredentialReads", True):
         for pattern, why in CREDENTIALS:
             if hit(units, pattern, anchored=True):
+                return f"{why}."
+        for pattern, why in CREDENTIAL_PATHS:
+            if hit(units, pattern):
                 return f"{why}."
         for pattern, why in SECRETS_IN_LINE:
             if re.search(pattern, command):
@@ -919,6 +1008,21 @@ def guard_problem(root: str, command: str, cfg: dict, record: bool = True) -> st
             merging = bool(gm) and not re.search(r"--(abort|continue|quit)\b", gm) \
                 and re.fullmatch(rf"({prot_re})", cur or "") is not None
         if merging:
+            # The findings store sat beside the gate and never reached it: a READY receipt
+            # for this commit let a merge through with an open critical finding against the
+            # same commit. A verdict and a defect list that disagree is the gate believing
+            # its own paperwork.
+            blocking = findings_blocking(root)
+            if blocking:
+                worst = ", ".join(f"{f['id']} {f['classification']['severity']}"
+                                  for f in blocking[:4])
+                more = f" and {len(blocking) - 4} more" if len(blocking) > 4 else ""
+                return (f"{len(blocking)} open finding(s) at critical or high block a merge: "
+                        f"{worst}{more}.\n"
+                        f"Close each with evidence — `sdlc finding close <id> --outcome fixed "
+                        f"--commit <sha>` — or record why it does not block, with "
+                        f"`--outcome refused` or `--outcome deferred`. `sdlc finding list "
+                        f"--open --severity critical` lists them.")
             why = (receipt_holds if record else receipt_quiet)(root, "readiness", "ready", max_age, why="merging")
             if why:
                 return (f"merging needs a READY readiness receipt, and {why}.\n"
@@ -2746,10 +2850,22 @@ def known_rules() -> set:
     """Rule IDs from the control specification's table — the one source of truth.
 
     Parsed rather than duplicated, so adding a row to docs/control-spec.md is all it takes to
-    make a rule usable. An unreadable table means we skip the check rather than block work.
+    make a rule usable.
+
+    A table that parses to nothing stops the tool. It used to return an empty set, and the
+    caller's `if rules and ...` then skipped the check — so a reformatting that broke the
+    regex would have silently accepted any rule id at all, which is the shape of failure
+    this file exists to refuse.
     """
     body = control_spec_body()
-    return set(re.findall(r"^\|\s*`([A-Z][A-Z0-9-]*)`\s*\|", body, re.M))
+    rules = set(re.findall(r"^\|\s*`([A-Z][A-Z0-9-]*)`\s*\|", body, re.M))
+    if len(rules) < 20:
+        print(f"sdlc: docs/control-spec.md parsed to {len(rules)} rule(s), which cannot be "
+              f"right — the rule table's shape has changed and every rule id would be "
+              f"accepted unchecked. Refusing rather than validating against nothing.",
+              file=sys.stderr)
+        raise SystemExit(3)
+    return rules
 
 
 def finding_id(rule: str, file: str, line, summary: str) -> str:

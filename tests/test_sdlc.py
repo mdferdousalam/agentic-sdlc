@@ -153,6 +153,49 @@ for cmd in ['sdlc finding write --detail "git stash is refused by the guard"',
             "git status\ngit log --oneline -5"]:
     ok(guard(d, cmd).returncode == 0, f"allowed: {cmd!r}")
 
+print("guard: the credential rule is about the file, not the verb that reads it")
+# Keying on a verb list meant the next reader of the same path was allowed: xxd was listed
+# and base64 was not. The path is a subject in its own right now.
+for cmd in ["cat .env", "base64 .env", "awk '{print}' .env", "grep KEY .env", "vim .env",
+            "sort secrets.yaml", "openssl rsa -in server.pem", "gzip -c ~/.aws/credentials",
+            "tar cf - ~/.ssh/", "cp ~/.ssh/id_rsa /tmp/x", "head -2 .env.production",
+            "python3 -c \"print(open('.env').read())\"", "docker cp x:/root/.aws/credentials ."]:
+    ok(guard(d, cmd).returncode == 2, f"blocked: {cmd!r}")
+for cmd in ["cat .env.example", "cat README.md", "cat docs/environment.md",
+            "echo 'see .env.example for the shape'", "npm run build"]:
+    ok(guard(d, cmd).returncode == 0, f"allowed: {cmd!r}")
+
+print("guard: a merge cannot outrun the findings store")
+# A READY receipt for this commit let a merge through with an open critical against the same
+# commit. A verdict and a defect list that disagree is the gate believing its own paperwork.
+dfb = newrepo(config={"version": 2, "trunk": "main"})
+run(["receipt", "write", "readiness", "--verdict", "ready", "--by", "t", "--detail", "ok"], dfb)
+ok(guard(dfb, "gh pr merge --squash").returncode == 0, "READY and no findings merges")
+_r = run(["finding", "write", "--rule", "SEC-AUTHORITY", "--category", "D.30",
+          "--severity", "critical", "--confidence", "high", "--file", "src/a.py",
+          "--line", "1", "--by", "sdlc-security-reviewer",
+          "--summary", "an admin path is reachable without the check"], dfb)
+_fid = _r.stdout.split()[0]
+_m = guard(dfb, "gh pr merge --squash")
+ok(_m.returncode == 2, "an open critical blocks the merge, READY receipt or not")
+ok(_fid in _m.stderr, "and the refusal names the finding")
+run(["finding", "close", _fid, "--outcome", "fixed", "--commit", "abc1234", "--by", "t"], dfb)
+ok(guard(dfb, "gh pr merge --squash").returncode == 0, "closing it lets the merge through")
+run(["finding", "write", "--rule", "ARCH-COHESION", "--category", "B.13",
+     "--severity", "advisory", "--confidence", "low", "--file", "src/b.py", "--line", "1",
+     "--by", "t", "--summary", "this module is acquiring a second responsibility"], dfb)
+ok(guard(dfb, "gh pr merge --squash").returncode == 0, "an open advisory does not block")
+shutil.rmtree(dfb)
+
+print("fail-closed: a question git could not answer is not a reassuring answer")
+_sd = subprocess.run([sys.executable, "-c",
+                      "import sys;m=type(sys)('m');"
+                      "exec(compile(open(%r).read().split('def main(')[0],'b','exec'),m.__dict__);"
+                      "print(m.tree_clean('/tmp'), m.tree_digest('/tmp'))" % SDLC],
+                     capture_output=True, text=True).stdout.strip()
+ok(_sd.startswith("False"), "git failing to run is not a clean tree")
+ok("unreadable-working-tree" in _sd, "and the digest says so rather than matching")
+
 print("guard: publishing")
 for cmd in ["git tag v1.0", "npm publish", "cargo publish", "gh release create v1",
             "docker push x/y", "git push --tags origin"]:
