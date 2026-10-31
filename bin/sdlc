@@ -118,30 +118,68 @@ def tree_clean(root: str) -> bool:
 
 
 def tree_digest(root: str) -> str:
-    """A digest of the working tree a receipt saw, untracked files included.
+    """A digest of the working tree a receipt saw, untracked content included.
 
-    `treeClean` was a boolean from `--untracked-files=no`, which fails in both directions.
-    A brand-new untracked file never made the tree dirty, so `verifyCmd` could be satisfied
-    by a file that was never committed and then removed, with the receipt still holding.
-    And the check only applied when the flag was true, so a receipt written over a dirty
-    tree recorded false and was never re-checked however much work piled up afterwards --
-    the control was opt-out by the actor it constrains.
+    `treeClean` was a boolean from `--untracked-files=no`, which failed in both directions.
+    A new untracked file never made the tree dirty, so `verifyCmd` could be satisfied by a
+    file that was never committed and then removed, with the receipt still holding. And the
+    check only applied when the flag was true, so a receipt written over a dirty tree
+    recorded false and was never re-checked however much work piled up afterwards.
 
-    `.sdlc/` is excluded by path rather than by switching the whole untracked class off,
-    because the receipts and findings written during a stage are not the subject of it.
+    The first version of this hashed the porcelain listing plus `git diff HEAD`. That still
+    missed an *edit* to an untracked file, because the listing carries names and the diff
+    carries only tracked content — so the hole it was written to close stayed open for the
+    case that opened it. Untracked files are read.
+
+    `.sdlc/` is excluded by path prefix, not substring, because the receipts and findings
+    written during a stage are not the subject of it — but `my.sdlc/` is somebody's code.
     """
-    ok, out = git_ok("status", "--porcelain", "--untracked-files=normal", cwd=root)
+    ok, out = git_ok("status", "--porcelain", "--untracked-files=all", cwd=root)
     if not ok:
         # A digest nothing can match, so the receipt stops holding rather than the check
         # quietly succeeding against an answer git never gave.
         return "unreadable-working-tree"
-    lines = sorted(l for l in out.split("\n")
-                   if l.strip() and ".sdlc/" not in l and not l.endswith(".sdlc"))
-    # The status list alone records only that a file is modified, so a second edit to an
-    # already-modified file left the digest unchanged. The diff carries the content.
-    content = git("diff", "HEAD", "--", ".", ":(exclude).sdlc", cwd=root)
-    blob = "\n".join(lines) + "\0" + content
-    return hashlib.sha256(blob.encode()).hexdigest()[:16]
+
+    def ours(path: str) -> bool:
+        return path == ".sdlc" or path.startswith(".sdlc/")
+
+    lines = sorted(l for l in out.split("\n") if l.strip() and not ours(l[3:].strip('"')))
+    h = hashlib.sha256()
+    h.update("\n".join(lines).encode())
+    h.update(b"\0")
+
+    ok_diff, content = git_ok("diff", "HEAD", "--", ".", ":(exclude).sdlc", cwd=root)
+    if not ok_diff and git_ok("rev-parse", "--verify", "HEAD", cwd=root)[0]:
+        return "unreadable-working-tree"   # there is a HEAD, so the diff should have worked
+    h.update(content.encode())
+
+    ok_u, listing = git_ok("ls-files", "-o", "--exclude-standard", "-z", cwd=root)
+    if not ok_u:
+        return "unreadable-working-tree"
+    seen = total = 0
+    for rel in sorted(x for x in listing.split("\0") if x and not ours(x)):
+        seen += 1
+        if seen > SUBJECT_MAX_FILES:
+            return "too-many-untracked-files"
+        h.update(b"\0")
+        h.update(rel.encode())
+        full = os.path.join(root, rel)
+        if os.path.islink(full):
+            h.update(b"<symlink>")
+            continue
+        try:
+            with open(full, "rb") as fh:
+                while True:
+                    chunk = fh.read(SUBJECT_CHUNK)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > SUBJECT_MAX_BYTES:
+                        return "untracked-content-too-large"
+                    h.update(chunk)
+        except OSError:
+            h.update(b"<unreadable>")
+    return h.hexdigest()[:16]
 
 
 # ------------------------------------------------------------------------------------ config
@@ -804,7 +842,16 @@ def strip_heredocs(command: str):
     starts = {}
     pos = 0
     for n, line in enumerate(lines):
-        m = HEREDOC.search(line)
+        # A `<<EOF` after an unquoted `#` is inside a comment, not a heredoc start. Checked
+        # here rather than by stripping comments first, because stripping them first ran
+        # over heredoc bodies and read their text as shell -- a markdown heading in a body
+        # became a comment, and the quoting after it came apart.
+        cut = len(line)
+        for k, c, q in quote_spans(line):
+            if c == "#" and q is None and (k == 0 or line[k - 1] in " \t;|&("):
+                cut = k
+                break
+        m = HEREDOC.search(line[:cut])
         if m and (pos + m.start()) in unquoted:
             starts[n] = (m.group(2), bool(m.group(1)))
         pos += len(line) + 1
@@ -963,7 +1010,8 @@ def command_units(command: str, depth: int = 0) -> list[tuple[str, bool]]:
     refused command reached through `find -exec`, `ssh host`, `git submodule foreach` or a
     shell keyword sits in argument position and is still run.
     """
-    body = strip_heredocs(strip_comments(command))
+    body = strip_heredocs(command)
+    body = strip_comments(body) if body is not None else None
     parsed = simple_commands(newlines_to_separators(body)) if body is not None else None
     if parsed is None:
         return [(command, False)]
@@ -1054,7 +1102,18 @@ def findings_blocking(root: str) -> list:
     """
     rank = {"critical": 0, "high": 1}
     out = []
-    for rec in finding_load_all(root):
+    # A file that will not parse is not an absent finding. Corrupting one was otherwise a
+    # way to clear a blocker without closing it, so an unreadable file blocks and says so.
+    for p in sorted(glob.glob(os.path.join(root, FINDING_DIR, "*.json"))):
+        try:
+            rec = json.load(open(p))
+            if not isinstance(rec, dict):
+                raise ValueError("not an object")
+        except Exception as e:
+            out.append({"id": os.path.basename(p)[:-5],
+                        "classification": {"severity": "critical"},
+                        "summary": f"this finding file cannot be read ({e})"})
+            continue
         if rec.get("outcome") != "open":
             continue
         sev = (rec.get("classification") or {}).get("severity")
@@ -2163,11 +2222,34 @@ def budget_state(root: str) -> dict:
     return {"tasks": {}}
 
 
+def budget_window_spend(root: str, cfg: dict) -> tuple:
+    """(calls, earliest start) across every task inside the window.
+
+    The same sum `budget_problem` enforces. `budget show` used to report only the current
+    task, so it could say 3 of 50 while enforcement saw 60 — a ceiling you cannot see
+    coming is a surprise, not a budget.
+    """
+    b = budget_config(cfg)
+    window = int(b.get("maxWallClockMin") or 0) or 240
+    now, calls, began_at = time.time(), 0, None
+    for t in (budget_state(root).get("tasks") or {}).values():
+        try:
+            began = calendar.timegm(time.strptime(t.get("startedAt", ""), "%Y-%m-%dT%H:%M:%SZ"))
+        except Exception:
+            began = now
+        if (now - began) / 60 <= window:
+            calls += t.get("toolCalls", 0)
+            began_at = began if began_at is None else min(began_at, began)
+    return calls, began_at
+
+
 def budget_task(root: str, cfg: dict) -> dict:
-    """This task's counters, as they stand. Does not count a call."""
-    st = budget_state(root)
-    return (st.get("tasks") or {}).get(budget_task_key(root, cfg)) or {
-        "toolCalls": 0, "startedAt": None, "task": budget_task_key(root, cfg)}
+    """What enforcement sees for this task: the window-summed count, and when it started."""
+    key = budget_task_key(root, cfg)
+    calls, began = budget_window_spend(root, cfg)
+    return {"toolCalls": calls, "task": key,
+            "startedAt": (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(began))
+                          if began else None)}
 
 
 def budget_save(root: str, st: dict) -> None:
@@ -2231,7 +2313,9 @@ def budget_problem(root: str, cfg: dict) -> str | None:
     mins = int(b.get("maxWallClockMin") or 0)
     if mins and not warn_only:
         try:
-            began = calendar.timegm(time.strptime(st["startedAt"], "%Y-%m-%dT%H:%M:%SZ"))
+            _calls, _began = budget_window_spend(root, cfg)
+            began = _began if _began else calendar.timegm(
+                time.strptime(st["startedAt"], "%Y-%m-%dT%H:%M:%SZ"))
             spent = (time.time() - began) / 60
             if spent > mins:
                 return (f"this task has run for {int(spent)} minutes and the budget is {mins}.\n"

@@ -178,6 +178,20 @@ for cmd in ["cat <<'EOF'\ngit stash\nEOF",          # a quoted delimiter is iner
             'python3 -c "print()" --note "rm -rf / is refused"']:
     ok(guard(d, cmd).returncode == 0, f"allowed: {cmd!r}")
 
+# Ordering: heredocs are removed before comments are. The other way round, comment
+# stripping ran over a heredoc body and read its text as shell — a markdown heading became
+# a comment and the quoting after it came apart, which refused a `gh pr edit --body-file`
+# heredoc carrying release notes.
+_md = ("cat > /tmp/pr.md <<'MD'\n## What this is\n\nThis pipeline's own gate found it.\n"
+       "\n## Known\n\n- `git stash` is refused, and it's stated rather than buried\nMD\n"
+       "gh pr edit 6 --body-file /tmp/pr.md")
+ok(guard(d, _md).returncode == 0, "a markdown heredoc body stays data, headings and all")
+for _c, _want in [("cat <<'MD'\nprose\nMD\ngit stash", 2),
+                  ("cat <<MD\nprose\nMD\ngit stash", 2),
+                  ("cat <<'EOF'\ngit stash\nEOF", 0)]:
+    ok(guard(d, _c).returncode == _want,
+       ("blocked" if _want else "allowed") + f" after the ordering change: {_c!r}")
+
 print("guard: the credential rule is about the file, not the verb that reads it")
 # Keying on a verb list meant the next reader of the same path was allowed: xxd was listed
 # and base64 was not. The path is a subject in its own right now.
@@ -426,6 +440,58 @@ open(os.path.join(dtd2, "README.md"), "a").write("more\n")
 ok(run(["receipt", "check", "gate", "--verdict", "passed"], dtd2).returncode == 1,
    "and stops holding when more work piles up — the check is not opt-out")
 shutil.rmtree(dtd2)
+
+print("receipts: untracked content, not just untracked names")
+# The first tree digest hashed the porcelain listing plus `git diff HEAD`. The listing
+# carries names and the diff carries only tracked content, so an *edit* to an untracked
+# file left the digest unchanged — the hole this was written to close, for the very case
+# that opened it.
+dut = newrepo(config={"version": 2, "trunk": "main"})
+open(os.path.join(dut, "a.txt"), "w").write("one\n")
+run(["receipt", "write", "gate", "--verdict", "passed", "--by", "t", "--detail", "v"], dut)
+ok(run(["receipt", "check", "gate", "--verdict", "passed"], dut).returncode == 0,
+   "a receipt holds while the untracked file it saw is unchanged")
+open(os.path.join(dut, "a.txt"), "w").write("two\n")
+ok(run(["receipt", "check", "gate", "--verdict", "passed"], dut).returncode == 1,
+   "editing an untracked file voids it")
+shutil.rmtree(dut)
+
+dsd = newrepo(config={"version": 2, "trunk": "main"})
+run(["receipt", "write", "gate", "--verdict", "passed", "--by", "t", "--detail", "v"], dsd)
+ok(run(["receipt", "check", "gate", "--verdict", "passed"], dsd).returncode == 0,
+   "the receipts written during a stage are not the subject of it")
+os.makedirs(os.path.join(dsd, "my.sdlc"), exist_ok=True)
+open(os.path.join(dsd, "my.sdlc", "code.py"), "w").write("x = 1\n")
+ok(run(["receipt", "check", "gate", "--verdict", "passed"], dsd).returncode == 1,
+   "but a path merely ending in .sdlc is somebody's code, and does void it")
+shutil.rmtree(dsd)
+
+print("findings: a file that will not parse is not an absent finding")
+dcf = newrepo(config={"version": 2, "trunk": "main"})
+run(["receipt", "write", "readiness", "--verdict", "ready", "--by", "t", "--detail", "ok"], dcf)
+ok(guard(dcf, "gh pr merge --squash").returncode == 0, "READY and no findings merges")
+os.makedirs(os.path.join(dcf, ".sdlc/findings"), exist_ok=True)
+_cf = os.path.join(dcf, ".sdlc/findings/F-deadbeef.json")
+open(_cf, "w").write("{truncated")
+ok(guard(dcf, "gh pr merge --squash").returncode == 2,
+   "corrupting a finding file blocks the merge rather than clearing it")
+open(_cf, "w").write("[]")
+ok(guard(dcf, "gh pr merge --squash").returncode == 2, "and so does one that is not an object")
+os.remove(_cf)
+ok(guard(dcf, "gh pr merge --squash").returncode == 0, "removing it lets the merge through")
+shutil.rmtree(dcf)
+
+print("budget: what `show` reports is what enforcement sees")
+dbs = newrepo(config={"trunk": "main", "spec": {"engine": "prd-frd"},
+                      "budget": {"maxToolCalls": 50}})
+for _ in range(3):
+    guard(dbs, "echo x")
+subprocess.run(["git", "checkout", "-q", "-b", "other"], cwd=dbs, capture_output=True)
+for _ in range(2):
+    guard(dbs, "echo x")
+ok("5 of 50" in run(["budget", "show"], dbs).stdout,
+   "show reports the window sum, not one key's count")
+shutil.rmtree(dbs)
 
 print("receipts: bound to the subject's content")
 spec = os.path.join(d, "spec.md")
