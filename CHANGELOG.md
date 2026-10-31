@@ -3,9 +3,16 @@
 All notable changes to this plugin. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the versioning is [semantic](https://semver.org/).
 
-## [Unreleased]
+## [3.0.1] — 2026-10-31
 
-### Fixed
+A security release. Every finding below was found by this pipeline's own readiness gate run
+against 3.0.0, which returned NOT-READY. Five were critical. 3.0.0 is published and
+bypassable; upgrade.
+
+The test suite goes from 248 assertions to 341. Each fix carries the reproduction that
+produced it, as a test.
+
+### Fixed — the refusal path
 
 - **The guard reads commands, not command lines.** Rules were matched as regular expressions
   against the raw text of a command line, which failed in both directions at once.
@@ -27,6 +34,71 @@ and the versioning is [semantic](https://semver.org/).
 
   Closes the critical `F-d0c13a07` and the `F-67811454` false positives. One line caused
   both, and one repair fixes both.
+
+- **A publish route the maintainer did not authorise.** `.github/workflows/publish.yml`
+  carried `workflow_dispatch` as a convenience, and a dispatch has no release tag, so the
+  tag-versus-manifest check sat behind `if: github.event_name == 'release'` and was skipped
+  on that path. `gh workflow run publish.yml --ref <anything>` would publish whatever version
+  that ref held, under the trusted-publisher identity. The trigger is gone; the version check
+  is unconditional; the mechanical gate moved to its own job, because a job that downloads
+  `markdownlint-cli2` from the network should not also hold a credential that can publish.
+  The guard now refuses `gh workflow run` by name, and `gh api` to a releases or dispatches
+  path when a method or field flag makes it a write. A plain read of the same path is still
+  allowed.
+
+- **The guard refuses when it cannot evaluate its own rules.** Every host reads exit 2 as a
+  block and any other non-zero exit as "carry on", so an unhandled exception was an *allow* —
+  and `"enforce": "all"` was enough to cause one, because a string has no `.get`. The eleven
+  config keys the guard reads are type-checked before use, and anything else that goes wrong
+  becomes a refusal that says so.
+
+- **A receipt dated in the future is not a receipt.** Staleness was `age > limit`, so a
+  receipt dated next month had a negative age and never expired: a hand-written
+  `readiness.json` unlocked a merge the guard had refused moments earlier. A timestamp more
+  than two minutes ahead is refused. `treeClean` was written on every receipt and read by
+  nothing; a receipt granted over a clean tree now stops holding once the tree is dirty.
+  Acceptances are written to the audit log, not only refusals.
+
+- **Loosening the configuration is itself a weakening.** Setting the six `enforce` flags to
+  `false` turned every refusal into an allow and left no trace, and committing that edit
+  passed `sdlc tests audit` in silence. Switching a flag off stays a legitimate choice — what
+  changes is that it is visible. The suite audit now reports nine kinds of loosening: a
+  refusal switched off, a branch dropped from `protected`, an action removed from
+  `neverByAgent`, a human approval downgraded to an agent's, receipts given a longer life, a
+  budget ceiling raised or removed, a budget that warns instead of refusing, a reviewer or
+  concern dropped, and a trunk change. And when a non-default flag lets a command through
+  that the defaults would have refused, the audit log records which rule and which flag.
+
+- **A finding id is an id, not a path.** `finding show` and `finding close` joined the id
+  straight into a path, so `../../../elsewhere/victim` read a file outside the repository and
+  `close` rewrote it. The shape is checked and the resolved path confirmed to be inside
+  `.sdlc/findings`.
+
+- **A budget an agent can rename its way out of is not a ceiling.** It was keyed on the branch
+  name. With the ceiling spent, `git checkout -b other` made the next call allowed and
+  overwrote the counter. It is keyed on the merge base against the trunk now, which no rename
+  moves and which a new branch from the same point shares; counters are held per task rather
+  than overwriting; a task starting its own budget is audited.
+
+### Added
+
+- `openspec/changes/verification.md` — the verification stage, run for the first time. 18
+  requirements, 31 scenarios: 29 passed, 0 failed, **2 unexecuted**, both now findings of
+  their own. Three passing scenarios hold by observation and carry no regression test; they
+  are marked, because a scenario nothing guards is one a later change can break in silence.
+
+### Known, and not fixed here
+
+- `profiles/concerns/performance.md` caps a finding raised by reading at `medium` confidence
+  and nothing enforces it — `finding write --rule PERF-N-PLUS-ONE --detection llm
+  --confidence high` is accepted (`F-92db516b`).
+- The impact stage leaves no receipt, so nothing records whether it ran (`F-59fb1d0e`).
+- `suiteAudit.exclude` still exempts `bin/sdlc` and `tests/test_sdlc.py`, which removes the
+  suppression-marker check from the file implementing every control (`F-51c26d39`). The
+  obvious repair — inferring from a line's text whether a marker is quoted — was tried and
+  reverted: it is the same forgeable heuristic this project has already rejected twice, and
+  one apostrophe defeats it. The sound fix is to move the detector's pattern literals out of
+  `bin/sdlc` into a data file so the control file no longer contains the strings it scans for.
 
 ## [3.0.0] — 2026-10-25
 
