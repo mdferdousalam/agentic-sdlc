@@ -223,6 +223,14 @@ from 248 at 3.0.0.
   up to a pass.
 - Precision and recall are still unmeasured. That needs a seeded-defect corpus;
   `docs/maturity.md` says how.
+- **Two medium findings from the eighth review are deferred, by the maintainer's decision.**
+  Neither is a regression — 3.0.0 allowed every command involved. `F-7cbc69ab`: a `$'!…'`
+  quoted word and the `GIT_CONFIG_*` environment routes reach a git alias without matching
+  the `!` shape. `F-afcbc050`: other spellings of shapes already matched — `sqlite3 '.once
+  |…'` and `.sh`, `vim '+silent !…'`, a `!` fed on stdin to `ed`, `ex` or `ftp`, and `at`
+  behind `env` or `nohup`. Each fix is another round of the same cycle, which is the limit of
+  matching shell with patterns; the protected-branch and receipt gates are what stand behind
+  it.
 - **`COMMAND_RUNNERS` and `CODE_OPTIONS` are still denylists.** Heredoc consumers and the
   shell-escape operand shapes were inverted in this release; those two were not. The next
   program missing from either is the next finding, and it is named here rather than left to
