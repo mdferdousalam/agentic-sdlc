@@ -57,6 +57,14 @@ the point, and it is a narrowing, so it is a major.
   share.
 - Four evals for the new refusals, and tests for every detection in both directions.
 
+### Changed
+
+- **The npm package is `@mdferdousalam1989/agentic-sdlc`.** Earlier entries named
+  `@mdferdousalam/agentic-sdlc`; that scope was never registered, so nothing was ever
+  published under it and no install is broken by the correction. The references in those
+  entries are corrected rather than preserved, because a changelog that documents an install
+  command which never worked is worse than one that is silently right.
+
 ### Noted
 
 Running `sdlc tests audit` against this repository reported six weakenings that were not
@@ -131,7 +139,7 @@ rather than any missing adapter, was what would have stopped other developers ad
   `~/.agentic-sdlc`, links `sdlc` into a bin directory already on your PATH, and touches
   nothing in your repository. No account, no sudo, no Python dependencies. It refuses to
   proceed on Python older than 3.8 rather than failing later with something cryptic.
-- **npm package `@mdferdousalam/agentic-sdlc`** — `npx @mdferdousalam/agentic-sdlc install`.
+- **npm package `@mdferdousalam1989/agentic-sdlc`** — `npx @mdferdousalam1989/agentic-sdlc install`.
   Scoped because the unscoped name belongs to an unrelated project. The `bin` is a small Node
   launcher rather than the Python file directly, so Windows gets a real shim instead of
   depending on a shebang npm cannot honour there; it tries `python`, `py`, `python3` on Windows

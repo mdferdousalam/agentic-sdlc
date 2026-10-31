@@ -7,7 +7,7 @@ things. Everything needs `git` and Python 3.8+ — there are no Python dependenc
 | --- | --- | --- |
 | **Claude Code plugin** | `/plugin marketplace add mdferdousalam/agentic-sdlc` then `/plugin install agentic-sdlc` | Claude Code |
 | **Shell** | `curl -fsSL https://raw.githubusercontent.com/mdferdousalam/agentic-sdlc/main/install.sh \| sh` | curl |
-| **npm** | `npx @mdferdousalam/agentic-sdlc install` | Node 16+ |
+| **npm** | `npx @mdferdousalam1989/agentic-sdlc install` | Node 16+ |
 | **PyPI** | `uvx --from agentic-sdlc-cli sdlc install` or `pipx install agentic-sdlc-cli` | Python |
 | **Homebrew** | `brew install mdferdousalam/tap/agentic-sdlc` | macOS/Linux |
 | **Codex plugin** | `codex plugin marketplace add mdferdousalam/agentic-sdlc` then `codex plugin add agentic-sdlc@agentic-sdlc` | Codex CLI |
@@ -54,7 +54,7 @@ Pin a version with `AGENTIC_SDLC_VERSION=v2.2.0`, or relocate it with `AGENTIC_S
 ```sh
 sdlc uninstall              # remove our blocks and the files we own from this repository
 rm -rf ~/.agentic-sdlc      # shell install
-npm rm -g @mdferdousalam/agentic-sdlc
+npm rm -g @mdferdousalam1989/agentic-sdlc
 pipx uninstall agentic-sdlc-cli
 brew uninstall agentic-sdlc
 ```

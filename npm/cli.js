@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Thin launcher. The CLI itself is one dependency-free Python file; this exists so that
-// `npx @mdferdousalam/agentic-sdlc install` works, and so Windows gets a real shim instead of
+// `npx @mdferdousalam1989/agentic-sdlc install` works, and so Windows gets a real shim instead of
 // relying on a shebang npm cannot honour there.
 "use strict";
 

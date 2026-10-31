@@ -27,7 +27,7 @@ curl -fsSL https://raw.githubusercontent.com/mdferdousalam/agentic-sdlc/main/ins
 sdlc install        # detects your agents and sets each one up
 ```
 
-Or with npm, if that is more your habit: `npx @mdferdousalam/agentic-sdlc install`.
+Or with npm, if that is more your habit: `npx @mdferdousalam1989/agentic-sdlc install`.
 Either way you need `git` and Python 3.8 or newer — nothing else.
 
 It installs git hooks too, because on most hosts that is the only thing that can actually stop

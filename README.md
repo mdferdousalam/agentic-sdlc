@@ -31,7 +31,7 @@ sdlc doctor      # what is configured and what is missing
 Or via whichever package manager you already use:
 
 ```sh
-npx @mdferdousalam/agentic-sdlc install        # npm
+npx @mdferdousalam1989/agentic-sdlc install        # npm
 uvx --from agentic-sdlc-cli sdlc install       # PyPI (or: pipx install agentic-sdlc-cli)
 brew install mdferdousalam/tap/agentic-sdlc    # Homebrew
 codex plugin marketplace add mdferdousalam/agentic-sdlc   # Codex, as a plugin
