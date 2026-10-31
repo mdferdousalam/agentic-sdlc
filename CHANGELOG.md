@@ -3,6 +3,31 @@
 All notable changes to this plugin. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the versioning is [semantic](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **The guard reads commands, not command lines.** Rules were matched as regular expressions
+  against the raw text of a command line, which failed in both directions at once.
+  `git -c core.pager=cat stash` was *allowed*, because a global option between `git` and the
+  subcommand defeated every `\bgit\s+stash\b` pattern — 18 of 18 refusals could be bypassed
+  this way, and the same hole let an ungated `git -c … push` past the protected-branch gate.
+  Meanwhile `sdlc finding write --detail "git stash is refused"` was *refused*, because prose
+  quoting a forbidden command read as the command itself; this blocked the readiness gate
+  from writing its own NOT-READY receipt, which is to say the control could not record its
+  own verdict.
+
+  The line is now tokenised, split at the shell operators, stripped of heredoc bodies and of
+  git's global options, and each rule is matched from the start of a command rather than
+  anywhere in the text. `sh -c "<code>"` is parsed in turn rather than scanned as a string.
+  Anything that cannot be parsed — an unbalanced quote, say — falls back to matching the raw
+  line exactly as before, so a parse failure fails closed. Secret-shaped strings
+  (`sk-…`, `ghp_…`, `AKIA…`) are still matched anywhere on the line: a secret is a secret
+  wherever it sits.
+
+  Closes the critical `F-d0c13a07` and the `F-67811454` false positives. One line caused
+  both, and one repair fixes both.
+
 ## [3.0.0] — 2026-10-25
 
 Findings become data, the gate can no longer be lowered to pass itself, and the six taxonomy

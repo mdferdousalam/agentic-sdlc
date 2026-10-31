@@ -27,6 +27,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -462,13 +463,175 @@ CREDENTIALS = [
     (r"(^|[\s;|&(])echo\s+\"?\$\{?\w*(SECRET|TOKEN|PASSWORD|API[-_]?KEY|"
      r"PRIVATE[-_]?KEY)\w*",
      "echoing a secret from the environment is forbidden"),
+]
+# A secret is a secret wherever it sits on the line -- in an argument, in a quoted string,
+# in a comment. This group alone is matched against the whole command rather than only in
+# command position.
+SECRETS_IN_LINE = [
     (r"\b(sk-[A-Za-z0-9]{12,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{12,})",
      "a credential appears in this command line"),
 ]
 
 
+# ------------------------------------------------------------------- reading a command line
+#
+# The rules above describe *commands*. Matching them against the raw text of a command line
+# failed in both directions at once, and one repair closes both:
+#
+#   git -c core.pager=cat stash      was allowed -- a global option between `git` and the
+#                                    subcommand defeated every `\bgit\s+stash\b` pattern.
+#   sdlc finding write --detail      was refused -- prose that merely quoted a forbidden
+#     "git stash is refused"         command read as the command itself. A control that
+#                                    cannot record its own verdict is not a control.
+#
+# So: parse the line, split it at the shell operators, drop git's global options, and keep an
+# argument's own text out of command position. Every parse failure falls back to matching the
+# raw line, which is what the guard did before -- failing closed, never open.
+
+# git's own options, which may appear between `git` and the subcommand.
+GIT_GLOBAL_VALUE_OPTS = {"-c", "-C", "--exec-path", "--git-dir", "--work-tree", "--namespace",
+                         "--super-prefix", "--config-env", "--attr-source"}
+# Wrappers that run another command: the rule applies to what they run, not to them.
+COMMAND_WRAPPERS = {"sudo", "doas", "env", "nohup", "time", "command", "builtin", "exec",
+                    "xargs", "nice", "ionice", "stdbuf", "setsid", "timeout"}
+# Interpreters whose argument is code rather than data. Their line is also matched raw.
+SHELL_INTERPRETERS = {"sh", "bash", "zsh", "dash", "ksh", "fish", "eval", "source", "."}
+SHELL_OPERATORS = {";", "&&", "||", "|", "|&", "&", "(", ")", "{", "}",
+                   "<", ">", ">>", "<<", "<<<", "2>", "&>", "$"}
+ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=", re.S)
+HEREDOC = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+
+
+def strip_heredocs(command: str) -> str:
+    """Drop heredoc bodies. A heredoc body is text being written, not a command run."""
+    if "<<" not in command:
+        return command
+    lines = command.split("\n")
+    out, i = [], 0
+    while i < len(lines):
+        out.append(lines[i])
+        m = HEREDOC.search(lines[i])
+        i += 1
+        if not m:
+            continue
+        word = m.group(2)
+        while i < len(lines) and lines[i].strip() != word:
+            i += 1          # the body: data, so it is not scanned
+        if i < len(lines):
+            out.append(lines[i])
+            i += 1
+    return "\n".join(out)
+
+
+def program_name(token: str) -> str:
+    return os.path.basename(token.strip("`\\'\""))
+
+
+def strip_wrappers(argv: list[str]) -> list[str]:
+    """Look through `sudo`, `env VAR=x`, `timeout 5` and the like to the real command."""
+    while argv:
+        if ASSIGNMENT.match(argv[0]):
+            argv = argv[1:]
+            continue
+        if program_name(argv[0]) in COMMAND_WRAPPERS:
+            rest = argv[1:]
+            while rest and (rest[0].startswith("-") or ASSIGNMENT.match(rest[0])
+                            or re.fullmatch(r"[\d.]+[smhd]?", rest[0])):
+                rest = rest[1:]
+            if not rest:
+                return []
+            argv = rest
+            continue
+        return argv
+    return argv
+
+
+def strip_git_globals(rest: list[str]) -> list[str]:
+    """Everything dash-prefixed before git's subcommand is a global option. Drop it."""
+    i = 0
+    while i < len(rest) and rest[i].startswith("-"):
+        name = rest[i].split("=", 1)[0]
+        i += 2 if (name in GIT_GLOBAL_VALUE_OPTS and "=" not in rest[i]) else 1
+    return rest[i:]
+
+
+def simple_commands(command: str) -> list[list[str]] | None:
+    """The line as a list of argv lists, or None if it cannot be parsed."""
+    lex = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    try:
+        tokens = list(lex)
+    except ValueError:
+        return None                     # an unbalanced quote: the caller matches raw
+    out: list[list[str]] = []
+    cur: list[str] = []
+    for tok in tokens:
+        tok = tok.strip("`")
+        if not tok:
+            continue
+        if tok in SHELL_OPERATORS:
+            if cur:
+                out.append(cur)
+            cur = []
+            continue
+        cur.append(tok)
+    if cur:
+        out.append(cur)
+    return out
+
+
+def rebuild(argv: list[str]) -> str:
+    argv = strip_wrappers(argv)
+    if not argv:
+        return ""
+    if program_name(argv[0]) == "git":
+        argv = ["git"] + strip_git_globals(argv[1:])
+    else:
+        argv = [program_name(argv[0])] + argv[1:]
+    # An argument's own whitespace is data, never a boundary between words of a command.
+    # Collapsing it keeps a quoted sentence from reading as the command it describes.
+    return " ".join(re.sub(r"\s+", ";", a) for a in argv)
+
+
+def command_units(command: str, depth: int = 0) -> list[tuple[str, bool]]:
+    """The line as (text, anchored) units to match rules against.
+
+    `anchored` means the text begins at the command's program, so a rule is matched from
+    position 0 and cannot fire on a word that merely appears among the arguments.
+    """
+    parsed = simple_commands(strip_heredocs(command))
+    if parsed is None:
+        return [(command, False)]
+    units = [(rebuild(argv), True) for argv in parsed if argv]
+    units = [u for u in units if u[0]]
+    nested = False
+    for argv in parsed:
+        if not argv or program_name(argv[0]) not in SHELL_INTERPRETERS:
+            continue
+        nested = True
+        if depth >= 3:
+            continue
+        # `sh -c "<code>"` carries a command line in an argument. It is code, not data, so
+        # it is parsed in turn -- otherwise an interpreter is a hole straight through.
+        for arg in argv[1:]:
+            if not arg.startswith("-"):
+                units += command_units(arg, depth + 1)
+    if nested:
+        units.append((command, False))  # and the raw line too, for what parsing cannot see
+    return units or [(command, False)]
+
+
+def hit(units: list[tuple[str, bool]], pattern: str) -> str | None:
+    """The first unit this rule fires on, or None."""
+    for text, anchored in units:
+        if (re.match(pattern, text) if anchored else re.search(pattern, text)):
+            return text
+    return None
+
+
 def guard_problem(root: str, command: str, cfg: dict) -> str | None:
     enforce = cfg.get("enforce") or {}
+    units = command_units(command)
     groups = []
     if enforce.get("blockDestructiveGit", True):
         groups += DESTRUCTIVE + STAGING
@@ -477,8 +640,12 @@ def guard_problem(root: str, command: str, cfg: dict) -> str | None:
     if enforce.get("blockCredentialReads", True):
         groups += CREDENTIALS
     for pattern, why in groups:
-        if re.search(pattern, command):
+        if hit(units, pattern):
             return f"{why}."
+    if enforce.get("blockCredentialReads", True):
+        for pattern, why in SECRETS_IN_LINE:
+            if re.search(pattern, command):
+                return f"{why}."
 
     protected = cfg.get("protected") or ["main", "master"]
     trunk = cfg.get("trunk") or "main"
@@ -487,9 +654,10 @@ def guard_problem(root: str, command: str, cfg: dict) -> str | None:
     approvals = cfg.get("approvals") or {}
     cur = branch(root)
 
-    if enforce.get("pushToTrunkNeedsGate", True) and re.search(r"\bgit\s+push\b", command):
-        named = re.search(r"\bgit\s+push\b\s+\S+\s+\S", command)
-        targets_protected = bool(re.search(rf"\b({prot_re})\b", command)) or (
+    pushed = hit(units, r"\bgit\s+push\b") if enforce.get("pushToTrunkNeedsGate", True) else None
+    if pushed:
+        named = re.search(r"\bgit\s+push\b\s+\S+\s+\S", pushed)
+        targets_protected = bool(re.search(rf"\b({prot_re})\b", pushed)) or (
             not named and re.fullmatch(rf"({prot_re})", cur or "") is not None)
         if targets_protected:
             why = receipt_problem(root, "gate", "passed", max_age)
@@ -500,10 +668,11 @@ def guard_problem(root: str, command: str, cfg: dict) -> str | None:
                         f"receipt.")
 
     if enforce.get("mergeNeedsReadiness", True):
-        merging = re.search(r"\bgh\s+pr\s+merge\b", command) or (
-            re.search(r"\bgit\s+merge\b", command)
-            and not re.search(r"--(abort|continue|quit)\b", command)
-            and re.fullmatch(rf"({prot_re})", cur or "") is not None)
+        merging = bool(hit(units, r"\bgh\s+pr\s+merge\b"))
+        if not merging:
+            gm = hit(units, r"\bgit\s+merge\b")
+            merging = bool(gm) and not re.search(r"--(abort|continue|quit)\b", gm) \
+                and re.fullmatch(rf"({prot_re})", cur or "") is not None
         if merging:
             why = receipt_problem(root, "readiness", "ready", max_age)
             if why:
@@ -525,7 +694,7 @@ def guard_problem(root: str, command: str, cfg: dict) -> str | None:
         return over
 
     # Deployment is a separate authority from merging, and defaults to a human's.
-    deploying = any(re.search(pat, command) for pat in DEPLOY_PATTERNS)
+    deploying = any(hit(units, pat) for pat in DEPLOY_PATTERNS)
     if deploying:
         if approvals.get("release", "human") == "human":
             why = receipt_problem(root, "approval_release", "granted", max_age)

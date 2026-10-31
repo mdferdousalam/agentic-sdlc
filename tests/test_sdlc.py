@@ -90,6 +90,30 @@ for cmd in ["git stash list", "git status --short", "git add src/main.rs",
             "git commit -m 'fix the -a flag'", "cargo test", "gh pr create --fill"]:
     ok(guard(d, cmd).returncode == 0, f"allowed: {cmd}")
 
+print("guard: a rule is about a command, not about the text of a command line")
+# Matching raw text failed in both directions at once, and both halves are regressions
+# worth a test: the global option that slipped past, and the prose that was refused.
+for cmd in ["git -c core.pager=cat stash", "git --no-pager stash", "git -C . clean -fd",
+            "git -c a=b reset --hard HEAD~1", "git --git-dir=.git stash",
+            "git -c a=b -C . --no-pager push --force origin main",
+            "/usr/bin/git -c core.pager=cat stash", "sudo git clean -fd",
+            "FOO=bar git stash", "env GIT_DIR=.git git stash", "echo $(git stash)",
+            "bash -c 'git stash'", 'sh -c "git -c core.pager=cat stash"',
+            "true && git stash", "ls | xargs git clean -fd"]:
+    ok(guard(d, cmd).returncode == 2, f"blocked: {cmd}")
+for cmd in ['sdlc finding write --detail "git stash is refused by the guard"',
+            'echo "git push --force is the maintainer\'s call"',
+            'git commit -m "document why git stash is refused"',
+            'grep -rn "git clean" docs/',
+            "cat > notes.md <<EOF\ngit stash\ngit reset --hard\nnpm publish\nEOF",
+            'python3 -c "print()" --note "rm -rf / is refused"']:
+    ok(guard(d, cmd).returncode == 0, f"allowed, it only describes the command: {cmd}")
+# The receipt the gate itself writes names the findings it is reporting. A control that
+# cannot record its own verdict is not a control.
+ok(guard(d, 'sdlc receipt write --kind readiness --verdict not-ready '
+             '--detail "18 of 18 refusals bypassed: git stash, git clean -fd, npm publish"'
+         ).returncode == 0, "allowed: the gate can write its own NOT-READY receipt")
+
 print("guard: publishing")
 for cmd in ["git tag v1.0", "npm publish", "cargo publish", "gh release create v1",
             "docker push x/y", "git push --tags origin"]:
