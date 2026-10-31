@@ -7,12 +7,19 @@ and — as a PreToolUse hook — refuses the actions that would skip a stage.
 
     sdlc init [--write]          detect the stack and write sdlc.config.json
     sdlc config                  print the effective configuration
-    sdlc receipt write KIND --verdict V [--subject S] [--detail D]
-    sdlc receipt check KIND [--verdict V] [--max-age-min N]
-    sdlc receipt show  KIND
+    sdlc doctor                  check the install, the config and the repo
     sdlc status                  where this unit of work stands
     sdlc guard                   PreToolUse hook: reads tool JSON on stdin, exit 2 blocks
-    sdlc doctor                  check the install, the config and the repo
+    sdlc install | uninstall     set this pipeline up for a host, or remove it
+    sdlc receipt write|check|show KIND      a stage's verdict, bound to a commit and a clock
+    sdlc finding write|list|show|close      a defect as a record, not as prose
+    sdlc baseline capture|compare|show      what verifyCmd said before the work began
+    sdlc tests audit             what in this diff makes the gate easier to pass
+    sdlc budget show|reset       the ceiling an agent cannot raise for itself
+    sdlc checkpoint write|resume|show       long work, and whether resuming is still safe
+    sdlc approve merge|release|exception    a named person accepting accountability
+    sdlc trace | metrics         the audit trail, and what the pipeline actually did
+    sdlc feedback                a failed attempt, so the next one carries the context
 
 Python 3.8+, standard library only, no network. Exit codes: 0 fine, 1 a check failed,
 2 blocked (the hook contract), 3 misuse.
@@ -21,34 +28,75 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import fnmatch
 import glob
 import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 CONFIG_NAMES = ("sdlc.config.json", ".opencode/sdlc.json")
 RECEIPT_DIR = ".sdlc/receipts"
-RECEIPT_KINDS = ("spec", "verification", "review", "security", "quality", "gate",
+RECEIPT_KINDS = ("spec", "impact", "verification", "review", "security", "quality", "gate",
                  "readiness", "approval_merge", "approval_release", "approval_exception",
                  "release", "postdeploy")
 AUDIT_LOG = ".sdlc/audit.log"
 FEEDBACK = ".sdlc/feedback.json"
 DEFAULT_MAX_AGE_MIN = 180
+DOCS_BASE_URL = "https://github.com/mdferdousalam/agentic-sdlc/blob/main/docs/"
+RECEIPT_SKEW_MIN = 2        # clock skew between a CI runner and a laptop, no more
+FINDING_DIR = ".sdlc/findings"
+BASELINE = ".sdlc/baseline.json"
+BUDGET = ".sdlc/budget.json"
+CHECKPOINT = ".sdlc/checkpoint.json"
+
+# The finding vocabularies. Severity is how bad it is if real; confidence is how sure we are
+# that it is real. They are separate axes on purpose — see docs/control-spec.md §1.
+SEVERITIES = ("critical", "high", "medium", "low", "advisory")
+CONFIDENCES = ("high", "medium", "low")
+DETECTIONS = ("deterministic", "test", "runtime", "llm")
+FINDING_OUTCOMES = ("open", "fixed", "refused", "deferred", "unexecuted", "escalated")
+EXPLOITABILITY = ("remote", "local", "authenticated", "theoretical", "not-applicable")
+
+# The repair policy, as a table rather than as a paragraph an agent can reinterpret.
+# True: an agent may repair it unattended. False: report or escalate. "repro": only once the
+# finding has a reproduction, because at medium confidence the finding itself is in question.
+# docs/control-spec.md §2 is the readable copy; a test keeps the two from drifting.
+AUTOFIX = {
+    ("critical", "high"): True,   ("critical", "medium"): False, ("critical", "low"): False,
+    ("high", "high"): True,       ("high", "medium"): "repro",   ("high", "low"): False,
+    ("medium", "high"): True,     ("medium", "medium"): True,    ("medium", "low"): False,
+    ("low", "high"): True,        ("low", "medium"): True,       ("low", "low"): False,
+    ("advisory", "high"): False,  ("advisory", "medium"): False, ("advisory", "low"): False,
+}
 
 # --------------------------------------------------------------------------------------- git
 
 
 def git(*args: str, cwd: str | None = None) -> str:
+    """git's stdout, or "" when it failed. Ambiguous on purpose only where "" is also a
+    valid answer; where it is not, use `git_ok`."""
+    return git_ok(*args, cwd=cwd)[1]
+
+
+def git_ok(*args: str, cwd: str | None = None):
+    """(succeeded, stdout). For the callers where "" is a real answer and a failure is not.
+
+    `tree_clean` compared `git status --porcelain` to "" — so git failing to run at all read
+    as a clean tree, and the receipt check that depends on it passed. Any question whose
+    "no output" answer means "nothing is wrong" has to know the difference.
+    """
     try:
         p = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, timeout=20)
-        return p.stdout.strip()
+        return p.returncode == 0, p.stdout.strip()
     except Exception:
-        return ""
+        return False, ""
 
 
 def repo_root(start: str | None = None) -> str:
@@ -65,7 +113,80 @@ def branch(root: str) -> str:
 
 
 def tree_clean(root: str) -> bool:
-    return git("status", "--porcelain", "--untracked-files=no", cwd=root) == ""
+    ok, out = git_ok("status", "--porcelain", "--untracked-files=no", cwd=root)
+    return ok and out == ""      # git failing is not a clean tree
+
+
+def tree_digest(root: str) -> str:
+    """A digest of the working tree a receipt saw, untracked content included.
+
+    `treeClean` was a boolean from `--untracked-files=no`, which failed in both directions.
+    A new untracked file never made the tree dirty, so `verifyCmd` could be satisfied by a
+    file that was never committed and then removed, with the receipt still holding. And the
+    check only applied when the flag was true, so a receipt written over a dirty tree
+    recorded false and was never re-checked however much work piled up afterwards.
+
+    The first version of this hashed the porcelain listing plus `git diff HEAD`. That still
+    missed an *edit* to an untracked file, because the listing carries names and the diff
+    carries only tracked content — so the hole it was written to close stayed open for the
+    case that opened it. Untracked files are read.
+
+    `.sdlc/` is excluded by path prefix, not substring, because the receipts and findings
+    written during a stage are not the subject of it — but `my.sdlc/` is somebody's code.
+    """
+    ok, out = git_ok("status", "--porcelain", "--untracked-files=all", cwd=root)
+    if not ok:
+        # A digest nothing can match, so the receipt stops holding rather than the check
+        # quietly succeeding against an answer git never gave.
+        return "unreadable-working-tree"
+
+    def ours(path: str) -> bool:
+        return path == ".sdlc" or path.startswith(".sdlc/")
+
+    lines = sorted(l for l in out.split("\n") if l.strip() and not ours(l[3:].strip('"')))
+    h = hashlib.sha256()
+    h.update("\n".join(lines).encode())
+    h.update(b"\0")
+
+    ok_diff, content = git_ok("diff", "HEAD", "--", ".", ":(exclude).sdlc", cwd=root)
+    if not ok_diff and git_ok("rev-parse", "--verify", "HEAD", cwd=root)[0]:
+        return "unreadable-working-tree"   # there is a HEAD, so the diff should have worked
+    h.update(content.encode())
+
+    ok_u, listing = git_ok("ls-files", "-o", "--exclude-standard", "-z", cwd=root)
+    if not ok_u:
+        return "unreadable-working-tree"
+    # Every name is hashed, always. Content is hashed until the bounds are reached, and
+    # then names alone carry the rest. Returning a constant past the cap meant a repository
+    # with many untracked files had one digest for every possible content — the bound
+    # became a bypass, which is the opposite of what a bound is for.
+    seen = total = 0
+    capped = False
+    for rel in sorted(x for x in listing.split("\0") if x and not ours(x)):
+        seen += 1
+        h.update(b"\0")
+        h.update(rel.encode())
+        if capped or seen > SUBJECT_MAX_FILES:
+            capped = True
+            continue
+        full = os.path.join(root, rel)
+        if os.path.islink(full):
+            h.update(b"<symlink>")
+            continue
+        try:
+            with open(full, "rb") as fh:
+                while True:
+                    chunk = fh.read(SUBJECT_CHUNK)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > SUBJECT_MAX_BYTES:
+                        capped = True
+                        break
+                    h.update(chunk)
+        except OSError:
+            h.update(b"<unreadable>")
+    return ("capped-" if capped else "") + h.hexdigest()[:16]
 
 
 # ------------------------------------------------------------------------------------ config
@@ -106,6 +227,45 @@ def detect_trunk(root: str) -> str:
         if git("rev-parse", "--verify", "--quiet", f"refs/heads/{cand}", cwd=root):
             return cand
     return branch(root) or "main"
+
+
+# Cross-cutting standards worth proposing, by what the repository evidently does. Proposed,
+# never imposed: a concern the maintainers did not choose produces noise on every review, which
+# is how a review tool gets switched off.
+CONCERN_HINTS = (
+    ("concurrency", (r"\bgo\s+func\b", r"\basync\s+def\b", r"\bawait\b", r"\bthread\b",
+                     r"\bMutex\b", r"\btokio\b", r"\bgoroutine\b", r"sync\.")),
+    ("data", (r"\bCREATE\s+TABLE\b", r"\bALTER\s+TABLE\b", r"\bmigrations?\b",
+              r"\bprisma\b", r"\bsqlalchemy\b", r"\bdiesel\b", r"\bgorm\b")),
+    ("memory", (r"\bunsafe\b", r"\bmalloc\b", r"\bfree\(", r"\braw pointer\b",
+                r"#include <stdlib", r"\bBox::leak\b")),
+)
+
+
+def suggest_concerns(root: str) -> list:
+    """Which cross-cutting profiles this repository looks like it needs.
+
+    A shallow scan of tracked source, because a wrong guess here costs a reviewer's noise
+    budget. The maintainer edits the list; detection never overwrites it (see cmd_init).
+    """
+    names = [n for n in git("ls-files", cwd=root).splitlines()
+             if re.search(r"\.(go|rs|py|ts|tsx|js|jsx|java|kt|c|cc|cpp|h|sql|rb|cs|swift)$", n)]
+    if not names:
+        return []
+    sample, found = names[:400], []
+    for concern, patterns in CONCERN_HINTS:
+        hits = 0
+        for n in sample:
+            try:
+                body = open(os.path.join(root, n), errors="replace").read(20000)
+            except OSError:
+                continue
+            if any(re.search(pat, body, re.I) for pat in patterns):
+                hits += 1
+                if hits >= 2:  # one match is a coincidence
+                    found.append(concern)
+                    break
+    return found
 
 
 def detect(root: str) -> dict:
@@ -188,6 +348,7 @@ def detect(root: str) -> dict:
                    else "trufflehog git file://. --since-commit HEAD~50 --fail" if which("trufflehog")
                    else None)
 
+    concerns = suggest_concerns(root)
     cfg = {
         "$schema": "./schema/sdlc.config.schema.json",
         "version": 2,
@@ -208,6 +369,7 @@ def detect(root: str) -> dict:
         "secretScan": secret_scan,
         "heavy": None,
         "profile": None,
+        "concerns": concerns,
         "quality": {
             "cmd": None,
             "coverageNewPct": None,
@@ -223,7 +385,13 @@ def detect(root: str) -> dict:
         },
         "approvals": {"merge": "agent", "release": "human"},
         "attributeCommits": True,
-        "reviewers": ["sdlc-code-reviewer"] + (["sdlc-security-reviewer"] if stack in ("rust", "go", "node", "python", "java") else []),
+        # Seeded from what was detected, because `reviewers` is the single authority on
+        # who the gate fans out to — a list that never mentions the architecture reviewer
+        # means a prompt has to, and then two authorities disagree.
+        "reviewers": (["sdlc-code-reviewer"]
+                      + (["sdlc-security-reviewer"]
+                         if stack in ("rust", "go", "node", "python", "java") else [])
+                      + (["sdlc-architecture-reviewer"] if "architecture" in concerns else [])),
         "protected": ["main", "master", "release/*"],
         "receipts": {"maxAgeMin": DEFAULT_MAX_AGE_MIN},
         "enforce": {
@@ -246,21 +414,59 @@ def receipt_path(root: str, kind: str) -> str:
     return os.path.join(root, RECEIPT_DIR, f"{kind}.json")
 
 
+SUBJECT_MAX_FILES = 2000
+SUBJECT_MAX_BYTES = 64 * 1024 * 1024
+SUBJECT_CHUNK = 1 << 20
+
+
 def subject_digest(root: str, subject: str) -> str | None:
-    if not subject:
+    """A digest of what a receipt was granted over, or None.
+
+    The subject comes from a receipt file, which is to say from whatever wrote one. It was
+    joined to the root unchecked and read whole into memory, on every guard call that
+    consults that receipt: `"subject": "/dev/zero"` or a path outside the repository was a
+    read the guard performed on request. It is resolved inside the root, and the walk is
+    bounded. Exceeding a bound returns a digest that cannot match, so the receipt stops
+    holding rather than the check being skipped.
+    """
+    if not subject or not isinstance(subject, str):
         return None
-    p = os.path.join(root, subject)
-    h = hashlib.sha256()
-    if os.path.isfile(p):
-        h.update(open(p, "rb").read())
+    base = os.path.realpath(root)
+    p = os.path.realpath(os.path.join(root, subject))
+    if p != base and not p.startswith(base + os.sep):
+        return "sha256:outside-the-repository"
+    h, seen, total = hashlib.sha256(), 0, 0
+
+    def eat(f):
+        nonlocal total
+        with open(f, "rb") as fh:
+            while True:
+                chunk = fh.read(SUBJECT_CHUNK)
+                if not chunk:
+                    return True
+                total += len(chunk)
+                if total > SUBJECT_MAX_BYTES:
+                    return False
+                h.update(chunk)
+
+    if os.path.isfile(p) and not os.path.islink(p):
+        if not eat(p):
+            return "sha256:subject-too-large"
     elif os.path.isdir(p):
         for dirpath, dirnames, names in os.walk(p):
             dirnames.sort()
             for n in sorted(names):
+                seen += 1
+                if seen > SUBJECT_MAX_FILES:
+                    return "sha256:subject-too-many-files"
                 f = os.path.join(dirpath, n)
                 h.update(os.path.relpath(f, p).encode())
+                if os.path.islink(f):
+                    h.update(b"<symlink>")
+                    continue
                 try:
-                    h.update(open(f, "rb").read())
+                    if not eat(f):
+                        return "sha256:subject-too-large"
                 except OSError:
                     pass
     else:
@@ -268,8 +474,32 @@ def subject_digest(root: str, subject: str) -> str | None:
     return "sha256:" + h.hexdigest()[:16]
 
 
-def audit(root: str, event: str, detail: str) -> None:
-    """Append-only record of everything the pipeline decided. Never rotated by this tool."""
+# What a secret looks like, for redaction. Deliberately the same shapes SECRETS_IN_LINE
+# refuses: if it is worth refusing a line for, it is worth not writing it down.
+SECRET_SHAPE = re.compile(
+    r"\b(sk-[A-Za-z0-9]{12,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{12,}|"
+    r"xox[abprs]-[A-Za-z0-9-]{10,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+)")
+
+
+def redact(text: str) -> str:
+    """Keep the shape, drop the secret.
+
+    The guard refused a line for carrying a credential and then wrote that line, credential
+    and all, into `.sdlc/audit.log` — which `docs/compliance.md` tells operators to ship to
+    a log store. The refusal is worth recording; the secret is not, and copying it into a
+    second place is the opposite of the control's purpose.
+    """
+    return SECRET_SHAPE.sub(lambda m: m.group(0)[:7] + "…redacted", str(text))
+
+
+def audit(root: str, event: str, detail: str, data: dict | None = None) -> None:
+    """Append-only record of everything the pipeline decided. Never rotated by this tool.
+
+    `detail` is prose, for a person reading the log. `data` is the same facts as JSON in a
+    seventh field, for anything that counts them: `sdlc metrics` used to re-parse the prose,
+    so rewording a message changed a number, and a message that did not match the expected
+    shape was silently counted as nothing.
+    """
     try:
         p = os.path.join(root, AUDIT_LOG)
         os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -279,8 +509,9 @@ def audit(root: str, event: str, detail: str) -> None:
             (head(root) or "")[:9],
             branch(root) or "-",
             os.environ.get("CLAUDE_AGENT") or os.environ.get("OPENCODE_AGENT") or "-",
-            re.sub(r"\s+", " ", str(detail))[:400],
-        ])
+            redact(re.sub(r"\s+", " ", str(detail)))[:400],
+        ] + ([redact(json.dumps(data, separators=(",", ":"), sort_keys=True))[:400]]
+             if data else []))
         with open(p, "a") as fh:
             fh.write(line + "\n")
     except Exception:
@@ -299,13 +530,20 @@ def receipt_write(root: str, kind: str, verdict: str, subject: str, detail: str,
         "by": by,
         "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "treeClean": tree_clean(root),
+        "treeDigest": tree_digest(root),
+        # The ids open when this verdict was given. Corrupting a finding file was closed by
+        # reading it as blocking; deleting one was not, because an absent file looks exactly
+        # like a finding that never existed. A receipt that lists them can tell.
+        "openFindings": sorted(f["id"] for f in findings_blocking(root)),
+        "env": environment(root),
     }
     p = receipt_path(root, kind)
     os.makedirs(os.path.dirname(p), exist_ok=True)
     with open(p, "w") as fh:
         json.dump(r, fh, indent=2)
         fh.write("\n")
-    audit(root, f"receipt.{kind}", f"{verdict} by {by}: {detail}")
+    audit(root, f"receipt.{kind}", f"{verdict} by {by}: {detail}",
+          {"kind": kind, "verdict": verdict, "by": by})
     print(f"{kind}: {verdict}  ->  {os.path.relpath(p, root)}")
     return 0
 
@@ -336,9 +574,53 @@ def receipt_problem(root: str, kind: str, verdict: str | None, max_age_min: int,
         age = (time.time() - calendar.timegm(time.strptime(r["at"], "%Y-%m-%dT%H:%M:%SZ"))) / 60
     except Exception:
         return f"the {kind} receipt has no readable timestamp"
+    # A future timestamp was the whole forgery: staleness is `age > limit`, and a receipt
+    # dated next month has a negative age, so it never expired. Nothing can be granted before
+    # the work it describes. The tolerance is for clock skew between a CI runner and a laptop,
+    # not a margin anyone should rely on.
+    if age < -RECEIPT_SKEW_MIN:
+        return (f"the {kind} receipt is dated {int(-age)} minutes in the future — a receipt "
+                f"cannot be granted before the work it attests to")
     if age > max_age_min:
         return f"the {kind} receipt is {int(age)} minutes old (limit {max_age_min})"
+    # The tree the receipt saw, compared in both directions. A verdict describes a state of
+    # the working tree, and any change to that state — including an untracked file appearing
+    # or disappearing — is work the verdict did not see.
+    was = r.get("treeDigest")
+    if was and was != tree_digest(root):
+        return (f"the {kind} receipt was granted over a different working tree — "
+                f"there is uncommitted work it did not see")
+    if was is None and r.get("treeClean") and not tree_clean(root):
+        return (f"the {kind} receipt was granted over a clean tree, and the tree is dirty now — "
+                f"there is uncommitted work it did not see")
     return None
+
+
+def receipt_quiet(root: str, kind: str, verdict: str | None, max_age_min: int,
+                  require_commit: bool = True, why: str = "") -> str | None:
+    """`receipt_problem` with the same signature as `receipt_holds`, and no audit line.
+
+    The guard evaluates the rules a second time to ask what the defaults would have done.
+    That question must not leave a trace of a refusal that never happened, nor count a tool
+    call that was never made.
+    """
+    return receipt_problem(root, kind, verdict, max_age_min, require_commit)
+
+
+def receipt_holds(root: str, kind: str, verdict: str | None, max_age_min: int,
+                  require_commit: bool = True, why: str = "") -> str | None:
+    """`receipt_problem`, and a record either way.
+
+    Refusals were written to the audit log and acceptances were not, so the log showed every
+    door that stayed shut and none that opened. For an auditor that is the wrong half.
+    """
+    problem = receipt_problem(root, kind, verdict, max_age_min, require_commit)
+    where = f" ({why})" if why else ""
+    if problem:
+        audit(root, f"receipt.{kind}.refused", f"{problem}{where}")
+    else:
+        audit(root, f"receipt.{kind}.accepted", f"{verdict or 'any verdict'} held{where}")
+    return problem
 
 
 # ------------------------------------------------------------------------------------- guard
@@ -348,17 +630,28 @@ DESTRUCTIVE = [
     (r"\bgit\s+reset\s+(--hard|--merge|--keep)\b", "git reset --hard destroys uncommitted work"),
     (r"\bgit\s+clean\b", "git clean deletes untracked files"),
     (r"\bgit\s+(checkout|restore)\s+(--\s+)?\.(\s|$)", "this discards every uncommitted change"),
-    (r"\bgit\s+(push|branch)\b[^|;&]*--force(-with-lease)?\b", "force-push rewrites published history"),
+    (r"\bgit\s+(push|branch)\b[^|;&\n]*(--force(-with-lease)?\b|\s-\w*f)",
+     "force-push rewrites published history"),
     (r"\bgit\s+filter-(branch|repo)\b", "history rewriting is the maintainer's decision"),
     (r"\brm\s+(-[a-zA-Z]*\s+)*(-rf|-fr)\s+(/|~|\$HOME)(\s|$)", "refusing rm -rf of a root or home path"),
 ]
 PUBLISHING = [
     (r"\bgit\s+tag\b(?!\s+(-l|--list|-n))", "a tag is a public promise — the maintainer's call"),
-    (r"\bgit\s+push\b[^|;&]*(--tags|\brefs/tags/)", "pushing tags is the maintainer's call"),
+    (r"\bgit\s+push\b[^|;&\n]*(--tags|\brefs/tags/)", "pushing tags is the maintainer's call"),
     (r"\b(npm|pnpm|yarn|bun)\s+publish\b", "publishing is the maintainer's call"),
     (r"\bcargo\s+publish\b", "publishing is the maintainer's call"),
     (r"\b(twine|poetry)\s+(upload|publish)\b", "publishing is the maintainer's call"),
     (r"\bgh\s+release\s+(create|edit|delete|upload)\b", "cutting a release is the maintainer's call"),
+    # A workflow run is a remote publish entry point. Refused by name rather than by keyword:
+    # the deploy patterns below decide from the words on the line, and `publish.yml` carries
+    # none of them, so a publishing workflow read as an ordinary command.
+    (r"\bgh\s+workflow\s+run\b", "running a workflow can publish or deploy — the maintainer's call"),
+    # The same two routes through the API. Write-shaped only: `gh api` defaults to GET, and
+    # listing releases is a read. A method flag or a field flag is what makes it a write.
+    (r"\bgh\s+api\b(?=[^\n]*\b(releases|dispatches)\b)"
+     r"(?=[^\n]*(-X\s*(POST|PUT|PATCH|DELETE)|--method[\s=]*(POST|PUT|PATCH|DELETE)|"
+     r"(\s|^)(-f|-F)\s|--field|--raw-field))",
+     "creating a release or dispatching a workflow through the API is the maintainer's call"),
     (r"\bdocker\s+push\b", "pushing an image is a deploy — the maintainer's call"),
 ]
 STAGING = [
@@ -375,33 +668,631 @@ DEPLOY_PATTERNS = [
     r"\baws\s+(deploy|ecs|lambda|cloudformation|s3\s+sync)\b",
     r"\b(gcloud|az)\s+\w+\s+deploy\b",
     r"\b(flyctl|fly|vercel|netlify|heroku|railway|render)\s+(deploy|releases?)\b",
-    r"\bdocker\s+(compose\s+)?(up|stack\s+deploy)\b[^|;&]*(prod|production)",
+    r"\bdocker\s+(compose\s+)?(up|stack\s+deploy)\b[^|;&\n]*(prod|production)",
     r"\bansible-playbook\b",
-    r"\bgh\s+workflow\s+run\b[^|;&]*(deploy|release|prod)",
+    r"\bgh\s+workflow\s+run\b[^|;&\n]*(deploy|release|prod)",
 ]
 
 CREDENTIALS = [
-    (r"(^|[\s;|&(])(cat|bat|less|more|head|tail|strings|xxd|od|cp|scp|rsync|curl)\b[^|;&]*"
-     r"(\.env(\.(?!example|sample|template)[\w.-]+)?|/\.ssh/|/\.aws/|id_rsa|id_ed25519|\.pem|\.p12|"
-     r"credentials\.json|secrets\.ya?ml)(\s|$|['\")])",
+    # [^|;&\n] rather than [^|;&]: the negated class matched newlines, so in a multi-line
+    # command a reader verb on line 1 paired with a credential word forty lines later. The
+    # verb list stays to tools whose whole job is to emit a file's contents -- adding
+    # interpreters made it fire on any script that merely mentions one.
+    (r"(^|[\s;|&(])(cat|bat|less|more|head|tail|strings|xxd|od|cp|scp|rsync|curl|base64|"
+     r"cut|awk|sed|tr|sort|uniq|grep|egrep|fgrep|rg|ag|tar|gzip|gunzip|zip|dd|tee|install|mv|"
+     r"vi|vim|nano|emacs|open|python|python3|node|ruby|perl|php|go|java|docker|kubectl|aws|"
+     r"gcloud|az|wget|nc|openssl|gpg|jq|yq|xmllint|file|wc|diff|md5sum|shasum|sha256sum)"
+     r"\b[^\n]*"
+     r"(\.env(?!\.(?:example|sample|template|dist))[\w.-]*|/\.ssh/|/\.aws/|/\.gnupg/|/\.kube/|"
+     r"/\.docker/|\.npmrc|\.pypirc|\.netrc|id_rsa|id_ed25519|\.pem|\.p12|\.kdbx|"
+     r"credentials(\.json)?|secrets?\.ya?ml|service[-_]account[\w.-]*\.json|\.pgpass|/proc/self/environ|/\.config/gh/hosts\.ya?ml|\.git-credentials|\.docker/config\.json|\.kube/config|\.e\*|\.en\?|\.e\[n\]v)",
      "reading a credential file is forbidden"),
+    (r"(^|[\s;|&(])(printenv|env)\b[^\n]*\b\w*(SECRET|TOKEN|PASSWORD|PASSWD|"
+     r"API[-_]?KEY|PRIVATE[-_]?KEY|CREDENTIAL)\w*",
+     "printing a secret from the environment is forbidden"),
+    (r"(^|[\s;|&(])echo\s+\"?\$\{?\w*(SECRET|TOKEN|PASSWORD|API[-_]?KEY|"
+     r"PRIVATE[-_]?KEY)\w*",
+     "echoing a secret from the environment is forbidden"),
+]
+# A secret is a secret wherever it sits on the line -- in an argument, in a quoted string,
+# in a comment. This group alone is matched against the whole command rather than only in
+# command position.
+# A credential path standing alone as an argument. The verb list above is a convenience for
+# the message and will always be incomplete, so the path itself is also a subject: whoever is
+# reading it, naming one as a bare argument is refused. Matched unanchored but space-
+# delimited, which is what keeps it out of prose -- a path inside a quoted sentence is
+# joined by ";" in a rebuilt unit, never by a space.
+CREDENTIAL_PATHS = [
+    (r"(^| )[\w./~-]*(\.env(?!\.(?:example|sample|template|dist))[\w.-]*|/\.ssh/|/\.aws/|/\.gnupg/|/\.kube/|/\.docker/|\.npmrc|\.pypirc|\.netrc|id_rsa|id_ed25519|\.pem|\.p12|\.kdbx|credentials(\.json)?|secrets?\.ya?ml|service[-_]account[\w.-]*\.json)( |$)",
+     "this command names a credential file"),
+]
+SECRETS_IN_LINE = [
     (r"\b(sk-[A-Za-z0-9]{12,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{12,})",
      "a credential appears in this command line"),
+    # Printing the whole environment, and the shorthands for fetching a live token.
+    (r"(^|[\s;|&(])(printenv|env)\s*(\||>|$)", "printing the environment exposes every secret in it"),
+    (r"\bgh\s+auth\s+token\b", "this prints a live credential"),
+    (r"\bgit\s+(show|cat-file)\b[^\n]*:[\w./-]*\.env\b", "this reads a credential file out of git"),
+    (r"(^|[\s;|&(=\"'])cat\s+[\w./-]*\.e(\*|\?|\[)", "a glob that matches a credential file"),
 ]
 
 
-def guard_problem(root: str, command: str, cfg: dict) -> str | None:
+# ------------------------------------------------------------------- reading a command line
+#
+# The rules above describe *commands*. Matching them against the raw text of a command line
+# failed in both directions at once, and one repair closes both:
+#
+#   git -c core.pager=cat stash      was allowed -- a global option between `git` and the
+#                                    subcommand defeated every `\bgit\s+stash\b` pattern.
+#   sdlc finding write --detail      was refused -- prose that merely quoted a forbidden
+#     "git stash is refused"         command read as the command itself. A control that
+#                                    cannot record its own verdict is not a control.
+#
+# So: parse the line, split it at the shell operators, drop git's global options, and keep an
+# argument's own text out of command position. Every parse failure falls back to matching the
+# raw line, which is what the guard did before -- failing closed, never open.
+
+# git's own options, which may appear between `git` and the subcommand.
+GIT_GLOBAL_VALUE_OPTS = {"-c", "-C", "--exec-path", "--git-dir", "--work-tree", "--namespace",
+                         "--super-prefix", "--config-env", "--attr-source"}
+# Wrappers that run another command: the rule applies to what they run, not to them. The
+# second element is the wrapper's own options that take a SEPARATE value -- `sudo -u ci git
+# clean -fd` left `ci` in command position, which is how anchoring lost the refusal.
+COMMAND_WRAPPERS = {
+    "sudo": {"-u", "-g", "-C", "-h", "-p", "-U", "-r", "-t"},
+    "doas": {"-u", "-C"},
+    "env": {"-u", "-C", "-S"},
+    "nohup": set(),
+    "time": {"-o", "-f"},
+    "command": set(),
+    "builtin": set(),
+    "exec": {"-a"},
+    "xargs": {"-I", "-i", "-a", "-d", "-E", "-e", "-L", "-l", "-n", "-P", "-s", "--replace"},
+    "nice": {"-n"},
+    "ionice": {"-c", "-n", "-p"},
+    "stdbuf": {"-i", "-o", "-e"},
+    "setsid": set(),
+    "timeout": {"-s", "-k", "--signal", "--kill-after"},
+}
+# Wrappers that are themselves the subject of a rule. Stripping `env` removed the very word
+# the credential rule matches, so `env MY_TOKEN` stopped being refused.
+WRAPPERS_THAT_ARE_RULE_SUBJECTS = {"env", "printenv"}
+# Shell keywords in command position. `for f in a b; do git clean -fd; done` put `do` where
+# the program goes.
+SHELL_KEYWORDS = {"if", "then", "elif", "else", "fi", "do", "done", "while", "until", "for",
+                  "case", "esac", "select", "function", "!", "{", "}", "time"}
+# Interpreters whose argument is code rather than data.
+SHELL_INTERPRETERS = {"sh", "bash", "zsh", "dash", "ksh", "fish", "eval", "source", "."}
+# Flags whose value is a command, whatever the program.
+CODE_OPTIONS = {"-c", "--command", "-e", "--eval", "-x", "--exec", "-exec", "-S", "--execute",
+                "--eval-command", "-execdir", "-o", "--to-command", "--checkpoint-action",
+                "-P", "--pager", "--rsh", "--ssh-command", "--upload-pack",
+                "--receive-pack", "--editor"}
+# Interpreters whose code operand is not shell, so shell parsing cannot reach inside it.
+# `python3 -c 'os.system("git stash")'` is a real invocation and the payload sits in a
+# string literal; the operand is matched raw rather than parsed, because it is code and not
+# somebody's prose.
+SCRIPT_INTERPRETERS = {"python", "python3", "node", "deno", "bun", "ruby", "perl", "php",
+                       "Rscript", "osascript", "pwsh", "powershell"}
+# Consumers that write a heredoc body down rather than running it. Everything else gets
+# its body parsed, because the list of things that RUN one cannot be kept complete:
+# `python3 - <<X`, `at now <<X` and `make -f - <<X` were each missing from it.
+INERT_CONSUMERS = {"cat", "tee", "echo", "printf", "sdlc", "bat", "head", "tail", "wc",
+                   "less", "more", "sort", "uniq", "grep", "diff", "jq", "yq", "column",
+                   "fold", "nl", "md5sum", "shasum", "sha256sum", "base64", "tr", "rev"}
+# Programs that run what they are handed, without being a shell themselves.
+COMMAND_RUNNERS = {"ssh", "su", "doas", "flock", "watch", "parallel", "script", "chroot",
+                   "nsenter", "docker", "podman", "kubectl", "oc", "vagrant", "ansible",
+                   "rsh", "telnet", "expect", "screen", "tmux", "at", "batch", "awk", "gawk",
+                   "mawk", "xargs", "entr", "systemd-run", "runuser", "setpriv", "lldb",
+                   "gdb", "man", "git-submodule", "make", "ninja", "just", "task"}
+# Runners that take the command to run from stdin, so a pipe into one makes everything
+# upstream of it code. `echo "git stash" | at now` runs it; `| sh` was already caught
+# because a shell is an interpreter, and these are the same shape without the name.
+STDIN_RUNNERS = {"at", "batch", "xargs", "parallel", "entr", "expect", "script"}
+PIPE_INTO_RUNNER = re.compile(
+    r"\|\s*(?:sudo\s+|command\s+|env\s+\S+=\S+\s+)*(?:/(?:usr/)?(?:local/)?s?bin/)?(%s)(?![\w./-])" % "|".join(
+        sorted(STDIN_RUNNERS)))
+# `!` in operand position is the shell escape, and it is a convention rather than one
+# program's flag: a git or gh alias beginning with it, `less +!cmd`, `vi +!cmd`, `psql \!cmd`.
+# Matching the shape rather than naming the programs is the point — the list of programs that
+# honour it cannot be kept complete, and three of them were missing when this was written.
+BANG_ESCAPE = re.compile(r"^[+\\]!\s*(\S.*)$", re.S)
+BANG_ALIAS = re.compile(r"^!\s*(\S.*\s.*)$", re.S)
+BANG_ALIAS_PROGS = {"git", "gh", "hub"}
+# sqlite3 and duckdb run a dot-command operand; `.shell` and `.system` are a shell.
+DOT_SHELL = re.compile(r"^\s*\.(?:shell|system|once\s+\||excel)\s+(\S.*)$", re.S)
+# sed's `e` runs the rest of the line as a command, and the `s///e` flag runs what it
+# substituted. `-e` already reads its value as code; a bare script operand did not.
+SED_PROGS = {"sed", "gsed", "ssed"}
+SED_EXEC = re.compile(r"(?:(?:^|[;{\n])\s*[0-9,$~+!]*\s*|/(?:\\.|[^/\\])*/\s*)e\s+\S"
+                      r"|s(.)(?:\\.|(?!\1)[^\\])*\1(?:\\.|(?!\1)[^\\])*\1[a-zA-Z0-9]*e", re.S)
+SHELL_OPERATORS = {";", "&&", "||", "|", "|&", "&", "(", ")", "{", "}", "<", ">", ">>", "<<",
+                   "<<<"}
+ASSIGNMENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=", re.S)
+# A token still carrying an unexpanded expansion is one the shell will rewrite before running
+# it, so what we parsed is not what runs. `git${IFS}stash` is a real command.
+UNEXPANDED = re.compile(r"\$[({\w]|`|\{[^}\s]*,[^}\s]*\}")
+# What an expansion becomes, for the widened form: a word separator.
+EXPANSION = re.compile(r"\$\{[^}]*\}|\$\([^)]*\)|\$\w+|`[^`]*`")
+BRACE_LIST = re.compile(r"\{([^}\s]*,[^}\s]*)\}")
+
+
+def widen_expansions(text: str) -> str:
+    """Each unperformed expansion standing in for the separator the shell will make of it.
+
+    Only outside quotes. An expansion inside a quoted argument is still expanded by the
+    shell, but it stays one word, so widening it invented word boundaries that do not exist
+    — a backquoted span inside a quoted sentence then read as two bare words and the
+    sentence read as a command. Which it did, on a commit message describing this fix.
+    """
+    quoted = {i for i, _c, q in quote_spans(text) if q is not None}
+
+    def sub(m):
+        return " " if m.start() not in quoted else m.group(0)
+
+    def brace(m):
+        if m.start() in quoted:
+            return m.group(0)
+        return " " + m.group(1).replace(",", " ") + " "
+
+    return BRACE_LIST.sub(brace, EXPANSION.sub(sub, text))
+
+
+def quote_spans(text: str):
+    """Walk `text` once, yielding (index, char, in_quote) with shell quoting state.
+
+    Everything structural in this file -- where a line ends, where a heredoc starts -- has to
+    agree about what is inside quotes, or the parts disagree and the gap between them is the
+    bypass. One scan, used by all of them.
+    """
+    quote = None
+    i = 0
+    while i < len(text):
+        c = text[i]
+        if quote != "'" and c == "\\" and i + 1 < len(text):
+            yield i, c, quote
+            yield i + 1, text[i + 1], quote
+            i += 2
+            continue
+        if quote:
+            if c == quote:
+                quote = None
+                yield i, c, None
+                i += 1
+                continue
+        elif c in "\"'":
+            quote = c
+            yield i, c, None
+            i += 1
+            continue
+        yield i, c, quote
+        i += 1
+
+
+HEREDOC = re.compile(r"(?<!<)<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1(?!<)")  # not a here-string
+
+
+def strip_heredocs(command: str, kept: list | None = None):
+    """Drop heredoc bodies, or None if the line cannot be parsed.
+
+    A heredoc body is text being written, not a command run. But the marker has to be found
+    outside quotes: `echo "see <<EOF for details"` is not a heredoc, and reading it as one
+    discarded every following line unscanned -- which is to say it hid them from every rule.
+    An unterminated heredoc is a parse failure and says so, rather than silently swallowing
+    the rest of the input.
+    """
+    if "<<" not in command:
+        return command
+    unquoted = {i for i, _c, q in quote_spans(command) if q is None}
+    lines, out, i, offset = command.split("\n"), [], 0, 0
+    starts = {}
+    pos = 0
+    for n, line in enumerate(lines):
+        # A `<<EOF` after an unquoted `#` is inside a comment, not a heredoc start. Checked
+        # here rather than by stripping comments first, because stripping them first ran
+        # over heredoc bodies and read their text as shell -- a markdown heading in a body
+        # became a comment, and the quoting after it came apart.
+        cut = len(line)
+        for k, c, q in quote_spans(line):
+            if c == "#" and q is None and (k == 0 or line[k - 1] in " \t;|&("):
+                cut = k
+                break
+        m = HEREDOC.search(line[:cut])
+        if m and (pos + m.start()) in unquoted:
+            starts[n] = (m.group(2), bool(m.group(1)))
+        pos += len(line) + 1
+    while i < len(lines):
+        out.append(lines[i])
+        word, quoted = starts.get(i, (None, False))
+        hd_line = lines[i]
+        i += 1
+        if word is None:
+            continue
+        body = []
+        while i < len(lines) and lines[i].strip() != word:
+            body.append(lines[i])
+            i += 1
+        if i >= len(lines):
+            return None          # no terminator: a parse failure, not an invitation
+        # Whether the body is data depends on who is reading it. `cat > notes.md <<EOF` writes
+        # it down; `python3 - <<X`, `at now <<X` and `make -f - <<X` execute it. The list of
+        # consumers that run a body cannot be kept complete, so the allowlist is the other
+        # way round: inert consumers are named, and everything else has its body parsed.
+        consumer = ""
+        toks = [t for t in re.split(r"[\s;|&<>()]+", hd_line) if t]
+        for t in toks:
+            if not t.startswith("-") and "=" not in t:
+                consumer = program_name(t)
+                break
+        if consumer and consumer not in INERT_CONSUMERS:
+            out.extend(body)
+            if kept is not None:
+                # Also raw: a body fed to python3, awk or make is code in another language,
+                # and shell parsing cannot see inside its string literals.
+                kept.append("\n".join(body))
+        # A quoted delimiter (<<'EOF') makes the body inert as far as EXPANSION goes. An
+        # unquoted one does not: the shell expands $(...) and backticks in it before a byte
+        # is written, so those run.
+        elif not quoted:
+            for b in body:
+                for mm in re.finditer(r"\$\(([^)]*)\)|`([^`]*)`", b):
+                    out.append(mm.group(1) or mm.group(2) or "")
+        out.append(lines[i])
+        i += 1
+    return "\n".join(out)
+
+
+def strip_comments(command: str) -> str:
+    """Drop `# ...` to end of line, the way bash does.
+
+    shlex has its own commenter, and it ran after newlines had been flattened into ` ; ` —
+    so a single `#` anywhere discarded the rest of the entire input. `echo hi # x` on line
+    one hid `git stash` on line two, with no evasion involved. shlex's commenter is off now
+    and this does it per line. bash starts a comment only at a word boundary, so `a#b` is a
+    word and not a comment; shlex disagreed, and that was a second way through.
+    """
+    if "#" not in command:
+        return command
+    state = {i: q for i, _c, q in quote_spans(command)}
+    out, line, prev, i = [], [], "", 0
+    while i < len(command):
+        c = command[i]
+        if c == "\n":
+            out.append("".join(line)); line = []; prev = ""; i += 1; continue
+        if c == "#" and state.get(i) is None and (prev == "" or prev in " \t;|&("):
+            while i < len(command) and command[i] != "\n":
+                i += 1
+            continue
+        line.append(c); prev = c; i += 1
+    out.append("".join(line))
+    return "\n".join(out)
+
+
+def newlines_to_separators(command: str) -> str:
+    """An unquoted newline ends a command. shlex treats it as whitespace, so two commands on
+    two lines became one argv list anchored on the first program -- and `echo hello` on line
+    one hid anything on line two. Routine multi-line input, no evasion required."""
+    out = []
+    for _i, c, q in quote_spans(command):
+        out.append(" ; " if (c == "\n" and q is None) else c)
+    return "".join(out)
+
+
+def code_substitutions(text: str):
+    """Every `$(...)` and backquoted span that the shell will execute.
+
+    A substitution inside DOUBLE quotes still runs — it is one word to the shell, but the
+    command inside it executes all the same. Widening was taught to leave quoted expansions
+    alone, correctly, because they are one word; but "not widened" was then read as "nothing
+    to look at", and `git commit -m "$(git push --force origin main)"` became invisible.
+    One word and no command are different claims.
+
+    Inside SINGLE quotes nothing is substituted, and a backslash-escaped `$` or backtick in
+    double quotes is literal. `quote_spans` already tracks both.
+    """
+    out, i, n = [], 0, len(text)
+    state = {k: q for k, _c, q in quote_spans(text)}
+    escaped = set()
+    k = 0
+    while k < n - 1:
+        if text[k] == "\\" and state.get(k) != "'":
+            escaped.add(k + 1)
+            k += 2
+            continue
+        k += 1
+    while i < n:
+        q = state.get(i)
+        if q == "'" or i in escaped:
+            i += 1
+            continue
+        if text.startswith("$(", i):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if text[j] == "(" and j not in escaped:
+                    depth += 1
+                elif text[j] == ")" and j not in escaped:
+                    depth -= 1
+                j += 1
+            out.append(text[i + 2:j - 1] if depth == 0 else text[i + 2:])
+            i = j
+            continue
+        if text[i] == "`":
+            j = text.find("`", i + 1)
+            out.append(text[i + 1:j] if j != -1 else text[i + 1:])
+            i = (j + 1) if j != -1 else n
+            continue
+        i += 1
+    return [c for c in out if c.strip()]
+
+
+def program_name(token: str) -> str:
+    return os.path.basename(token.strip("`\\'\""))
+
+
+def strip_wrappers(argv: list[str]) -> list[str]:
+    """Look through `sudo -u ci`, `env VAR=x`, `timeout 5`, `do`, `if` to the real command."""
+    seen = 0
+    while argv and seen < 12:
+        seen += 1
+        head = argv[0]
+        if ASSIGNMENT.match(head):
+            argv = argv[1:]
+            continue
+        name = program_name(head)
+        if name in SHELL_KEYWORDS and name not in COMMAND_WRAPPERS:
+            argv = argv[1:]
+            continue
+        if name in COMMAND_WRAPPERS:
+            takes_value = COMMAND_WRAPPERS[name]
+            rest = argv[1:]
+            while rest:
+                tok = rest[0]
+                if ASSIGNMENT.match(tok):
+                    rest = rest[1:]
+                elif tok.split("=", 1)[0] in takes_value and "=" not in tok:
+                    rest = rest[2:]          # the option and its separate value
+                elif tok.startswith("-"):
+                    rest = rest[1:]
+                elif re.fullmatch(r"[\d.]+[smhd]?", tok):
+                    rest = rest[1:]          # timeout 5, nice 10
+                else:
+                    break
+            if not rest:
+                return []
+            argv = rest
+            continue
+        return argv
+    return argv
+
+
+def strip_git_globals(rest: list[str]) -> list[str]:
+    """Everything dash-prefixed before git's subcommand is a global option. Drop it."""
+    i = 0
+    while i < len(rest) and rest[i].startswith("-"):
+        name = rest[i].split("=", 1)[0]
+        i += 2 if (name in GIT_GLOBAL_VALUE_OPTS and "=" not in rest[i]) else 1
+    return rest[i:]
+
+
+def simple_commands(command: str):
+    """The line as a list of argv lists, or None if it cannot be parsed."""
+    lex = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    lex.commenters = ""      # handled per line, before newlines became separators
+    try:
+        tokens = list(lex)
+    except ValueError:
+        return None                     # an unbalanced quote: the caller matches raw
+    out, cur = [], []
+    for tok in tokens:
+        tok = tok.strip("`")
+        if not tok:
+            continue
+        if tok in SHELL_OPERATORS:
+            if cur:
+                out.append(cur)
+            cur = []
+            continue
+        cur.append(tok)
+    if cur:
+        out.append(cur)
+    return out
+
+
+def rebuild(argv: list[str]) -> str:
+    if not argv:
+        return ""
+    if program_name(argv[0]) == "git":
+        argv = ["git"] + strip_git_globals(argv[1:])
+    else:
+        argv = [program_name(argv[0])] + argv[1:]
+    # An argument's own whitespace is data, never a boundary between words of a command.
+    # Collapsing it is what keeps a quoted sentence from reading as the command it describes,
+    # and it is why the rules do not also need anchoring to position 0.
+    return " ".join(re.sub(r"\s+", ";", a) for a in argv)
+
+
+def command_units(command: str, depth: int = 0) -> list[tuple[str, bool]]:
+    """The line as (text, parsed) units to match rules against.
+
+    `parsed` is False for a unit that is the raw line, kept whenever parsing could not be
+    trusted. Rules are matched across the whole of a unit, not anchored at its start: a
+    refused command reached through `find -exec`, `ssh host`, `git submodule foreach` or a
+    shell keyword sits in argument position and is still run.
+    """
+    kept_bodies = []
+    body = strip_heredocs(command, kept_bodies)
+    body = strip_comments(body) if body is not None else None
+    parsed = simple_commands(newlines_to_separators(body)) if body is not None else None
+    if parsed is None:
+        return [(command, False)]
+    units, nested, suspect = [], False, False
+    units += [(b, False) for b in kept_bodies if b.strip()]
+    # An expansion is a word separator the shell has not performed yet: `git${IFS}stash` is
+    # one token here and two words to bash, and `{git,stash}` is a brace list that expands to
+    # a real command. Widen the line and parse it again -- it has to happen before lexing,
+    # because an argument's own whitespace is collapsed afterwards.
+    # A substitution executes wherever it is not single-quoted, so its body is parsed as
+    # the command it is — separately from widening, which is about word boundaries.
+    if depth < 3:
+        for sub in code_substitutions(command):
+            units += [u for u in command_units(sub, depth + 1) if u[1]]
+    # A runner that reads its command from stdin makes the whole line code, the same way a
+    # shell does. Nothing downstream of the pipe can be read from the upstream argv.
+    if PIPE_INTO_RUNNER.search(command):
+        suspect = True
+    widened_line = widen_expansions(command) if UNEXPANDED.search(command) else command
+    if widened_line != command:
+        # An expansion outside quotes is a word separator the shell has not performed yet.
+        # Inside quotes it is not, and widening there invented boundaries that do not exist.
+        suspect = True
+        if depth < 3:
+            units += [u for u in command_units(widened_line, depth + 1) if u[1]]
+    for argv in parsed:
+        if not argv:
+            continue
+        stripped = strip_wrappers(argv)
+        for form in ({tuple(argv), tuple(stripped)} if stripped else {tuple(argv)}):
+            text = rebuild(list(form))
+            if text:
+                units.append((text, True))
+        head = program_name(stripped[0]) if stripped else ""
+        if head in SHELL_INTERPRETERS:
+            nested = True
+            if depth < 3:
+                for arg in stripped[1:]:
+                    if not arg.startswith("-"):
+                        units += command_units(arg, depth + 1)
+        # An operand can be code without the program being a shell. `ssh host 'git push
+        # --force'`, `su -c`, `docker exec c '...'`, `git rebase -x '...'` and a git `-c`
+        # alias all run what they are handed, and reading it as prose is how each of them
+        # slipped past. Two ways in: a flag whose value is code, and a runner whose quoted
+        # operand is.
+        forms = [stripped, argv] if stripped != argv else [argv]
+        for form in (forms if depth < 3 else []):
+            if not form:
+                continue
+            prog = program_name(form[0])
+            for n, arg in enumerate(form):
+                code = None
+                name = arg.split("=", 1)[0]
+                if name in CODE_OPTIONS:
+                    code = (arg.split("=", 1)[1] if "=" in arg
+                            else (form[n + 1] if n + 1 < len(form) else None))
+                elif prog in COMMAND_RUNNERS and " " in arg and not arg.startswith("-"):
+                    code = arg
+                elif (prog == "git" and " " in arg and not arg.startswith("-")
+                      and any(v in form for v in ("foreach", "bisect", "filter-branch"))):
+                    code = arg          # git subcommands that run a shell command
+                elif BANG_ESCAPE.match(arg):
+                    code = BANG_ESCAPE.match(arg).group(1)
+                elif prog in BANG_ALIAS_PROGS and BANG_ALIAS.match(arg):
+                    code = BANG_ALIAS.match(arg).group(1)
+                elif DOT_SHELL.match(arg):
+                    code = DOT_SHELL.match(arg).group(1)
+                elif (prog in SED_PROGS and n and not arg.startswith("-")
+                      and SED_EXEC.search(arg)):
+                    code = arg
+                elif prog == "git" and name == "-c":
+                    val = (arg.split("=", 1)[1] if "=" in arg
+                           else (form[n + 1] if n + 1 < len(form) else "")) or ""
+                    # `-c alias.x='!git stash'` and `-c core.pager='git stash'` both execute
+                    _, _, rhs = val.partition("=")
+                    code = rhs.lstrip("!") if (" " in rhs or rhs.startswith("!")) else None
+                if code:
+                    # Parsed, so no raw-line fallback: that is for an interpreter whose
+                    # argument we could not reach, and adding it here made every quoted
+                    # sentence on the line readable as a command again.
+                    units += command_units(code, depth + 1)
+                    units.append((code, False))
+    if nested or suspect:
+        units.append((command, False))
+    return units or [(command, False)]
+
+
+def hit(units, pattern: str, anchored: bool = False) -> str | None:
+    """The first unit this rule fires on, or None.
+
+    `anchored` is for the credential rules alone. They span from a reading verb to a filename
+    across arbitrary argument text, so they match from the start of a command: `cat` as the
+    program means a read, `cat` inside somebody's prose does not.
+    """
+    for text, is_parsed in units:
+        if anchored and not is_parsed:
+            continue
+        if (re.match(pattern, text) if anchored else re.search(pattern, text)):
+            return text
+    return None
+
+
+
+def findings_blocking(root: str) -> list:
+    """Open findings severe enough to stop a merge, worst first.
+
+    Read at the enforcement boundary rather than only reported by `sdlc finding list`, so a
+    READY receipt and an open critical cannot both be true at a merge.
+    """
+    rank = {"critical": 0, "high": 1}
+    out = []
+    # A file that will not parse is not an absent finding. Corrupting one was otherwise a
+    # way to clear a blocker without closing it, so an unreadable file blocks and says so.
+    for p in sorted(glob.glob(os.path.join(root, FINDING_DIR, "*.json"))):
+        try:
+            rec = json.load(open(p))
+            if not isinstance(rec, dict):
+                raise ValueError("not an object")
+        except Exception as e:
+            out.append({"id": os.path.basename(p)[:-5],
+                        "classification": {"severity": "critical"},
+                        "summary": f"this finding file cannot be read ({e})"})
+            continue
+        if rec.get("outcome") != "open":
+            continue
+        sev = (rec.get("classification") or {}).get("severity")
+        if sev in rank:
+            out.append(rec)
+    out.sort(key=lambda r: rank[r["classification"]["severity"]])
+    return out
+
+
+def receipt_vanished_findings(root: str) -> set:
+    """Ids the readiness receipt recorded as open that are no longer in the store."""
+    p = receipt_path(root, "readiness")
+    if not os.path.exists(p):
+        return set()
+    try:
+        recorded = set(json.load(open(p)).get("openFindings") or [])
+    except Exception:
+        return set()
+    if not recorded:
+        return set()
+    here = {os.path.basename(f)[:-5]
+            for f in glob.glob(os.path.join(root, FINDING_DIR, "*.json"))}
+    return recorded - here
+
+
+def guard_problem(root: str, command: str, cfg: dict, record: bool = True) -> str | None:
     enforce = cfg.get("enforce") or {}
+    units = command_units(command)
     groups = []
     if enforce.get("blockDestructiveGit", True):
         groups += DESTRUCTIVE + STAGING
     if enforce.get("blockPublishing", True):
         groups += PUBLISHING
-    if enforce.get("blockCredentialReads", True):
-        groups += CREDENTIALS
     for pattern, why in groups:
-        if re.search(pattern, command):
+        if hit(units, pattern):
             return f"{why}."
+    if enforce.get("blockCredentialReads", True):
+        for pattern, why in CREDENTIALS:
+            if hit(units, pattern, anchored=True):
+                return f"{why}."
+        for pattern, why in CREDENTIAL_PATHS:
+            if hit(units, pattern):
+                return f"{why}."
+        for pattern, why in SECRETS_IN_LINE:
+            if re.search(pattern, command):
+                return f"{why}."
 
     protected = cfg.get("protected") or ["main", "master"]
     trunk = cfg.get("trunk") or "main"
@@ -410,12 +1301,17 @@ def guard_problem(root: str, command: str, cfg: dict) -> str | None:
     approvals = cfg.get("approvals") or {}
     cur = branch(root)
 
-    if enforce.get("pushToTrunkNeedsGate", True) and re.search(r"\bgit\s+push\b", command):
-        named = re.search(r"\bgit\s+push\b\s+\S+\s+\S", command)
-        targets_protected = bool(re.search(rf"\b({prot_re})\b", command)) or (
+    pushed = hit(units, r"\bgit\s+push\b") if enforce.get("pushToTrunkNeedsGate", True) else None
+    if pushed:
+        named = re.search(r"\bgit\s+push\b\s+\S+\s+\S", pushed)
+        # --all and --mirror push every branch, including the trunk, and name none of them.
+        # --mirror also deletes remote refs that are absent locally.
+        sweeping = bool(re.search(r"\bgit\s+push\b[^\n]*--(all|mirror)\b", pushed))
+        targets_protected = sweeping or bool(re.search(rf"\b({prot_re})\b", pushed)) or (
             not named and re.fullmatch(rf"({prot_re})", cur or "") is not None)
         if targets_protected:
-            why = receipt_problem(root, "gate", "passed", max_age)
+            why = (receipt_holds if record else receipt_quiet)(root, "gate", "passed", max_age,
+                                why="pushing a protected branch")
             if why:
                 return (f"pushing a protected branch needs a passed gate receipt, and {why}.\n"
                         f"Run `/agentic-sdlc:gate` (the mechanical checks and the secret scan), or "
@@ -423,37 +1319,138 @@ def guard_problem(root: str, command: str, cfg: dict) -> str | None:
                         f"receipt.")
 
     if enforce.get("mergeNeedsReadiness", True):
-        merging = re.search(r"\bgh\s+pr\s+merge\b", command) or (
-            re.search(r"\bgit\s+merge\b", command)
-            and not re.search(r"--(abort|continue|quit)\b", command)
-            and re.fullmatch(rf"({prot_re})", cur or "") is not None)
+        merging = bool(hit(units, r"\bgh\s+pr\s+merge\b"))
+        if not merging:
+            gm = hit(units, r"\bgit\s+merge\b")
+            merging = bool(gm) and not re.search(r"--(abort|continue|quit)\b", gm) \
+                and re.fullmatch(rf"({prot_re})", cur or "") is not None
         if merging:
-            why = receipt_problem(root, "readiness", "ready", max_age)
+            # The findings store sat beside the gate and never reached it: a READY receipt
+            # for this commit let a merge through with an open critical finding against the
+            # same commit. A verdict and a defect list that disagree is the gate believing
+            # its own paperwork.
+            blocking = findings_blocking(root)
+            vanished = receipt_vanished_findings(root)
+            if vanished:
+                return (f"{len(vanished)} finding(s) the readiness receipt recorded as open "
+                        f"are no longer in the store: {', '.join(sorted(vanished)[:4])}.\n"
+                        f"A finding that disappears is not a finding that was closed. Restore "
+                        f"them, or re-run `/agentic-sdlc:readiness` so the verdict describes "
+                        f"the findings that actually exist.")
+            if blocking:
+                worst = ", ".join(f"{f['id']} {f['classification']['severity']}"
+                                  for f in blocking[:4])
+                more = f" and {len(blocking) - 4} more" if len(blocking) > 4 else ""
+                return (f"{len(blocking)} open finding(s) at critical or high block a merge: "
+                        f"{worst}{more}.\n"
+                        f"Close each with evidence — `sdlc finding close <id> --outcome fixed "
+                        f"--commit <sha>` — or record why it does not block, with "
+                        f"`--outcome refused` or `--outcome deferred`. `sdlc finding list "
+                        f"--open --severity critical` lists them.")
+            why = (receipt_holds if record else receipt_quiet)(root, "readiness", "ready", max_age, why="merging")
             if why:
                 return (f"merging needs a READY readiness receipt, and {why}.\n"
                         f"Run `/agentic-sdlc:readiness`. It runs the reviewers, the secret scan and "
                         f"the verify command, and checks every acceptance criterion against evidence.")
             if approvals.get("merge") == "human":
-                why = receipt_problem(root, "approval_merge", "granted", max_age)
+                why = (receipt_holds if record else receipt_quiet)(root, "approval_merge", "granted", max_age,
+                                    why="merging")
                 if why:
                     return (f"this project requires a human to approve a merge, and {why}.\n"
                             f"A person runs:  sdlc approve merge --as '<their name>'\n"
                             f"An agent must not run it for them — the approval records who is "
                             f"accountable, and an agent approving its own work records nothing.")
 
+    # X7: a ceiling the agent cannot raise for itself. Checked last, so a destructive command
+    # is still refused for the right reason when the budget also happens to be spent.
+    over = budget_problem(root, cfg) if record else None
+    if over:
+        return over
+
     # Deployment is a separate authority from merging, and defaults to a human's.
-    deploying = any(re.search(pat, command) for pat in DEPLOY_PATTERNS)
+    deploying = any(hit(units, pat) for pat in DEPLOY_PATTERNS)
     if deploying:
         if approvals.get("release", "human") == "human":
-            why = receipt_problem(root, "approval_release", "granted", max_age)
+            why = (receipt_holds if record else receipt_quiet)(root, "approval_release", "granted", max_age,
+                                why="deploying")
             if why:
                 return (f"deploying needs a human approval, and {why}.\n"
                         f"A person runs:  sdlc approve release --as '<their name>'\n"
                         f"Deployment changes what users are running. No agent grants itself that.")
-        why = receipt_problem(root, "readiness", "ready", max_age)
+        why = (receipt_holds if record else receipt_quiet)(root, "readiness", "ready", max_age, why="deploying")
         if why:
             return f"deploying needs a READY readiness receipt, and {why}."
     return None
+
+
+ENFORCE_FLAGS = ("pushToTrunkNeedsGate", "mergeNeedsReadiness", "branchNeedsApprovedSpec",
+                 "blockDestructiveGit", "blockPublishing", "blockCredentialReads")
+
+# The shape the guard depends on. A key with the wrong type here is not a typo to shrug at:
+# these are the keys the guard reads to decide whether to refuse, and reading them is what
+# used to raise.
+GUARD_CONFIG_TYPES = {
+    "trunk": str, "enforce": dict, "protected": list, "neverByAgent": list,
+    "approvals": dict, "receipts": dict, "budget": dict, "quality": dict,
+    "suiteAudit": dict, "reviewers": list, "concerns": list,
+}
+
+
+def config_type_problems(cfg) -> list:
+    """Keys the guard reads whose type it cannot work with."""
+    if not isinstance(cfg, dict):
+        return [f"the configuration is {type(cfg).__name__}, not an object"]
+    out = []
+    for key, want in GUARD_CONFIG_TYPES.items():
+        got = cfg.get(key)
+        if key in cfg and got is not None and not isinstance(got, want):
+            out.append(f'"{key}" is {type(got).__name__}, expected {want.__name__}')
+    enforce = cfg.get("enforce")
+    if isinstance(enforce, dict):
+        for k, v in enforce.items():
+            if not isinstance(v, bool):
+                out.append(f'"enforce.{k}" is {type(v).__name__}, expected true or false')
+    return out
+
+
+def guard_decide(root: str, command: str, cfg: dict, meter: bool = True) -> str | None:
+    """Evaluate the rules, and refuse when they cannot be evaluated.
+
+    Every host reads exit 2 as a block and anything else as "something went wrong, carry on".
+    So an unhandled exception in here was an *allow* — and the configuration that produces one
+    is editable by the actor the guard exists to constrain, which makes a crash a bypass
+    rather than a bug. `"enforce": "all"` was enough: a string has no `.get`.
+    """
+    bad = config_type_problems(cfg)
+    if bad:
+        return ("the guard cannot read sdlc.config.json — " + "; ".join(bad) + ".\n"
+                "Refused rather than allowed: a control that cannot evaluate its own rules is "
+                "not a control. Fix the type and the refusals resume. The shape is in "
+                "schema/sdlc.config.schema.json.")
+    try:
+        problem = guard_problem(root, command, cfg, record=meter)
+    except Exception as e:
+        return (f"the guard failed while evaluating its rules: {e.__class__.__name__}: {e}\n"
+                "Refused rather than allowed. This is a defect in agentic-sdlc — please report "
+                "it, with the command that triggered it.")
+    # Switching a flag off is a legitimate configuration choice, and it left no trace: the
+    # four canonical refusals went from exit 2 to exit 0 and the audit log gained nothing. A
+    # choice nobody can see is indistinguishable from a bypass, so record what the
+    # configuration let through. Only re-evaluated when a flag is actually off, because this
+    # runs on every tool call.
+    enf = cfg.get("enforce") if isinstance(cfg.get("enforce"), dict) else {}
+    if problem is None and command and any(enf.get(f) is False for f in ENFORCE_FLAGS):
+        strict = dict(cfg)
+        strict.pop("enforce", None)
+        try:
+            would = guard_problem(root, command, strict, record=False)
+        except Exception:
+            would = None
+        if would:
+            off = ", ".join(f for f in ENFORCE_FLAGS if enf.get(f) is False)
+            audit(root, "guard.allowed-by-config",
+                  f"{would.splitlines()[0]} :: allowed because {off} is off :: {command}")
+    return problem
 
 
 def cmd_guard(args) -> int:
@@ -464,10 +1461,12 @@ def cmd_guard(args) -> int:
     """
     if getattr(args, "command", None):
         root = repo_root()
-        problem = guard_problem(root, args.command, load_config(root))
+        # `guard --command` is the git-hook entry point. A hook firing is not an agent
+        # tool call, and counting it made the ceiling mean two different things.
+        problem = guard_decide(root, args.command, load_config(root), meter=False)
         if problem:
             audit(root, "blocked", f"{problem.splitlines()[0]} :: {args.command}")
-            print(f"BLOCKED by agentic-sdlc: {problem}", file=sys.stderr)
+            print(f"BLOCKED by agentic-sdlc: {redact(problem)}", file=sys.stderr)
             return 2
         return 0
     try:
@@ -484,10 +1483,10 @@ def cmd_guard(args) -> int:
         command = str(inp.get("command", ""))
         if not command:
             return 0
-        problem = guard_problem(root, command, cfg)
+        problem = guard_decide(root, command, cfg)
         if problem:
             audit(root, "blocked", f"{problem.splitlines()[0]} :: {command}")
-            print(f"BLOCKED by agentic-sdlc: {problem}\n"
+            print(f"BLOCKED by agentic-sdlc: {redact(problem)}\n"
                   f"This is a pipeline rule, not a preference. Do not work around it — choose "
                   f"another route or stop and report.", file=sys.stderr)
             return 2
@@ -557,12 +1556,18 @@ def cmd_receipt(args) -> int:
         return 0
     cfg = load_config(root)
     max_age = args.max_age_min or int(((cfg.get("receipts") or {}).get("maxAgeMin")) or DEFAULT_MAX_AGE_MIN)
-    why = receipt_problem(root, args.kind, args.verdict, max_age, require_commit=not args.any_commit)
+    why = receipt_holds(root, args.kind, args.verdict, max_age,
+                        require_commit=not args.any_commit, why="sdlc receipt check")
     if why:
         print(f"{args.kind} receipt does not hold: {why}", file=sys.stderr)
         return 1
     print(f"{args.kind} receipt holds")
     return 0
+
+
+def fingerprint_line(env: dict) -> str:
+    keys = [k for k in ("os", "arch", "python", "node", "go", "cargo", "git") if k in env]
+    return "  ".join(f"{k} {env[k]}" for k in keys)
 
 
 def cmd_status(_args) -> int:
@@ -588,6 +1593,7 @@ def cmd_status(_args) -> int:
         why = receipt_problem(root, kind, None, 10 ** 9)
         mark = "stale" if why else "current"
         print(f"  {kind:<13} {r.get('verdict','?'):<18} {str(r.get('commit',''))[:9]}  {r.get('at','')}  {mark}")
+    print(f"toolchain  {fingerprint_line(environment(root))}")
     return 0
 
 
@@ -605,6 +1611,11 @@ def cmd_doctor(_args) -> int:
             problems.append('"verifyCmd" is not set — nothing can be gated')
         if not cfg.get("secretScan"):
             notes.append('"secretScan" is not set — install gitleaks and re-run `sdlc init`')
+        if not (cfg.get("quality") or {}).get("cmd"):
+            notes.append('"quality.cmd" is not set — the gate has no deterministic analysis on '
+                         "new code, so maintainability and complexity are reviewed by reading "
+                         "only. An LLM reviewer is a complement to a static analyser, not a "
+                         "substitute for one.")
         engine = (cfg.get("spec") or {}).get("engine")
         if engine == "openspec":
             if not which("openspec"):
@@ -616,6 +1627,7 @@ def cmd_doctor(_args) -> int:
 
     present = detect_platforms()
     here = [k for k, v in present.items() if v]
+    print(f"toolchain       {fingerprint_line(environment(root))}")
     print(f"hosts detected  {', '.join(here) if here else 'none'}")
     installed = []
     for rel, label in ((".cursor/rules/agentic-sdlc.mdc", "cursor"),
@@ -648,6 +1660,14 @@ def cmd_doctor(_args) -> int:
                      "tool hook (Cursor, Copilot, Windsurf). Run `sdlc install git-hooks`")
     if not os.path.exists(os.path.join(root, ".github/workflows/sdlc-gate.yml")):
         notes.append("no CI gate — the only layer an agent cannot reach. Run `sdlc install ci`")
+
+    openf = [f for f in finding_load_all(root) if f.get("outcome") in ("open", "unexecuted")]
+    if openf:
+        crit = sum(1 for f in openf
+                   if (f.get("classification") or {}).get("severity") in ("critical", "high"))
+        notes.append(f"{len(openf)} finding(s) still open or unexecuted"
+                     + (f", {crit} of them critical or high" if crit else "")
+                     + " — see `sdlc finding list --open`")
 
     hooks = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "hooks", "hooks.json")
     if os.path.exists(hooks):
@@ -800,6 +1820,12 @@ def rules_body(cfg: dict) -> str:
     """The pipeline's rules, plus this project's bindings. One source: docs/rules.md."""
     rules = read_plugin("docs", "rules.md")
     rules = re.sub(r"^# .*\n+", "", rules, count=1)  # the host file supplies the title
+    # rules.md links its neighbours relatively. `install` places this text into a host's own
+    # rules file and never places those neighbours beside it, so every such link resolved to
+    # nothing — including the one to the normative control specification. Point them at the
+    # repository, which is reachable from wherever this lands.
+    rules = re.sub(r"\]\((?!https?://)([\w./-]+\.md)\)",
+                   lambda m: "](" + DOCS_BASE_URL + os.path.basename(m.group(1)) + ")", rules)
     lines = ["## The agentic SDLC pipeline", "",
              "This project uses the agentic-sdlc pipeline. Work moves through stages, each owned",
              "by one agent and closed by a receipt bound to a commit. Do not skip a stage: on some",
@@ -815,6 +1841,12 @@ def rules_body(cfg: dict) -> str:
         lines.append(f"- specifications: {spec.get('engine', 'prd-frd')} in `{spec.get('docsRoot', 'docs/specs')}`")
         if cfg.get("profile"):
             lines.append(f"- profile: `{cfg['profile']}` — its standards apply to reviews")
+        if cfg.get("concerns"):
+            lines.append("- concerns: " + ", ".join(f"`{c}`" for c in cfg["concerns"])
+                         + " — cross-cutting standards, and they win over the profile")
+        if cfg.get("reviewers"):
+            lines.append("- reviewers: " + ", ".join(f"`{r}`" for r in cfg["reviewers"])
+                         + " — the gate fans out to these and no others")
         if cfg.get("heavy"):
             lines.append(f"- heavy work: {cfg['heavy']}")
         lines.append("")
@@ -1279,9 +2311,1315 @@ def cmd_feedback(args) -> int:
         json.dump(d, fh, indent=2)
     audit(root, "feedback", f"{args.stage}: attempt {d['attempts']}")
     print(f"feedback recorded — attempt {d['attempts']} at stage {args.stage}")
-    if d["attempts"] >= 3:
-        print("Three attempts at the same stage. Stop and report rather than trying a fourth: "
-              "the specification or the approach is probably the problem, not the code.")
+    ceiling = int(budget_config(load_config(root)).get("maxRetries") or 3)
+    if d["attempts"] >= ceiling:
+        print(f"{d['attempts']} attempts at the same stage, and budget.maxRetries is "
+              f"{ceiling}. Stop and report rather than trying another: the specification or "
+              f"the approach is probably the problem, not the code.")
+    return 0
+
+
+# ------------------------------------------------------------------- budget and checkpoints
+#
+# X5 and X7: an agent that cannot stop is a cost centre with a git token. X10: a long task that
+# crashes halfway must not leave a half-applied refactor nobody can reason about.
+#
+# The honest limit, stated once: this process cannot see the host's token meter. It counts what
+# it can observe — tool calls through the hook, wall-clock since the task began, and repair
+# attempts — and refuses when a ceiling is reached. A ceiling that stops the work is worth more
+# than a token count that only describes it afterwards.
+
+DEFAULT_BUDGET = {"maxToolCalls": 0, "maxWallClockMin": 0, "maxRetries": 3, "stopPolicy": "refuse"}
+
+
+def budget_config(cfg: dict) -> dict:
+    b = dict(DEFAULT_BUDGET)
+    b.update(cfg.get("budget") or {})
+    return b
+
+
+def budget_task_key(root: str, cfg: dict) -> str:
+    """What counts as one task, chosen so an agent cannot mint itself a fresh budget.
+
+    This was the branch name, and a branch name is the agent's to pick: with the ceiling
+    spent, `git checkout -b other` made the next call allowed, and coming back read a counter
+    of 2 — the state file had been overwritten rather than kept. A detached HEAD did the same,
+    because branch() returns the literal "HEAD".
+
+    The merge base against the trunk does not move when a branch is renamed, when another
+    branch is cut from the same point, or as the work commits. Starting genuinely new work
+    usually moves it, because the trunk has advanced; when it has not, `sdlc budget reset`
+    is the route, and it records who accepted the cost.
+    """
+    trunk = cfg.get("trunk") or detect_trunk(root) or "main"
+    base = git("merge-base", trunk, "HEAD", cwd=root)
+    if base:
+        return base[:12]
+    # No merge base: a single-branch or shallow clone, unrelated history, or a trunk named
+    # differently from the config. Falling back to the branch name would restore exactly the
+    # key this function replaced, so fall back to the root commit, which a rename cannot
+    # move. An empty repository has neither, and gets one shared key.
+    root_commit = git("rev-list", "--max-parents=0", "HEAD", cwd=root).split("\n")[-1].strip()
+    return ("root-" + root_commit[:12]) if root_commit else "default"
+
+
+def budget_state(root: str) -> dict:
+    """Every task's counters, never overwritten by the arrival of a new one."""
+    try:
+        raw = json.load(open(os.path.join(root, BUDGET)))
+    except Exception:
+        return {"tasks": {}}
+    if not isinstance(raw, dict):
+        return {"tasks": {}}
+    if isinstance(raw.get("tasks"), dict):
+        return raw
+    if "toolCalls" in raw:          # the single-task shape this replaced
+        return {"tasks": {str(raw.get("task") or "default"): raw}}
+    return {"tasks": {}}
+
+
+def budget_window_spend(root: str, cfg: dict) -> tuple:
+    """(calls, earliest start) across every task inside the window.
+
+    The same sum `budget_problem` enforces. `budget show` used to report only the current
+    task, so it could say 3 of 50 while enforcement saw 60 — a ceiling you cannot see
+    coming is a surprise, not a budget.
+    """
+    b = budget_config(cfg)
+    window = int(b.get("maxWallClockMin") or 0) or 240
+    now, calls, began_at = time.time(), 0, None
+    for t in (budget_state(root).get("tasks") or {}).values():
+        try:
+            began = calendar.timegm(time.strptime(t.get("startedAt", ""), "%Y-%m-%dT%H:%M:%SZ"))
+        except Exception:
+            began = now
+        if (now - began) / 60 <= window:
+            calls += t.get("toolCalls", 0)
+            began_at = began if began_at is None else min(began_at, began)
+    return calls, began_at
+
+
+def budget_task(root: str, cfg: dict) -> dict:
+    """What enforcement sees for this task: the window-summed count, and when it started."""
+    key = budget_task_key(root, cfg)
+    calls, began = budget_window_spend(root, cfg)
+    return {"toolCalls": calls, "task": key,
+            "startedAt": (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(began))
+                          if began else None)}
+
+
+def budget_save(root: str, st: dict) -> None:
+    try:
+        p = os.path.join(root, BUDGET)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as fh:
+            json.dump(st, fh, indent=2)
+    except Exception:
+        pass
+
+
+def budget_problem(root: str, cfg: dict) -> str | None:
+    """Why this task must stop now, or None. Counts one tool call as a side effect."""
+    b = budget_config(cfg)
+    if not (b.get("maxToolCalls") or b.get("maxWallClockMin")):
+        return None
+    key = budget_task_key(root, cfg)
+    all_st = budget_state(root)
+    tasks = all_st.setdefault("tasks", {})
+    st = tasks.get(key)
+    if st is None:
+        st = {"toolCalls": 0, "startedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+              "task": key}
+        tasks[key] = st
+        # A budget that silently starts over is the thing this finding was about.
+        audit(root, "budget.task-started", f"{key} on {branch(root)}")
+    st["toolCalls"] = st.get("toolCalls", 0) + 1
+    st["branch"] = branch(root)
+    budget_save(root, all_st)
+
+    # Spend is summed across every task started inside the window, so changing the key --
+    # by moving the trunk ref, or editing `trunk` in the config -- carries the old spend
+    # forward instead of starting over. `sdlc budget reset --as` is the way to start over,
+    # and it records who accepted the cost.
+    window = int(b.get("maxWallClockMin") or 0) or 240
+    now = time.time()
+    spent = 0
+    for t in tasks.values():
+        try:
+            began = calendar.timegm(time.strptime(t.get("startedAt", ""), "%Y-%m-%dT%H:%M:%SZ"))
+        except Exception:
+            began = now
+        if (now - began) / 60 <= window:
+            spent += t.get("toolCalls", 0)
+    st = dict(st, toolCalls=max(st.get("toolCalls", 0), spent))
+
+    warn_only = (b.get("stopPolicy") or "refuse") == "warn"
+    limit = int(b.get("maxToolCalls") or 0)
+    if limit and st["toolCalls"] > limit and warn_only:
+        if st["toolCalls"] == limit + 1:  # say it once, not on every call after
+            print(f"agentic-sdlc: this task has passed its budget of {limit} tool calls. "
+                  f"stopPolicy is 'warn', so nothing is being refused — but nothing is "
+                  f"stopping a runaway either.", file=sys.stderr)
+        return None
+    if limit and st["toolCalls"] > limit:
+        return (f"this task has made {st['toolCalls']} tool calls and the budget is {limit}.\n"
+                f"Stop and report what is done, what is left and what it would cost. "
+                f"A person raises the ceiling in sdlc.config.json; an agent does not raise "
+                f"its own.\nReset with:  sdlc budget reset")
+    mins = int(b.get("maxWallClockMin") or 0)
+    if mins and not warn_only:
+        try:
+            _calls, _began = budget_window_spend(root, cfg)
+            began = _began if _began else calendar.timegm(
+                time.strptime(st["startedAt"], "%Y-%m-%dT%H:%M:%SZ"))
+            spent = (time.time() - began) / 60
+            if spent > mins:
+                return (f"this task has run for {int(spent)} minutes and the budget is {mins}.\n"
+                        f"Stop and report. Reset with:  sdlc budget reset")
+        except Exception:
+            pass
+    return None
+
+
+def cmd_budget(args) -> int:
+    root = repo_root()
+    cfg = load_config(root)
+    b, st = budget_config(cfg), budget_task(root, cfg)
+    if args.budget_action == "reset":
+        if not args.as_person:
+            print("sdlc budget reset needs --as '<your name>'.\n"
+                  "A ceiling an agent can clear for itself is not a ceiling — it is a pause. "
+                  "The reset records who accepted the extra cost, for the same reason "
+                  "`sdlc approve` does, and an agent must not run it on a person's behalf.",
+                  file=sys.stderr)
+            return 3
+        key = budget_task_key(root, cfg)
+        all_st = budget_state(root)
+        spent = sum(t.get("toolCalls", 0) for t in (all_st.get("tasks") or {}).values())
+        # Every task, not only the current key: spend is summed across the window, so
+        # clearing one key would leave the rest carried forward and the reset would not
+        # reset anything.
+        budget_save(root, {"tasks": {key: {
+            "toolCalls": 0, "task": key, "branch": branch(root),
+            "startedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}}})
+        audit(root, "budget.reset", f"task {key} at {spent} tool calls, by {args.as_person}")
+        print(f"budget reset for this task by {args.as_person}")
+        return 0
+    spent_min = ""
+    try:
+        began = calendar.timegm(time.strptime(st["startedAt"], "%Y-%m-%dT%H:%M:%SZ"))
+        spent_min = f"{int((time.time() - began) / 60)} min"
+    except Exception:
+        pass
+    print(f"task        {st.get('task')}")
+    print(f"tool calls  {st.get('toolCalls', 0)}" +
+          (f" of {b['maxToolCalls']}" if b.get("maxToolCalls") else " (no ceiling set)"))
+    print(f"elapsed     {spent_min}" +
+          (f" of {b['maxWallClockMin']} min" if b.get("maxWallClockMin") else " (no ceiling set)"))
+    print(f"retries     ceiling {b.get('maxRetries')}")
+    if not (b.get("maxToolCalls") or b.get("maxWallClockMin")):
+        print("\nNo ceiling is set, so nothing will stop a runaway task. Set budget.maxToolCalls "
+              "or budget.maxWallClockMin in sdlc.config.json.")
+    return 0
+
+
+def cmd_checkpoint(args) -> int:
+    """A resumable record of a long task.
+
+    The hard part of resuming is not storing the plan; it is knowing whether the plan still
+    applies. So a checkpoint records the repository state it assumed, and resuming re-checks it
+    — the same discipline receipts use, for the same reason.
+    """
+    root = repo_root()
+    p = os.path.join(root, CHECKPOINT)
+
+    if args.checkpoint_action == "write":
+        c = {
+            "task": args.task or branch(root),
+            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "commit": head(root),
+            "branch": branch(root),
+            "treeClean": tree_clean(root),
+            "done": args.done or [],
+            "next": args.next_step or "",
+            "note": args.note or "",
+            "files": {},
+            "env": environment(root),
+        }
+        for rel in (args.file or []):
+            d = subject_digest(root, rel)
+            if d:
+                c["files"][rel] = d
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as fh:
+            json.dump(c, fh, indent=2)
+            fh.write("\n")
+        audit(root, "checkpoint.write", f"{c['task']}: {args.next_step or ''}")
+        print(f"checkpoint at {c['commit'][:9]}: {len(c['done'])} step(s) done, "
+              f"next: {c['next'] or '(unstated)'}")
+        if not c["treeClean"]:
+            print("note: the tree was dirty when this was taken, so resuming cannot verify "
+                  "the uncommitted part. Commit before checkpointing if you can.")
+        return 0
+
+    if not os.path.exists(p):
+        print("no checkpoint — this is the first attempt at this task")
+        return 1
+    c = json.load(open(p))
+
+    if args.checkpoint_action == "show":
+        print(json.dumps(c, indent=2))
+        return 0
+
+    # resume: a checkpoint is not automatically safe to resume
+    problems = []
+    if c.get("branch") != branch(root):
+        problems.append(f"it was taken on branch {c.get('branch')}, you are on {branch(root)}")
+    if c.get("commit") != head(root):
+        behind = subprocess.run(["git", "merge-base", "--is-ancestor", c["commit"], "HEAD"],
+                                cwd=root, capture_output=True).returncode == 0
+        problems.append(f"HEAD has moved to {head(root)[:9]}" +
+                        ("" if behind else " and the checkpoint's commit is not behind it — "
+                                           "the history was rewritten"))
+    for rel, digest in (c.get("files") or {}).items():
+        now = subject_digest(root, rel)
+        if now is None:
+            problems.append(f"{rel} no longer exists")
+        elif now != digest:
+            problems.append(f"{rel} changed since the checkpoint")
+    env_now = environment(root)
+    drift = [k for k in env_now if k in c.get("env", {}) and env_now[k] != c["env"][k]]
+    if drift:
+        problems.append(f"the toolchain changed ({', '.join(drift)})")
+
+    print(f"# Resuming {c['task']} — checkpointed {c['at']} at {c['commit'][:9]}\n")
+    if c.get("done"):
+        print("Already done, do not repeat:")
+        for step in c["done"]:
+            print(f"  - {step}")
+    print(f"\nNext: {c.get('next') or '(unstated)'}")
+    if c.get("note"):
+        print(f"Note: {c['note']}")
+    if problems:
+        print("\nThe repository is NOT in the state this checkpoint assumed:")
+        for why in problems:
+            print(f"  - {why}")
+        print("\nRe-establish the facts before editing anything. A checkpoint is a record of "
+              "what was true, not a licence to carry on as if it still is.")
+        audit(root, "checkpoint.resume", f"stale: {len(problems)} mismatch(es)")
+        return 1
+    print("\nThe repository matches what this checkpoint assumed. Safe to continue.")
+    audit(root, "checkpoint.resume", "clean")
+    return 0
+
+
+# --------------------------------------------------------------------------- suite integrity
+#
+# The one failure this whole pipeline exists to prevent: making the gate pass by lowering it.
+# Every agent prompt forbids deleting a test, weakening an assertion, suppressing a warning or
+# excluding a path — and a prompt is a request. This is the check that does not negotiate.
+#
+# It reads the diff textually, so it is a heuristic and says so. It is deliberately tuned to
+# over-report: a false positive costs one sentence of explanation in the pull request, and a
+# false negative costs a silently disarmed test suite.
+
+TEST_PATH_RE = re.compile(
+    r"(^|/)(tests?|spec|specs|__tests__|testdata)/|[._-](test|spec)\.[a-z]+$|_test\.|"
+    r"(^|/)test_[^/]+\.py$", re.I)
+
+# A line that declares a test. Losing one is losing a check.
+TEST_DECL = re.compile(
+    r"\b(def\s+test_\w+|func\s+Test\w+|#\[test\]|#\[tokio::test\]|@Test\b|"
+    r"\b(it|test|describe|context)\s*\(|\bTEST(_F|_P)?\s*\()", re.I)
+
+# A line that asserts something. Losing one usually means the test now proves less.
+ASSERT_RE = re.compile(
+    r"\b(assert\w*|expect|should|require\.\w+|must\w*|verify|ok\(|t\.(Error|Fatal)\w*)\b",
+    re.I)
+
+# A marker that stops a test running, or runs only one. Added, these are how a suite goes quiet.
+SUPPRESSION_PATTERNS = "schema/suppression-patterns.json"
+
+
+def _marker_bank():
+    """The skip and suppression markers, loaded from data.
+
+    They used to be regex literals here, which meant the file implementing every control
+    contained the strings the control scans for -- so `sdlc tests audit` reported itself and
+    `suiteAudit.exclude` had to exempt the whole of bin/sdlc. Exempting that file is a poor
+    trade for a detector that cannot read its own source, and the fix is structural rather
+    than a heuristic about quoting: two such heuristics were tried here before and both were
+    forgeable by the actor the control constrains.
+
+    Missing or empty is a stop, for the same reason the rule table is: a detector with no
+    patterns reports nothing and looks exactly like a clean diff.
+    """
+    raw = read_plugin(SUPPRESSION_PATTERNS)
+    try:
+        data = json.loads(raw) if raw else {}
+        skip = tuple((re.compile(e["pattern"], re.I if "i" in e.get("flags", "") else 0),
+                      e["why"]) for e in data["skip"])
+        sup = tuple((re.compile(e["pattern"], re.I if "i" in e.get("flags", "") else 0),
+                     e["why"]) for e in data["suppress"])
+    except Exception as e:
+        skip = sup = ()
+        print(f"sdlc: {SUPPRESSION_PATTERNS} is unreadable ({e})", file=sys.stderr)
+    if not skip or not sup:
+        print(f"sdlc: {SUPPRESSION_PATTERNS} is missing or empty, so the suite audit would "
+              f"report nothing and a gutted diff would look clean. Refusing rather than "
+              f"scanning for nothing.", file=sys.stderr)
+        raise SystemExit(3)
+    return skip, sup
+
+
+_MARKERS = None
+
+
+def markers():
+    global _MARKERS
+    if _MARKERS is None:
+        _MARKERS = _marker_bank()
+    return _MARKERS
+
+
+NUM_SETTING = re.compile(r"([A-Za-z_][\w.\- ]{2,40})\s*[:=]\s*(\d{1,3})(?:\.\d+)?\s*%?\s*$")
+
+# Markdown is scanned like anything else. In a plugin whose executable instructions ARE
+# markdown, `|| true` appended to a command in commands/gate.md is a real weakening.
+#
+# There is no content-based exemption left in this function. Three were tried — quote parity,
+# quotes on both sides, and "a line starting with + or - is a diff illustration" — and each
+# was defeated by editing the line: an apostrophe, a trailing quote, and a two-character list
+# prefix. A file that contains these patterns as subject matter rather than as behaviour
+# declares itself in suiteAudit.exclude, where a reviewer sees it.
+
+
+def diff_files(root: str, base: str):
+    """(path, added, removed) per changed file, or None if git could not tell us.
+
+    Each file is diffed on its own, with explicit prefixes. Parsing one combined diff let a
+    line of *content* beginning `++ b/x.md` pose as a file header and reassign every line
+    after it, and a developer's long-standing `diff.noprefix` setting removed the prefix this
+    parser keyed on — silently disabling the whole check. Neither is reachable per-file.
+    """
+    def run(*args):
+        return subprocess.run(["git", *args], cwd=root, capture_output=True, text=True)
+
+    # -z: NUL-separated and never C-quoted. With git's default core.quotePath a non-ASCII
+    # name came back quoted, matched no pathspec, and produced an empty diff with returncode
+    # 0 — so gutting that file reported nothing. Failing OPEN, the mode B1d removed.
+    r = run("diff", "--name-only", "-z", f"{base}...HEAD")
+    if r.returncode != 0:
+        r = run("diff", "--name-only", "-z", base)
+    if r.returncode != 0:
+        return None  # fail closed; the caller reports unexecuted, never "nothing found"
+
+    out = []
+    for path in [x for x in r.stdout.split("\0") if x.strip()]:
+        d = run("diff", "--no-color", "--unified=0", "--src-prefix=a/", "--dst-prefix=b/",
+                f"{base}...HEAD", "--", path)
+        if d.returncode != 0:
+            d = run("diff", "--no-color", "--unified=0", "--src-prefix=a/", "--dst-prefix=b/",
+                    base, "--", path)
+        if d.returncode != 0:
+            return None
+        added, removed, in_body = [], [], False
+        for line in d.stdout.splitlines():
+            if line.startswith("@@"):
+                in_body = True
+            elif in_body and line.startswith("+"):
+                added.append(line[1:])
+            elif in_body and line.startswith("-"):
+                removed.append(line[1:])
+        if not d.stdout.strip():
+            return None  # named as changed but produced no diff; that is not "clean"
+        out.append((path, added, removed))
+    return out
+
+
+def audit_excluded(cfg: dict, path: str) -> bool:
+    """Is this path declared exempt from the suite audit?
+
+    Content-based exemption was tried twice and is not defensible. Counting quote parity let
+    one apostrophe disarm a line, and requiring a quote on both sides fell to appending one.
+    Anything decided from the text of a line can be forged by writing different text, and the
+    actor writing it is the one the control exists to constrain.
+
+    So exemption is declared in sdlc.config.json instead: visible in the diff, reviewable, and
+    not reachable by editing the line under suspicion. A file that genuinely *defines* these
+    patterns — this plugin's own detector, its fixtures — says so once, out loud. Adding to
+    the list is itself reported as a weakening, so the escape hatch cannot be used quietly.
+    """
+    for pat in ((cfg.get("suiteAudit") or {}).get("exclude") or []):
+        if fnmatch.fnmatch(path, pat) or path == pat:
+            return True
+    return False
+
+
+def config_loosenings(before: dict, after: dict) -> list:
+    """Every way `after` makes this pipeline easier to pass than `before`.
+
+    The configuration is editable by the actor the configuration constrains, so a change to
+    it belongs in the diff a reviewer reads, named as what it is. Absent keys compare as
+    their defaults, so deleting `enforce` reads as switching all six flags off — which is
+    what it does.
+    """
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return []
+    out = []
+    b_enf = before.get("enforce") if isinstance(before.get("enforce"), dict) else {}
+    a_enf = after.get("enforce") if isinstance(after.get("enforce"), dict) else {}
+    for flag in ENFORCE_FLAGS:
+        if b_enf.get(flag, True) and not a_enf.get(flag, True):
+            out.append((f"the {flag} refusal was switched off",
+                        f"enforce.{flag}: true -> false"))
+
+    # protected defaults to ["main", "master"] in guard_problem, so dropping to ["main"]
+    # from an absent key loses master.
+    for key, what in (("protected", "a branch is no longer protected"),
+                      ("neverByAgent", "an action an agent may not take became allowed"),
+                      ("reviewers", "a reviewer the gate fans out to was removed"),
+                      ("concerns", "a concern's review standards no longer apply")):
+        fallback = ["main", "master"] if key == "protected" else []
+        b_list = before.get(key) if isinstance(before.get(key), list) else fallback
+        a_list = after.get(key) if isinstance(after.get(key), list) else fallback
+        for gone in [x for x in b_list if x not in a_list]:
+            out.append((what, f'{key} -= "{gone}"'))
+
+    b_ap = before.get("approvals") if isinstance(before.get("approvals"), dict) else {}
+    a_ap = after.get("approvals") if isinstance(after.get("approvals"), dict) else {}
+    # guard_problem reads approvals.get("merge") -- absent means agent -- and
+    # approvals.get("release", "human") -- absent means human. Mirror both exactly.
+    for what, default in (("merge", "agent"), ("release", "human")):
+        if b_ap.get(what, default) == "human" and a_ap.get(what, default) != "human":
+            out.append((f"a human approval for {what} was downgraded to an agent's",
+                        f'approvals.{what}: human -> {a_ap.get(what, "agent")}'))
+
+    b_age = (before.get("receipts") or {}).get("maxAgeMin") if isinstance(
+        before.get("receipts"), dict) else None
+    a_age = (after.get("receipts") or {}).get("maxAgeMin") if isinstance(
+        after.get("receipts"), dict) else None
+    b_age = b_age if isinstance(b_age, int) else DEFAULT_MAX_AGE_MIN
+    a_age = a_age if isinstance(a_age, int) else DEFAULT_MAX_AGE_MIN
+    if a_age > b_age:
+        out.append(("receipts now stay valid for longer",
+                    f"receipts.maxAgeMin: {b_age} -> {a_age}"))
+
+    b_bud = before.get("budget") if isinstance(before.get("budget"), dict) else {}
+    a_bud = after.get("budget") if isinstance(after.get("budget"), dict) else {}
+    for k in ("maxToolCalls", "maxWallClockMin", "maxRetries"):
+        was, now = b_bud.get(k) or 0, a_bud.get(k) or 0
+        if was and (now == 0 or now > was):
+            out.append((f"the {k} ceiling was raised or removed",
+                        f"budget.{k}: {was} -> {now or 'no ceiling'}"))
+    if b_bud.get("stopPolicy", "refuse") == "refuse" and \
+            a_bud.get("stopPolicy", "refuse") != "refuse":
+        out.append(("the budget now warns instead of refusing",
+                    f'budget.stopPolicy: refuse -> {a_bud.get("stopPolicy")}'))
+
+    b_ex = set(((before.get("suiteAudit") or {}).get("exclude")) or []) if isinstance(
+        before.get("suiteAudit"), dict) else set()
+    a_ex = set(((after.get("suiteAudit") or {}).get("exclude")) or []) if isinstance(
+        after.get("suiteAudit"), dict) else set()
+    for glob_added in sorted(a_ex - b_ex):
+        out.append(("a path was newly exempted from the suite audit's "
+                    "suppression-marker checks", f'suiteAudit.exclude += "{glob_added}"'))
+
+    # A gate is only as strong as the command it runs. Replacing verifyCmd with `true`
+    # weakens the pipeline more completely than any flag.
+    for key in ("verifyCmd", "gateCmd", "secretScan", "quality"):
+        b_v, a_v = before.get(key), after.get(key)
+        if key == "quality":
+            b_v = (before.get("quality") or {}).get("cmd") if isinstance(
+                before.get("quality"), dict) else None
+            a_v = (after.get("quality") or {}).get("cmd") if isinstance(
+                after.get("quality"), dict) else None
+            key = "quality.cmd"
+        if b_v and b_v != a_v:
+            out.append((f"{key} was weakened or removed", f"{key}: {b_v!r} -> {a_v!r}"))
+    b_cov = (before.get("quality") or {}).get("coverageNewPct") if isinstance(
+        before.get("quality"), dict) else None
+    a_cov = (after.get("quality") or {}).get("coverageNewPct") if isinstance(
+        after.get("quality"), dict) else None
+    if isinstance(b_cov, (int, float)) and (not isinstance(a_cov, (int, float))
+                                            or a_cov < b_cov):
+        out.append(("the new-code coverage floor was lowered or removed",
+                    f"quality.coverageNewPct: {b_cov} -> {a_cov}"))
+    if ((before.get("spec") or {}).get("strict") if isinstance(before.get("spec"), dict)
+            else None) and not ((after.get("spec") or {}).get("strict")
+                                if isinstance(after.get("spec"), dict) else None):
+        out.append(("specification validation is no longer strict", "spec.strict: true -> false"))
+    if before.get("trunk") and after.get("trunk") != before.get("trunk"):
+        out.append(("the trunk branch changed, which changes what is protected",
+                    f'trunk: {before.get("trunk")} -> {after.get("trunk")}'))
+    return out
+
+
+def suite_findings(root: str, base: str, cfg: dict = None):
+    """Everything in this diff that makes the gate easier to pass, or None if git failed."""
+    cfg = cfg if cfg is not None else load_config(root)
+    found = []
+
+    r = subprocess.run(["git", "diff", "--name-only", "-z", "--diff-filter=D",
+                        f"{base}...HEAD"], cwd=root, capture_output=True, text=True)
+    if r.returncode != 0:
+        return None
+    for path in r.stdout.split("\0"):
+        if path and TEST_PATH_RE.search(path):
+            found.append((path, "a test file was deleted", path))
+
+    files = diff_files(root, base)
+    if files is None:
+        return None
+
+    # Loosening the configuration is itself a weakening — otherwise the escape hatch IS the
+    # bypass. This began as the suiteAudit.exclude check and the argument never was specific
+    # to that key: every refusal in the guard is switched off by editing `enforce`, and that
+    # edit used to pass the suite audit in silence. Compared as parsed configs at the two
+    # revisions rather than by pattern-matching the diff, so reformatting neither hides a
+    # change nor invents one.
+    cfg_path = config_path(root)
+    if cfg_path:
+        name = os.path.relpath(cfg_path, root)
+        was = {}
+        r = subprocess.run(["git", "show", f"{base}:{name}"], cwd=root,
+                           capture_output=True, text=True)
+        if r.returncode == 0:
+            try:
+                was = json.loads(r.stdout)
+            except Exception:
+                was = {}
+        try:
+            now = load_config(root)
+        except Exception:
+            now = {}
+        for why, detail in config_loosenings(was, now):
+            found.append((name, why, detail))
+
+    for path, added, removed in files:
+        if TEST_PATH_RE.search(path or ""):
+            lost = sum(1 for l in removed if TEST_DECL.search(l))
+            gained = sum(1 for l in added if TEST_DECL.search(l))
+            if lost > gained:
+                found.append((path, f"{lost - gained} test(s) removed and not replaced",
+                              next(l.strip() for l in removed if TEST_DECL.search(l))))
+            lost_a = sum(1 for l in removed if ASSERT_RE.search(l))
+            gained_a = sum(1 for l in added if ASSERT_RE.search(l))
+            # One removed assertion counts. The old threshold of two meant a reviewer could
+            # drop exactly one check per commit forever and never be reported.
+            if lost_a - gained_a >= 1:
+                n = lost_a - gained_a
+                found.append((path, f"{n} assertion(s) removed and not replaced — the test "
+                                    f"may now prove less",
+                              next(l.strip() for l in removed if ASSERT_RE.search(l))))
+
+        exempt = audit_excluded(cfg, path or "")
+        for line in added:
+            if not exempt:
+                for pat, why in markers()[0] + markers()[1]:
+                    if pat.search(line):
+                        found.append((path, why, line.strip()))
+                        break
+
+
+        was = {}
+        for line in removed:
+            m = NUM_SETTING.search(line.strip())
+            if m:
+                was[m.group(1).strip().lower()] = int(m.group(2))
+        for line in added:
+            m = NUM_SETTING.search(line.strip())
+            if m:
+                key = m.group(1).strip().lower()
+                if key in was and int(m.group(2)) < was[key]:
+                    found.append((path, f"a threshold was lowered: {key} "
+                                        f"{was[key]} -> {m.group(2)}", line.strip()))
+    return found
+
+
+def cmd_tests(args) -> int:
+    root = repo_root()
+    cfg = load_config(root)
+    base = args.base or merge_base(root, cfg)
+    found = suite_findings(root, base, cfg)
+
+    if found is None:
+        print(f"suite integrity: UNEXECUTED — git could not produce a diff against "
+              f"'{base}'. This is not a pass. A check that did not run is `unexecuted`; "
+              f"fix the ref and run it again.", file=sys.stderr)
+        audit(root, "suite.unexecuted", f"git diff failed against {base}")
+        return 1
+
+    if not found:
+        print(f"suite integrity: nothing in this diff weakens a check (against {base[:9]})")
+        return 0
+
+    print(f"suite integrity: {len(found)} thing(s) in this diff make the gate easier to pass\n")
+    for path, why, evidence in found:
+        print(f"  {path}")
+        print(f"    {why}")
+        print(f"    > {evidence[:150]}")
+    print("\nEach of these may be correct. None of them is correct *by default*, and none may")
+    print("pass without a sentence in the commit message saying why. Deleting a failing test,")
+    print("weakening an assertion, skipping a case or lowering a threshold to make the gate")
+    print("pass is the one failure this pipeline exists to prevent.")
+
+    if args.acknowledge:
+        if not args.as_person:
+            print("\n--acknowledge needs --as '<your name>'. An acknowledgement with nobody "
+                  "behind it records nothing, which is the whole reason it exists.",
+                  file=sys.stderr)
+            return 3
+        audit(root, "suite.acknowledged",
+              f"{len(found)} weakening(s) accepted by {args.as_person} against {base[:9]}")
+        print(f"\nAcknowledged by {args.as_person} — recorded, not waived. The reviewers still "
+              f"see every one of these, and so does `sdlc metrics`.")
+        return 0
+
+    print("\nIf a suppression is genuinely the right resolution, say so in the commit and")
+    print("re-run with --acknowledge --as '<your name>' to record who decided.")
+    audit(root, "suite.weakened", f"{len(found)} weakening change(s) against {base[:9]}")
+    return 1
+
+
+# ------------------------------------------------------------------- environment + baseline
+#
+# Two blind spots with one shape: the pipeline judged a change without knowing what the
+# repository looked like before it, and without knowing what produced the result. A test that
+# was already red gets blamed on the patch; a missing binary looks like a defect. Both are
+# answered by recording the starting state and comparing against it.
+
+_ENV_CACHE = None
+
+# Probed in this order; absent tools are simply not reported. Version flags differ, so each
+# names its own.
+VERSION_PROBES = (
+    ("git", ["git", "--version"]),
+    ("python", [sys.executable, "--version"]),
+    ("node", ["node", "--version"]),
+    ("npm", ["npm", "--version"]),
+    ("pnpm", ["pnpm", "--version"]),
+    ("yarn", ["yarn", "--version"]),
+    ("bun", ["bun", "--version"]),
+    ("cargo", ["cargo", "--version"]),
+    ("go", ["go", "version"]),
+    ("uv", ["uv", "--version"]),
+    ("java", ["java", "-version"]),
+)
+
+
+def environment(root: str = "") -> dict:
+    """Which toolchain produced this result. Probed once per process — these are subprocesses.
+
+    Without it, 'the tests failed' cannot be told apart from 'this machine cannot run them',
+    and an agent will spend its retries editing code to fix a missing binary.
+    """
+    global _ENV_CACHE
+    if _ENV_CACHE is not None:
+        return _ENV_CACHE
+    env = {"os": sys.platform, "arch": os.uname().machine if hasattr(os, "uname") else "?"}
+    for name, cmd in VERSION_PROBES:
+        if not which(cmd[0]) and cmd[0] != sys.executable:
+            continue
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            out = (r.stdout or r.stderr or "").strip().splitlines()
+            if out:
+                env[name] = re.sub(r"^[a-z]+ version |^v", "", out[0].strip())[:40]
+        except Exception:
+            pass
+    _ENV_CACHE = env
+    return env
+
+
+# Lines worth comparing between two runs: the ones a runner uses to say something went wrong.
+SIGNAL_RE = re.compile(
+    r"(?:^|\s)(?:error|errors?\[|fail(?:ed|ure|ures)?|warning|warn|panic|assert(?:ion)?|"
+    r"exception|traceback|FAILED|FAIL|✗|✕|×)\b", re.I)
+
+# Everything here changes between two runs of the same unchanged code, so it must not count as
+# a difference. Over-scrubbing can hide a real change, which is why the full output is kept.
+NOISE = (
+    (re.compile(r"\b\d+(\.\d+)?\s*(ms|s|sec|secs|seconds|m|min|minutes)\b", re.I), "<time>"),
+    (re.compile(r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}\S*"), "<ts>"),
+    (re.compile(r"0x[0-9a-fA-F]{4,}"), "<addr>"),
+    # The platform's own answer, not three guesses that happened to cover macOS and Linux.
+    (re.compile("(?:" + "|".join(
+        re.escape(t.rstrip("/")) for t in sorted(
+            {tempfile.gettempdir(), "/tmp", "/private/var/folders", "/var/folders",
+             os.environ.get("TMPDIR") or "", os.environ.get("TEMP") or "",
+             os.environ.get("RUNNER_TEMP") or ""} - {""}, key=len, reverse=True)
+    ) + r")[\\/]\S*"), "<tmp>"),
+    (re.compile(r":\d+:\d+"), ":<pos>"),
+    (re.compile(r"\b[0-9a-f]{7,40}\b"), "<sha>"),
+    (re.compile(r"\s+"), " "),
+)
+
+
+def signals(output: str) -> list:
+    """The normalised failure and warning lines in a command's output.
+
+    A heuristic over text, deliberately: parsing would mean a parser per test runner, and only
+    sdlc.config.json is allowed to know the stack.
+    """
+    out = []
+    for line in output.splitlines():
+        line = line.strip()
+        if not line or not SIGNAL_RE.search(line):
+            continue
+        for pat, rep in NOISE:
+            line = pat.sub(rep, line)
+        line = line.strip()
+        if line and line not in out:
+            out.append(line[:300])
+    return out
+
+
+def merge_base(root: str, cfg: dict) -> str:
+    trunk = cfg.get("trunk") or "main"
+    return (git("merge-base", "HEAD", f"origin/{trunk}", cwd=root)
+            or git("merge-base", "HEAD", trunk, cwd=root)
+            or git("rev-list", "--max-parents=0", "HEAD", cwd=root))
+
+
+# A verify command is long by nature; a runaway one is the longest thing the pipeline runs,
+# and the ceiling meant to stop a runaway could not stop it.
+VERIFY_TIMEOUT_S = 1800
+
+
+def run_verify(root: str, cfg: dict):
+    """Run the project's verify command — through the same refusals as any other command.
+
+    `verifyCmd` comes from sdlc.config.json, which docs/rules.md section 7 classifies as data,
+    not authority. Running it with shell=True without consulting guard_problem opened a route
+    around every refusal in this file: a publish, a credential read or a deploy written into a
+    config string executed unchallenged, from a stage the branch-opener runs automatically.
+    The guard sees it first now, and it cannot run forever.
+    """
+    cmd = cfg.get("gateCmd") or cfg.get("verifyCmd")
+    if not cmd:
+        return None, None, None
+    problem = guard_decide(root, cmd, cfg)
+    if problem:
+        audit(root, "blocked", f"verifyCmd: {problem.splitlines()[0]} :: {cmd}")
+        return cmd, 126, (f"REFUSED before running: the configured command is not allowed.\n"
+                          f"{problem}\n\nThis came from sdlc.config.json, which is data, not "
+                          f"authority. A command in a config file is held to the same rules "
+                          f"as one an agent types.")
+    try:
+        r = subprocess.run(cmd, shell=True, cwd=root, capture_output=True, text=True,
+                           timeout=VERIFY_TIMEOUT_S)
+    except subprocess.TimeoutExpired as e:
+        out = e.stdout if isinstance(e.stdout, str) else (e.stdout or b"").decode(errors="replace")
+        return cmd, 124, (f"{out}\nTIMED OUT after {VERIFY_TIMEOUT_S}s. That is `unexecuted` "
+                          f"— not a failure of the change, and not a pass.")
+    return cmd, r.returncode, (r.stdout or "") + (r.stderr or "")
+
+
+def cmd_baseline(args) -> int:
+    root = repo_root()
+    cfg = load_config(root)
+    p = os.path.join(root, BASELINE)
+
+    if args.baseline_action == "show":
+        if not os.path.exists(p):
+            print("no baseline — run `sdlc baseline capture` before starting work")
+            return 1
+        b = json.load(open(p))
+        print(f"captured {b['at']} at base {b['base'][:9]} on {b.get('branch')}")
+        print(f"  command   {b['cmd']}")
+        print(f"  exit      {b['exit']} ({'green' if b['exit'] == 0 else 'ALREADY FAILING'})")
+        print(f"  signals   {len(b['signals'])}")
+        for sig in b["signals"][:20]:
+            print(f"    {sig[:120]}")
+        return 0
+
+    if args.baseline_action == "capture":
+        cmd, code, out = run_verify(root, cfg)
+        if cmd is None:
+            print("no verifyCmd in the config — nothing to baseline. Without one nothing can "
+                  "be gated either; see `sdlc doctor`.", file=sys.stderr)
+            return 3
+        base = merge_base(root, cfg)
+        b = {
+            "base": base,
+            "branch": branch(root),
+            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "cmd": cmd,
+            "exit": code,
+            "signals": signals(out),
+            "output": out[-20000:],
+            "env": environment(root),
+        }
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as fh:
+            json.dump(b, fh, indent=2)
+            fh.write("\n")
+        audit(root, "baseline.capture", f"exit {code}, {len(b['signals'])} signals at {base[:9]}")
+        print(f"baseline captured at {base[:9]}: exit {code}, {len(b['signals'])} signal(s)")
+        if code != 0:
+            print("This repository was NOT green when the work started. That is worth knowing "
+                  "now rather than discovering it as a 'regression' later.")
+        return 0
+
+    # compare
+    if not os.path.exists(p):
+        print("no baseline: this comparison is `unexecuted`, not passed. Capture one at the "
+              "branch point with `sdlc baseline capture`.", file=sys.stderr)
+        return 1
+    b = json.load(open(p))
+    cmd, code, out = run_verify(root, cfg)
+    if cmd is None:
+        print("no verifyCmd in the config", file=sys.stderr)
+        return 3
+    now = signals(out)
+    was = b["signals"]
+    new = [x for x in now if x not in was]
+    gone = [x for x in was if x not in now]
+    kept = [x for x in now if x in was]
+
+    # A baseline goes stale when its base is no longer behind us — a rebase, or a trunk that
+    # moved under the branch. It does NOT go stale merely because we committed: that is the
+    # whole difference between a baseline and a receipt.
+    still_behind = subprocess.run(["git", "merge-base", "--is-ancestor", b["base"], "HEAD"],
+                                  cwd=root, capture_output=True).returncode == 0
+    if not still_behind:
+        print(f"note: the baseline's base {b['base'][:9]} is no longer an ancestor of HEAD — "
+              f"the branch was rebased or the trunk moved. Recapture it.")
+    env_now = environment(root)
+    drift = [k for k in env_now if k in b.get("env", {}) and env_now[k] != b["env"][k]]
+    if drift:
+        print(f"note: the toolchain changed since the baseline ({', '.join(drift)}). A failure "
+              f"may belong to the environment rather than to the change.")
+
+    print(f"baseline {b['exit']} -> now {code}   "
+          f"{len(new)} new, {len(kept)} pre-existing, {len(gone)} fixed")
+    if new:
+        print("\nNEW since the baseline — these belong to this change:")
+        for x in new[:30]:
+            print(f"  {x[:160]}")
+    if kept:
+        print(f"\nPre-existing ({len(kept)}) — already there before the work started, "
+              f"not caused by it:")
+        for x in kept[:10]:
+            print(f"  {x[:160]}")
+    if gone:
+        print(f"\nFixed ({len(gone)}) — present at the baseline, gone now.")
+    audit(root, "baseline.compare", f"{len(new)} new, {len(kept)} pre-existing, {len(gone)} fixed")
+    if code in (124, 126):
+        print(f"\nVerdict: UNEXECUTED. The verify command did not run, so this says nothing "
+              f"about the change — in either direction.\n{out.strip()[:600]}")
+        audit(root, "baseline.unexecuted", f"verify exit {code}")
+        return 1
+
+    if new or (code != 0 and b["exit"] == 0):
+        print("\nVerdict: this change introduced failures. Fix those; leave the pre-existing "
+              "ones alone unless the specification asked for them.")
+        return 1
+    if code != 0:
+        print("\nVerdict: still failing, but with nothing new. The failures predate this work — "
+              "do not spend attempts on them, and do not report them as caused by the change.")
+        return 0
+    print("\nVerdict: nothing new.")
+    return 0
+
+
+# ---------------------------------------------------------------------------------- findings
+#
+# A finding is a claim about the code. Prose carries the argument; this carries the parts that
+# have to be compared, counted and audited: what rule, how bad, how sure, on what evidence, by
+# whom. Validation here mirrors schema/finding.schema.json — two expressions of one contract,
+# because bin/sdlc has no dependencies and cannot run a JSON Schema validator. A test feeds the
+# same values through both so they cannot drift.
+
+
+def control_spec_body() -> str:
+    """The control specification's text, or stop.
+
+    This used to swallow a read error and return nothing, which meant a missing or renamed
+    docs/control-spec.md silently emptied both the rule table and the never-autofix set: any
+    invented rule validated, and TEST-SUITE-WEAKENED came back autofixable. A control whose
+    off-switch is an absent file is not a control, so this fails closed and loudly.
+    """
+    try:
+        body = read_plugin("docs", "control-spec.md")
+    except Exception:
+        body = ""
+    # read_plugin returns "" on a read error rather than raising, so checking for the
+    # exception alone was dead code: a missing file produced an empty policy in silence.
+    if not body.strip() or "| Rule ID |" not in body:
+        e = "missing, empty, or has no rule table"
+        print(f"agentic-sdlc: cannot read docs/control-spec.md ({e}).\n"
+              f"It is the normative rule table: without it no rule can be validated and no "
+              f"rule can be known to be un-autofixable. Refusing rather than proceeding with "
+              f"an empty policy.", file=sys.stderr)
+        raise SystemExit(3)
+    return body
+
+
+def known_rules() -> set:
+    """Rule IDs from the control specification's table — the one source of truth.
+
+    Parsed rather than duplicated, so adding a row to docs/control-spec.md is all it takes to
+    make a rule usable.
+
+    A table that parses to nothing stops the tool. It used to return an empty set, and the
+    caller's `if rules and ...` then skipped the check — so a reformatting that broke the
+    regex would have silently accepted any rule id at all, which is the shape of failure
+    this file exists to refuse.
+    """
+    body = control_spec_body()
+    rules = set(re.findall(r"^\|\s*`([A-Z][A-Z0-9-]*)`\s*\|", body, re.M))
+    if len(rules) < 20:
+        print(f"sdlc: docs/control-spec.md parsed to {len(rules)} rule(s), which cannot be "
+              f"right — the rule table's shape has changed and every rule id would be "
+              f"accepted unchecked. Refusing rather than validating against nothing.",
+              file=sys.stderr)
+        raise SystemExit(3)
+    return rules
+
+
+def concern_rules() -> set:
+    """Rule IDs from the control spec's "Concern rules" sub-table.
+
+    These are the rules a concern profile owns, and every profile says the same thing: a
+    finding raised by reading is `medium` confidence at most, because a reading is not a
+    measurement. That was a sentence in a profile and nothing checked it. Scoped to this
+    sub-table rather than to every `llm` finding, because `--detection` defaults to `llm`
+    and the cap the profiles state is theirs, not the whole taxonomy's.
+    """
+    body = control_spec_body()
+    _, _, tail = body.partition("### Concern rules")
+    # Only the rules the table itself declares as detected by reading. A concern rule whose
+    # row says `deterministic` -- MEM-SAFETY names a sanitiser -- has a tool behind it, and
+    # the cap is about readings, not about the domain.
+    return {m.group(1) for m in
+            re.finditer(r"^\|\s*`([A-Z][A-Z0-9-]*)`\s*\|[^|]*\|\s*llm\s*\|", tail, re.M)}
+
+
+def finding_id(rule: str, file: str, line, summary: str) -> str:
+    """Stable identity, so the same finding raised twice is one finding and not two.
+
+    Deduplication is not cosmetic: a wall of repeated comments is how a review tool gets turned
+    off (the brief's X9).
+    """
+    key = f"{rule}|{file}|{line or ''}|{summary}".encode()
+    return "F-" + hashlib.sha256(key).hexdigest()[:8]
+
+
+def never_autofix_rules() -> set:
+    """Rules the control spec does not mark autofixable, whatever the severity pair says.
+
+    Parsed from the same table as the rule IDs. Without this the matrix alone decided, and a
+    TEST-SUITE-WEAKENED finding at critical/high came back "eligible for automatic fix" — an
+    agent authorised to repair a disarmed test suite unattended, which is the exact thing the
+    rule exists to stop.
+    """
+    body = control_spec_body()
+    out = set()
+    for rule, rest in re.findall(r"^\|\s*`([A-Z][A-Z0-9-]*)`\s*\|(.*)$", body, re.M):
+        cols = [c.strip() for c in rest.split("|")]
+        # columns: domain | detection | default severity | autofix | evidence
+        autofix = cols[3].lower() if len(cols) > 3 else ""
+        # Only an explicit "yes" defers to the severity x confidence matrix. Reading only
+        # **never** let the 53 rows that say plain "no" — SEC-INJECTION-SQL, SEC-AUTHORITY,
+        # MEM-SAFETY among them — come back autofixable at critical/high, which is the
+        # permissive half of a document that contradicted itself.
+        if not autofix.startswith("yes"):
+            out.add(rule)
+    return out
+
+
+def autofix_eligible(severity: str, confidence: str, has_repro: bool,
+                     rule: str = "") -> bool:
+    if rule and rule in never_autofix_rules():
+        return False
+    policy = AUTOFIX.get((severity, confidence), False)
+    if policy == "repro":
+        return bool(has_repro)
+    return bool(policy)
+
+
+def finding_problems(rec: dict) -> list:
+    """Why this record is not a valid finding. Empty list means it is."""
+    out = []
+    for field in ("id", "category", "ruleId", "summary", "evidence", "classification",
+                  "outcome", "provenance"):
+        if not rec.get(field):
+            out.append(f'missing required field "{field}"')
+    if out:
+        return out
+
+    if not re.fullmatch(r"F-[0-9a-f]{8}", rec["id"]):
+        out.append(f'id "{rec["id"]}" is not F- plus 8 hex digits')
+    if not re.fullmatch(r"([A-U]\.(?:[1-9][0-9]{0,2})|X(?:[1-9]|1[0-2]))", rec["category"]):
+        out.append(f'category "{rec["category"]}" is not a taxonomy address '
+                   f'(a domain letter and a check number, like D.31, or X1 to X12)')
+    if not re.fullmatch(r"[A-Z][A-Z0-9]*(-[A-Z0-9]+)*", rec["ruleId"]):
+        out.append(f'ruleId "{rec["ruleId"]}" is not an upper-case rule identifier')
+    else:
+        rules = known_rules()
+        if rules and rec["ruleId"] not in rules:
+            out.append(f'ruleId "{rec["ruleId"]}" is not in the rule table in '
+                       f'docs/control-spec.md — add the row before raising findings under it')
+    if not (8 <= len(rec["summary"]) <= 200):
+        out.append("summary must be between 8 and 200 characters: one sentence, the defect")
+    if rec["outcome"] not in FINDING_OUTCOMES:
+        out.append(f'outcome "{rec["outcome"]}" is not one of: {", ".join(FINDING_OUTCOMES)}')
+
+    ev = rec.get("evidence") or {}
+    if not ev.get("file"):
+        out.append("evidence.file is required — a finding with no location is an opinion")
+    if ev.get("line") is not None and not (isinstance(ev["line"], int) and ev["line"] >= 1):
+        out.append("evidence.line must be a positive integer")
+
+    cl = rec.get("classification") or {}
+    if cl.get("severity") not in SEVERITIES:
+        out.append(f'severity "{cl.get("severity")}" is not one of: {", ".join(SEVERITIES)}')
+    if cl.get("confidence") not in CONFIDENCES:
+        out.append(f'confidence "{cl.get("confidence")}" is not one of: {", ".join(CONFIDENCES)}')
+    # A reading is not a measurement. The concern profiles already say a finding raised by
+    # reading is `medium` confidence at most; it was a sentence in a profile and nothing
+    # checked it, so `--detection llm --confidence high` was accepted. `high` is what tool
+    # output or a reproduction earns.
+    prov = rec.get("provenance") or {}
+    ev = rec.get("evidence") or {}
+    if (rec.get("ruleId") in concern_rules() and prov.get("detection") == "llm"
+            and cl.get("confidence") == "high"
+            and not ev.get("repro") and not ev.get("toolOutput")):
+        out.append('confidence "high" on a finding detected by reading needs evidence that '
+                   'does not depend on the reading: supply --repro or --tool-output, or '
+                   'raise it at --confidence medium')
+    if cl.get("exploitability") and cl["exploitability"] not in EXPLOITABILITY:
+        out.append(f'exploitability "{cl["exploitability"]}" is not one of: '
+                   f'{", ".join(EXPLOITABILITY)}')
+
+    pr = rec.get("provenance") or {}
+    if not pr.get("agent"):
+        out.append("provenance.agent is required — a finding with no author cannot be disputed")
+    if pr.get("detection") and pr["detection"] not in DETECTIONS:
+        out.append(f'detection "{pr["detection"]}" is not one of: {", ".join(DETECTIONS)}')
+    return out
+
+
+FINDING_ID_RE = re.compile(r"^F-[0-9a-f]{8}$")
+
+
+def finding_file(root: str, fid: str) -> str | None:
+    """The path for a finding id, or None if the id is not one.
+
+    `os.path.join(root, FINDING_DIR, fid + ".json")` took whatever it was given: an id of
+    `../../../elsewhere/victim` read a file outside the repository, and `close` rewrote it.
+    An absolute path worked too, because join discards everything before one. The id is a
+    content hash with a fixed shape, so checking the shape costs nothing — and the resolved
+    path is confirmed to be inside the findings directory regardless, because a shape check
+    alone is the kind of thing a later edit quietly loosens.
+    """
+    if not isinstance(fid, str) or not FINDING_ID_RE.match(fid):
+        return None
+    base = os.path.realpath(os.path.join(root, FINDING_DIR))
+    p = os.path.realpath(os.path.join(base, fid + ".json"))
+    if p != os.path.join(base, fid + ".json"):
+        return None
+    return p
+
+
+def finding_load_all(root: str) -> list:
+    d = os.path.join(root, FINDING_DIR)
+    if not os.path.isdir(d):
+        return []
+    out = []
+    for name in sorted(os.listdir(d)):
+        if name.endswith(".json"):
+            try:
+                out.append(json.load(open(os.path.join(d, name))))
+            except Exception:
+                pass
+    return out
+
+
+def cmd_finding(args) -> int:
+    root = repo_root()
+
+    if args.finding_action == "write":
+        severity, confidence = args.severity, args.confidence
+        rid = finding_id(args.rule, args.file, args.line, args.summary)
+        rec = {
+            "id": rid,
+            "category": args.category,
+            "ruleId": args.rule,
+            "component": args.component or "",
+            "summary": args.summary,
+            "evidence": {
+                "file": args.file,
+                "line": args.line,
+                "endLine": None,
+                "code": args.code or None,
+                "toolOutput": args.tool_output or None,
+                "repro": args.repro or None,
+            },
+            "classification": {
+                "severity": severity,
+                "confidence": confidence,
+                "exploitability": args.exploitability or "not-applicable",
+                "impact": args.impact or None,
+            },
+            "rootCause": args.root_cause or None,
+            "proposedRepair": None,
+            "verificationPlan": args.verification_plan or None,
+            "outcome": "open",
+            "closedBy": None,
+            "provenance": {
+                "agent": args.by,
+                "model": os.environ.get("CLAUDE_MODEL") or None,
+                "detection": args.detection,
+                "toolVersion": args.tool_version or None,
+                "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "commit": head(root),
+            },
+        }
+        # The agent proposes the change; the policy table decides whether it may make it.
+        # Recorded even when no repair was proposed, so the remediator always has the
+        # machine-readable answer and never has to re-derive it from the prose.
+        rec["proposedRepair"] = {
+            "change": args.repair or "",
+            "expectedBehaviour": args.expected or "",
+            "sideEffects": args.side_effects or None,
+            "autofixEligible": autofix_eligible(severity, confidence,
+                                                bool(args.repro), args.rule),
+        }
+        problems = finding_problems(rec)
+        if problems:
+            for why in problems:
+                print(f"invalid finding: {why}", file=sys.stderr)
+            return 3
+        d = os.path.join(root, FINDING_DIR)
+        os.makedirs(d, exist_ok=True)
+        existing = os.path.join(d, rid + ".json")
+        if os.path.exists(existing):
+            # The same finding raised again is one finding — but if it was closed and has
+            # come back, it is NOT still closed. Re-opening it is the honest record: a defect
+            # re-detected after a bad fix was previously written straight back as `fixed`,
+            # and the gate reads `finding list --open`, so it vanished.
+            try:
+                prev = json.load(open(existing))
+                was = prev.get("outcome", "open")
+                if was in ("fixed", "refused", "deferred"):
+                    rec["outcome"] = "open"
+                    rec["closedBy"] = None
+                    rec["reopened"] = int(prev.get("reopened", 0)) + 1
+                    print(f"  REOPENED — this was closed as {was} at "
+                          f"{str(prev.get('closedBy'))[:9]} and has been detected again.")
+                else:
+                    rec["outcome"] = was
+                    rec["closedBy"] = prev.get("closedBy")
+                    if prev.get("reopened"):
+                        rec["reopened"] = prev["reopened"]
+            except Exception:
+                pass
+        with open(existing, "w") as fh:
+            json.dump(rec, fh, indent=2)
+            fh.write("\n")
+        audit(root, "finding.write", f"{rid} {args.rule} {severity}/{confidence} by {args.by}",
+              {"id": rid, "rule": args.rule, "severity": severity,
+               "confidence": confidence, "by": args.by})
+        auto = rec["proposedRepair"]["autofixEligible"]
+        print(f"{rid}  {args.rule}  {severity}/{confidence}  {args.file}"
+              f"{':' + str(args.line) if args.line else ''}")
+        if args.repair:
+            print("  repair: " + ("eligible for automatic fix"
+                                  if auto else "NOT eligible — report or escalate"))
+        return 0
+
+    if args.finding_action == "list":
+        rows = finding_load_all(root)
+        total = len(rows)
+        if args.open_only:
+            rows = [r for r in rows if r.get("outcome") == "open"]
+        if args.severity:
+            rows = [r for r in rows
+                    if (r.get("classification") or {}).get("severity") == args.severity]
+        if args.json:
+            print(json.dumps(rows, indent=2))
+            return 0
+        if not rows:
+            print("no findings" + (" open" if args.open_only else ""))
+            return 0
+        order = {s: i for i, s in enumerate(SEVERITIES)}
+        rows.sort(key=lambda r: order.get((r.get("classification") or {}).get("severity"), 9))
+        for r in rows:
+            cl = r.get("classification") or {}
+            ev = r.get("evidence") or {}
+            loc = ev.get("file", "?") + (f":{ev['line']}" if ev.get("line") else "")
+            print(f"  {r['id']}  {cl.get('severity','?'):<8} {cl.get('confidence','?'):<6} "
+                  f"{r.get('outcome','?'):<10} {r.get('ruleId','?'):<26} {loc}")
+            print(f"            {r.get('summary','')}")
+        allrows = finding_load_all(root)
+        openn = sum(1 for r in allrows if r.get("outcome") == "open")
+        unex = sum(1 for r in allrows if r.get("outcome") == "unexecuted")
+        shown = f"showing {len(rows)} of {total}" if len(rows) != total else f"{total} finding(s)"
+        print(f"\n{shown}; {openn} open, {unex} unexecuted, of {total} raised.")
+        if unex:
+            print("An unexecuted finding is not closed — the fix was never verified.")
+        return 0
+
+    if args.finding_action == "show":
+        p = finding_file(root, args.id)
+        if p is None or not os.path.exists(p):
+            print(f"no finding {args.id}", file=sys.stderr)
+            return 1
+        print(open(p).read().rstrip())
+        return 0
+
+    # close
+    p = finding_file(root, args.id)
+    if p is None or not os.path.exists(p):
+        print(f"no finding {args.id}", file=sys.stderr)
+        return 1
+    _sev = ((json.load(open(p)).get("classification") or {}).get("severity")
+            if os.path.exists(p) else None)
+    if args.outcome in ("refused", "deferred") and _sev in ("critical", "high") \
+            and not (args.detail or "").strip():
+        print(f"closing a {_sev} finding as `{args.outcome}` needs --detail saying why.\n"
+              "Those two outcomes are a judgement that something real will not be acted on "
+              "now, and a judgement with no reason recorded is indistinguishable from "
+              "clearing the board.", file=sys.stderr)
+        return 3
+    if args.outcome == "fixed" and not args.commit:
+        print("closing a finding as `fixed` needs --commit <sha>.\n"
+              "`fixed` is a claim that something was repaired, and a claim with nothing "
+              "behind it is how a false-fix rate stays at zero while defects come back. "
+              "If the finding was wrong, or will not be acted on, say so instead:\n"
+              "  --outcome refused    it is not a defect, and why\n"
+              "  --outcome deferred   it is real and not now\n"
+              "  --outcome unexecuted nobody checked", file=sys.stderr)
+        return 3
+    if args.outcome not in FINDING_OUTCOMES or args.outcome == "open":
+        print(f'outcome must be one of: {", ".join(w for w in FINDING_OUTCOMES if w != "open")}',
+              file=sys.stderr)
+        return 3
+    rec = json.load(open(p))
+    raiser = (rec.get("provenance") or {}).get("agent", "")
+    if raiser and args.by and raiser != args.by:
+        # Not refused — a remediator legitimately closes a reviewer's finding — but recorded,
+        # because "who closed this" was previously nowhere and any actor could close any
+        # finding silently.
+        print(f"note: {raiser} raised this; {args.by} is closing it.")
+    rec["outcome"] = args.outcome
+    rec["closedBy"] = args.commit or head(root)
+    rec["closedByActor"] = args.by
+    if args.detail:
+        rec["verificationPlan"] = rec.get("verificationPlan") or args.detail
+    with open(p, "w") as fh:
+        json.dump(rec, fh, indent=2)
+        fh.write("\n")
+    audit(root, "finding.close",
+          f"{args.id} outcome={args.outcome} by {args.by}: {args.detail or ''}",
+          {"id": args.id, "outcome": args.outcome, "by": args.by,
+           "commit": args.commit or None})
+    print(f"{args.id}: {args.outcome}")
+    if args.outcome == "unexecuted":
+        print("unexecuted is not closed — the fix was not verified. It stays on the gate's list.")
     return 0
 
 
@@ -1298,7 +3636,17 @@ def cmd_metrics(args) -> int:
     for line in open(p, errors="replace"):
         parts = line.rstrip("\n").split("\t")
         if len(parts) >= 6:
-            rows.append(dict(zip(("at", "event", "commit", "branch", "agent", "detail"), parts)))
+            r = dict(zip(("at", "event", "commit", "branch", "agent", "detail"), parts[:6]))
+            # The seventh field is the same facts as JSON. Prefer it: re-parsing the prose
+            # meant rewording a message changed a number, and a message that did not match
+            # the expected shape counted as nothing at all.
+            r["data"] = {}
+            if len(parts) >= 7:
+                try:
+                    r["data"] = json.loads(parts[6]) or {}
+                except Exception:
+                    r["data"] = {}
+            rows.append(r)
     if args.since:
         rows = [r for r in rows if r["at"][:10] >= args.since]
     if not rows:
@@ -1309,7 +3657,7 @@ def cmd_metrics(args) -> int:
     for r in rows:
         if r["event"].startswith("receipt."):
             kind = r["event"].split(".", 1)[1]
-            verdict = r["detail"].split(" by ")[0]
+            verdict = r["data"].get("verdict") or r["detail"].split(" by ")[0]
             stages.setdefault(kind, {}).setdefault(verdict, 0)
             stages[kind][verdict] += 1
         elif r["event"] == "blocked":
@@ -1335,8 +3683,79 @@ def cmd_metrics(args) -> int:
         print("\nactors")
         for a, n in sorted(agents.items(), key=lambda x: -x[1]):
             print(f"  {a:<24} {n} events")
+    findings = finding_load_all(root)
+    if findings:
+        sev, cat, outcome = {}, {}, {}
+        for f in findings:
+            cl = f.get("classification") or {}
+            sev[cl.get("severity", "?")] = sev.get(cl.get("severity", "?"), 0) + 1
+            dom = str(f.get("category", "?")).split(".")[0]
+            cat[dom] = cat.get(dom, 0) + 1
+            outcome[f.get("outcome", "?")] = outcome.get(f.get("outcome", "?"), 0) + 1
+        print("\nfindings by severity")
+        for k in SEVERITIES:
+            if k in sev:
+                print(f"  {k:<10} {sev[k]}")
+        print("findings by taxonomy domain")
+        for k, v in sorted(cat.items(), key=lambda x: -x[1])[:12]:
+            print(f"  {k:<10} {v}")
+
+        # The outcome measures the brief asks for, computed only from what is recorded.
+        # Each is labelled with what it actually counts, because a metric whose definition is
+        # unstated is how a dashboard starts lying.
+        closed = sum(outcome.get(w, 0) for w in ("fixed", "refused", "deferred", "escalated"))
+        attempted = outcome.get("fixed", 0) + outcome.get("unexecuted", 0)
+        print("\noutcomes")
+        print(f"  verified repair rate   "
+              f"{100 * outcome.get('fixed', 0) // max(attempted, 1)}%  "
+              f"({outcome.get('fixed', 0)} fixed with proof / {attempted} repairs attempted)")
+        print(f"  human intervention     "
+              f"{100 * outcome.get('escalated', 0) // max(len(findings), 1)}%  "
+              f"({outcome.get('escalated', 0)} escalated / {len(findings)} findings)")
+        repro = sum(1 for f in findings if (f.get("evidence") or {}).get("repro"))
+        print(f"  reproducible           "
+              f"{100 * repro // max(len(findings), 1)}%  "
+              f"({repro} carry a reproduction)")
+        unex = outcome.get("unexecuted", 0)
+        if unex:
+            print(f"  UNVERIFIED             {unex} finding(s) closed as unexecuted — the fix "
+                  f"was never proved. These are not closed.")
+        if outcome.get("open"):
+            print(f"  still open             {outcome['open']}")
+
+        # A finding re-raised after being closed as fixed did not stay fixed.
+        fixed_then, refixed = set(), 0
+        for r in rows:
+            # Matched on the structured field, not on free text: the old `" fixed" in detail`
+            # counted a close whose note said "could not be fixed yet" as a fix.
+            if r["event"] == "finding.close" and (
+                    r["data"].get("outcome") == "fixed"
+                    or (not r["data"] and "outcome=fixed" in r["detail"])):
+                fixed_then.add(r["data"].get("id") or r["detail"].split()[0])
+            elif r["event"] == "finding.write" and (
+                    r["data"].get("id") or r["detail"].split()[0]) in fixed_then:
+                refixed += 1
+        if fixed_then:
+            print(f"  false-fix rate         "
+                  f"{100 * refixed // max(len(fixed_then), 1)}%  "
+                  f"({refixed} of {len(fixed_then)} came back after being closed fixed)")
+
+    regress = [r for r in rows if r["event"] == "baseline.compare"]
+    if regress:
+        withnew = sum(1 for r in regress if not r["detail"].startswith("0 new"))
+        print(f"\nattribution ({len(regress)} comparisons)")
+        print(f"  changes that introduced a new failure  "
+              f"{100 * withnew // max(len(regress), 1)}%  ({withnew} of {len(regress)})")
+    weakened = [r for r in rows if r["event"] == "suite.weakened"]
+    if weakened:
+        print(f"  diffs that weakened a check            {len(weakened)}")
+
     print("\nA low first-pass rate is not a problem by itself — it is the gate doing its job.\n"
           "A first-pass rate of 100% means the gate is not checking anything.")
+    if findings:
+        print("Detection precision and recall are NOT here: they need a corpus of seeded\n"
+              "defects with known answers, which no repository has about itself. See\n"
+              "docs/maturity.md for how to measure them if you need to.")
     return 0
 
 
@@ -1489,6 +3908,87 @@ def main() -> int:
         q.add_argument("--any-commit", action="store_true",
                        help="do not require the receipt to name the current HEAD")
     r.set_defaults(fn=cmd_receipt)
+
+    fd = sub.add_parser("finding", help="raise, list and close a structured finding")
+    fds = fd.add_subparsers(dest="finding_action", required=True)
+
+    fw = fds.add_parser("write", help="raise a finding (validated against the contract)")
+    fw.add_argument("--rule", required=True, help="a ruleId from docs/control-spec.md")
+    fw.add_argument("--category", required=True, help="taxonomy address, e.g. D.31 or X7")
+    fw.add_argument("--summary", required=True, help="one sentence: the defect")
+    fw.add_argument("--file", required=True)
+    fw.add_argument("--line", type=int)
+    fw.add_argument("--severity", required=True, choices=SEVERITIES)
+    fw.add_argument("--confidence", required=True, choices=CONFIDENCES)
+    fw.add_argument("--detection", default="llm", choices=DETECTIONS)
+    fw.add_argument("--exploitability", choices=EXPLOITABILITY)
+    fw.add_argument("--component", default="")
+    fw.add_argument("--code", default="", help="the relevant lines, quoted")
+    fw.add_argument("--tool-output", default="", help="the deterministic output behind the claim")
+    fw.add_argument("--repro", default="", help="the smallest reproduction, as commands")
+    fw.add_argument("--impact", default="")
+    fw.add_argument("--root-cause", default="", help="why it exists, not the symptom")
+    fw.add_argument("--repair", default="", help="the minimal proposed change")
+    fw.add_argument("--expected", default="", help="what is true after the repair")
+    fw.add_argument("--side-effects", default="")
+    fw.add_argument("--verification-plan", default="",
+                    help="the check that would establish the repair worked")
+    fw.add_argument("--tool-version", default="")
+    fw.add_argument("--by", default=os.environ.get("CLAUDE_AGENT", "agent"))
+
+    fl = fds.add_parser("list", help="what has been found")
+    fl.add_argument("--open", dest="open_only", action="store_true")
+    fl.add_argument("--severity", choices=SEVERITIES)
+    fl.add_argument("--json", action="store_true")
+
+    fsh = fds.add_parser("show")
+    fsh.add_argument("id")
+
+    fc = fds.add_parser("close", help="record what became of a finding")
+    fc.add_argument("id")
+    fc.add_argument("--outcome", required=True,
+                    choices=[w for w in FINDING_OUTCOMES if w != "open"])
+    fc.add_argument("--commit", default="")
+    fc.add_argument("--detail", default="")
+    fc.add_argument("--by", default=os.environ.get("CLAUDE_AGENT", "agent"),
+                    help="who is closing it; recorded on the finding and in the audit log")
+    fd.set_defaults(fn=cmd_finding)
+
+    bl = sub.add_parser("baseline", help="what was already broken before the work started")
+    bls = bl.add_subparsers(dest="baseline_action", required=True)
+    bls.add_parser("capture", help="record the verify result at the branch point")
+    bls.add_parser("compare", help="classify each failure as new, pre-existing or fixed")
+    bls.add_parser("show", help="what was captured, and when")
+    bl.set_defaults(fn=cmd_baseline)
+
+    ts = sub.add_parser("tests", help="has this diff made the gate easier to pass?")
+    tss = ts.add_subparsers(dest="tests_action", required=True)
+    ta = tss.add_parser("audit", help="deleted tests, weakened assertions, skips, suppressions")
+    ta.add_argument("--base", default="", help="compare against this ref instead of the merge base")
+    ta.add_argument("--acknowledge", action="store_true",
+                    help="record that a human decided each of these is correct")
+    ta.add_argument("--as", dest="as_person", default="",
+                    help="who is accepting them; required with --acknowledge")
+    ts.set_defaults(fn=cmd_tests)
+
+    bg = sub.add_parser("budget", help="what this task has spent, and its ceiling")
+    bgs = bg.add_subparsers(dest="budget_action", required=True)
+    bgs.add_parser("show")
+    bgr = bgs.add_parser("reset", help="a person clears the counter for this task")
+    bgr.add_argument("--as", dest="as_person", default="")
+    bg.set_defaults(fn=cmd_budget)
+
+    cp = sub.add_parser("checkpoint", help="resume a long task without assuming it is safe to")
+    cps = cp.add_subparsers(dest="checkpoint_action", required=True)
+    cw = cps.add_parser("write")
+    cw.add_argument("--task", default="")
+    cw.add_argument("--done", action="append", help="a step already finished; repeatable")
+    cw.add_argument("--next", dest="next_step", default="", help="the next step")
+    cw.add_argument("--note", default="")
+    cw.add_argument("--file", action="append", help="a file whose state this assumes; repeatable")
+    cps.add_parser("resume", help="re-check the assumptions before continuing")
+    cps.add_parser("show")
+    cp.set_defaults(fn=cmd_checkpoint)
 
     args = ap.parse_args()
     return args.fn(args)

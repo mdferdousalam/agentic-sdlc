@@ -1,0 +1,72 @@
+{
+  "$comment": "The suppression markers `sdlc tests audit` looks for, held as data so that bin/sdlc does not contain the strings it scans for. It used to, which forced suiteAudit.exclude to exempt the whole of the file implementing every control. An exemption over that file is a poor trade for a detector that cannot read its own source.",
+  "skip": [
+    {
+      "pattern": "\\.(skip|only)\\s*\\(|\\bx(it|describe|test)\\s*\\(",
+      "flags": "",
+      "why": "a test is skipped or isolated"
+    },
+    {
+      "pattern": "@pytest\\.mark\\.(skip|xfail)",
+      "flags": "",
+      "why": "a test is skipped or expected to fail"
+    },
+    {
+      "pattern": "\\bt\\.Skip\\w*\\(",
+      "flags": "",
+      "why": "a Go test skips itself"
+    },
+    {
+      "pattern": "#\\[ignore\\]",
+      "flags": "",
+      "why": "a Rust test is ignored"
+    },
+    {
+      "pattern": "@(Disabled|Ignore)\\b",
+      "flags": "",
+      "why": "a JVM test is disabled"
+    },
+    {
+      "pattern": "\\breturn\\s*;?\\s*//\\s*(TODO|FIXME|skip)",
+      "flags": "i",
+      "why": "a test returns early"
+    }
+  ],
+  "suppress": [
+    {
+      "pattern": "eslint-disable(-next-line)?",
+      "flags": "",
+      "why": "an eslint rule is disabled"
+    },
+    {
+      "pattern": "#\\s*noqa|#\\s*type:\\s*ignore|#\\s*pylint:\\s*disable",
+      "flags": "",
+      "why": "a Python check is silenced"
+    },
+    {
+      "pattern": "#\\[allow\\(",
+      "flags": "",
+      "why": "a Rust lint is allowed"
+    },
+    {
+      "pattern": "//\\s*nolint|//lint:ignore",
+      "flags": "",
+      "why": "a Go linter is silenced"
+    },
+    {
+      "pattern": "@SuppressWarnings|@ts-(ignore|expect-error|nocheck)",
+      "flags": "",
+      "why": "a type or compiler check is suppressed"
+    },
+    {
+      "pattern": "\\bcontinue-on-error:\\s*true",
+      "flags": "",
+      "why": "a CI step is allowed to fail"
+    },
+    {
+      "pattern": "\\|\\|\\s*true\\s*$",
+      "flags": "",
+      "why": "a command's failure is swallowed"
+    }
+  ]
+}

@@ -61,7 +61,7 @@ you to trust its hook once, and what `install.sh` actually does before you pipe 
 Also `:gate` (the mechanical half on its own), `:status` (which receipts hold right now), `:doctor` (is the install sane), and
 `sdlc-test-author` for the tests a review finds missing.
 
-Eleven agents, each with one job and no permission to do another's. The reviewers cannot edit.
+Sixteen agents, each with one job and no permission to do another's. The reviewers cannot edit.
 The gate cannot push. Only the lander touches the remote, and it cannot tag, release or publish
 at all.
 
@@ -93,6 +93,17 @@ at one stage the tool says to stop: at that point the specification is usually t
 The same hook also refuses `git stash`, `reset --hard`, `clean`, `checkout -- .`, `add -A`,
 `commit -a`, force-push, `tag`, every `publish`, `gh release`, `docker push`, and reading a
 credential file. Each refusal explains itself and names the route that is allowed.
+
+**A ceiling an agent cannot raise.** Set `budget.maxToolCalls` or `budget.maxWallClockMin` and
+the hook stops the task when it is reached. This cannot see your host's token meter — nothing
+inside your repository can — so it counts what it can observe and refuses, which is worth more
+than a number that describes the overspend afterwards.
+
+**And the gate cannot be lowered to pass itself.** `sdlc tests audit` reads the diff for
+deleted tests, removed assertions, new skip markers, new suppression comments and lowered
+thresholds. Every agent prompt already forbids these; this is the part that does not negotiate.
+The readiness gate runs it, and so does the remediator — on its own work, because it is the
+stage most tempted.
 
 This cannot make a dishonest verdict honest — nothing can. It makes a **skipped** stage
 impossible, which is the failure that actually happens.
@@ -135,6 +146,22 @@ profiles carry them instead — `"profile": "webapp"` and the reviewers hold you
 | [`service`](profiles/service.md) | timeouts and retries, idempotency, observability, limits, rollback |
 | [`compiler`](profiles/compiler.md) | specification first, diagnostic codes, evidence vocabulary, bounded workloads |
 
+Those are project *kinds*, and you pick one. **Concerns** cut across them, so you pick any
+number — a Go service wants `service` and `concurrency` both:
+
+```jsonc
+{ "profile": "service", "concerns": ["concurrency", "data", "performance"] }
+```
+
+`architecture` (dependency direction, cycles, boundaries) · `performance` (N+1, pagination,
+scale limits) · `memory` (lifetimes, cleanup, unbounded growth) · `concurrency` (races, lock
+order, TOCTOU, cancellation) · `data` (constraints, transaction boundaries, reversible
+migrations, idempotency) · `platform` (host assumptions, numerics, locale, shutdown).
+
+`:init` proposes them from what your repository actually does and never imposes one. Each names
+the deterministic tool for your stack and says it belongs in `quality.cmd` — until it is there,
+those findings are a reading, not a measurement, and they are recorded as such.
+
 Writing your own is one markdown file. Keep it to what a reviewer can check.
 
 ## OpenSpec, properly
@@ -142,7 +169,7 @@ Writing your own is one markdown file. Keep it to what a reviewer can check.
 When OpenSpec is present the specification *is* an OpenSpec change, and the pipeline uses the
 parts of it that are machine-checkable:
 
-- `openspec change validate <id> --strict` — a malformed spec is an automatic
+- `openspec validate <id> --strict` — a malformed spec is an automatic
   changes-requested, quoted rather than paraphrased;
 - `tasks.md` is the acceptance criteria: the implementer ticks each item in the commit that did
   it, the verifier maps each to `file:line` plus a test outcome, the gate treats a ticked
@@ -155,13 +182,27 @@ behaviour. [How it fits](docs/openspec.md).
 ## Governance you can show someone
 
 ```sh
-sdlc metrics      # stage outcomes, first-pass rates, which refusals fire, who acted
+sdlc metrics      # stage outcomes, findings by severity and domain, repair and false-fix rates
 sdlc trace        # requirement → commit → test → receipts, as markdown or JSON
 sdlc status       # which receipts hold right now, which are stale
+sdlc finding list --open      # what is outstanding, worst first
 ```
 
 Everything lands in an append-only `.sdlc/audit.log`. A first-pass gate rate of 100% is
 reported as a finding, not a success — it usually means the gate is not checking anything.
+
+**Findings are records, not prose.** Each carries a rule from
+[`docs/control-spec.md`](docs/control-spec.md), a taxonomy address, evidence, a root cause and
+a provenance — and two independent judgements: **severity** (how bad if real) and
+**confidence** (how sure it is real). What an agent may repair unattended comes from the pair.
+A critical finding at low confidence escalates to a person, because the agent's belief that it
+found an auth bypass is exactly the thing in question. An `advisory` finding is never committed
+at any confidence.
+
+What is deliberately *not* reported: detection precision and recall. Those need a corpus of
+seeded defects with known answers, which no repository has about itself.
+[`docs/maturity.md`](docs/maturity.md) says how to measure them, and what else this does not
+give you.
 [Standards mapping](docs/compliance.md) for NIST AI RMF, OWASP Agentic AI and OWASP NHI,
 including what this does **not** give you.
 

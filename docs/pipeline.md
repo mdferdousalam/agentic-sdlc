@@ -17,7 +17,7 @@ Turns a request into a specification: an OpenSpec change (`proposal.md`, `design
 `tasks.md`, delta specs) or a PRD + FRD with numbered requirements.
 
 **Exit:** every requirement falsifiable, every refusal specified, scope stated both ways, open
-questions named — and with OpenSpec, `openspec change validate --strict` passing.
+questions named — and with OpenSpec, `openspec validate --strict` passing.
 
 ## 2 · Review the spec — `sdlc-spec-reviewer`
 
@@ -33,7 +33,30 @@ The only component allowed to create a branch, and it checks the approval mechan
 (`sdlc receipt check spec --verdict approved`) rather than believing a transcript. Refuses on a
 dirty tree rather than stashing anything.
 
-**Exit:** a branch cut from an up-to-date trunk, and a draft pull request where a remote exists.
+It also captures the **baseline**: what `verifyCmd` said about the repository as it was found.
+This is the only moment that can be recorded honestly, and everything downstream depends on it.
+A failure afterwards is then attributable — `new`, `pre-existing` or `fixed` — instead of being
+blamed on whoever is holding the diff. A repository that was already red is a fact to report,
+not a reason to stop.
+
+Unlike a receipt, a baseline is keyed to the base commit and survives every commit on the
+branch. A receipt that outlived a commit would be a lie; a baseline that did not would be
+useless by the second commit.
+
+**Exit:** a branch cut from an up-to-date trunk, a captured baseline, and a draft pull request
+where a remote exists.
+
+## 3b · Impact — `sdlc-impact-analyst`
+
+Reads the specification, not a diff, and asks the question no other stage asks: **who else
+depends on this?** Call sites, published interfaces, schemas, consumers, the migrations they
+imply and the order those must happen in, and what is irreversible. Read-only.
+
+It also states what a textual search cannot see — dynamic dispatch, reflection, another
+repository, a consumer that only exists in production traffic — because an impact report that
+implies completeness is worse than none: the gate will trust it.
+
+**Exit:** a dependents report, and a finding for anything blocking.
 
 ## 4 · Implement — `sdlc-implementer`
 
@@ -53,7 +76,7 @@ actually running it. Also the reverse — anything in the diff no requirement as
 **Exit:** a `verification` receipt and a report in which every requirement carries one of the
 five words. `unexecuted` is the honest answer for a test that was not run.
 
-## 6 · Review — `sdlc-code-reviewer`, `sdlc-security-reviewer`
+## 6 · Review — `sdlc-code-reviewer`, `sdlc-security-reviewer`, `sdlc-architecture-reviewer`
 
 Code review reads the diff against its specification, the project's standards and the profile.
 Security review covers authority, injection, untrusted input, secrets, dependencies, data
@@ -129,6 +152,7 @@ suppression *is* the correct resolution, and the commit message must say why.
 | `git add -A`, `git add .`, `git commit -a` | never — commits are path-scoped |
 | force-push, `git tag`, any publish, `gh release`, `docker push` | never — the maintainer's |
 | reading `.env`, keys, `~/.ssh`, `~/.aws` | never |
+| any tool call past `budget.maxToolCalls` or `maxWallClockMin` | a person runs `sdlc budget reset` |
 | `kubectl apply`, `helm upgrade`, `terraform apply`, `fly deploy`, `ansible-playbook`, cloud deploys | a human `approval_release` **and** a READY receipt |
 | `gh pr merge` where `approvals.merge` is `human` | a human `approval_merge` for this commit |
 

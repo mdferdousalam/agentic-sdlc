@@ -125,7 +125,20 @@
         "string",
         "null"
       ],
-      "description": "An opt-in standards profile from the plugin's profiles/ directory."
+      "description": "The kind of project this is: an opt-in standards profile from the plugin's profiles/ directory (webapp, library, service, compiler). One per project."
+    },
+    "concerns": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Cross-cutting standards from profiles/concerns/, applied in addition to the project-kind profile. A Go service needs service AND concurrency, so this is a list rather than a second single choice. Known: architecture, performance, memory, concurrency, data, platform.",
+      "examples": [
+        [
+          "concurrency",
+          "performance"
+        ]
+      ]
     },
     "reviewers": {
       "type": "array",
@@ -263,6 +276,49 @@
     "attributeCommits": {
       "type": "boolean",
       "description": "Add an agent identity trailer to commits, so a change can be traced to the actor that made it."
+    },
+    "budget": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Ceilings an agent cannot raise for itself. An agent that cannot stop is a cost centre with a git token. The tool cannot see the host's token meter, so it counts what it can observe: tool calls through the hook, wall-clock since the task began, and repair attempts.",
+      "properties": {
+        "maxToolCalls": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Tool calls per task before the hook refuses. 0 means no ceiling, which means nothing will stop a runaway task."
+        },
+        "maxWallClockMin": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Minutes per task before the hook refuses. 0 means no ceiling."
+        },
+        "maxRetries": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Attempts at one stage before the pipeline says to stop and report. Default 3: past that, the specification is usually the problem, not the code."
+        },
+        "stopPolicy": {
+          "enum": [
+            "refuse",
+            "warn"
+          ],
+          "description": "refuse: the hook blocks. warn: it says so and allows it. refuse is the point."
+        }
+      }
+    },
+    "suiteAudit": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Controls for `sdlc tests audit`. Exemption is declared here rather than inferred from a line's text, because anything decided from the text can be rewritten by the actor the control exists to constrain. Adding a glob is itself reported as a weakening, so the escape hatch cannot be used quietly.",
+      "properties": {
+        "exclude": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Paths or globs exempt from the suppression-marker half of the audit. Deleted tests, removed assertions and lowered thresholds still fire on them. For files that genuinely DEFINE these patterns \u2014 a detector, its fixtures, an adversarial eval prompt \u2014 not for files that merely trip it."
+        }
+      }
     }
   }
 }

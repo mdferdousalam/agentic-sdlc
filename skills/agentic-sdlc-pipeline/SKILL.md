@@ -18,9 +18,10 @@ Read `${CLAUDE_PLUGIN_ROOT}/docs/rules.md` before running any stage. Read the pr
 | 1 | Specify | `/agentic-sdlc:feature` | `sdlc-spec-writer` | a specification |
 | 2 | Review the spec | ↑ same command | `sdlc-spec-reviewer` | `spec` receipt |
 | 3 | Branch | ↑ same command | `sdlc-branch-opener` | a branch |
+| 3b | Impact | `/agentic-sdlc:impact` | `sdlc-impact-analyst` | who depends on this, and in what order |
 | 4 | Implement | `/agentic-sdlc:implement` | `sdlc-implementer` | code and tests |
 | 5 | Verify | `/agentic-sdlc:verify` | `sdlc-verifier` | `verification` receipt |
-| 6 | Review | `/agentic-sdlc:review` | `sdlc-code-reviewer`, `sdlc-security-reviewer` | `review`, `security` receipts |
+| 6 | Review | `/agentic-sdlc:review` | `sdlc-code-reviewer`, `sdlc-security-reviewer`, `sdlc-architecture-reviewer` | `review`, `security` receipts |
 | 7a | Mechanical gate | `/agentic-sdlc:gate` | — | `gate` receipt |
 | 7b | Readiness | `/agentic-sdlc:readiness` | `sdlc-readiness-gate` | `readiness` receipt |
 | 8 | Land | `/agentic-sdlc:land` | `sdlc-lander` | branch pushed, pull request |
@@ -28,6 +29,10 @@ Read `${CLAUDE_PLUGIN_ROOT}/docs/rules.md` before running any stage. Read the pr
 | 10 | Release | `/agentic-sdlc:release` | `sdlc-release-manager` | `postdeploy` receipt, or a rollback |
 | — | Triage | `/agentic-sdlc:triage` | `sdlc-triager` | a scoped unit of work, or a reasoned dismissal |
 | — | Remediate | `/agentic-sdlc:remediate` | `sdlc-remediator` | one commit per finding, re-verified |
+
+The branch stage also captures a **baseline** — what the verify command said before any work
+began. Every later failure is then attributable: new, pre-existing, or fixed. Without it an
+agent spends its retries on a test that was already red.
 
 `/agentic-sdlc:status` says which receipts hold right now; `/agentic-sdlc:doctor` checks the
 install and the configuration.

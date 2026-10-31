@@ -1,6 +1,6 @@
 {
   "name": "@mdferdousalam/agentic-sdlc",
-  "version": "2.3.0",
+  "version": "3.0.1",
   "description": "An enforced agent-based SDLC pipeline for any coding agent: specify, review, branch, implement, verify, review, gate, land, release. Claude Code, opencode, Codex and Cline refuse a skipped stage at the tool call; Cursor, Copilot, Windsurf and every AGENTS.md host get the pipeline plus git-hook and CI enforcement.",
   "keywords": [
     "sdlc",

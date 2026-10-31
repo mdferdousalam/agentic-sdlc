@@ -7,7 +7,7 @@ pipeline needs and prose cannot give.
 
 ## Why it earns its place here
 
-**A validator.** `openspec change validate <id> --strict --json` fails on a malformed
+**A validator.** `openspec validate <id> --strict --json` fails on a malformed
 specification. The spec reviewer runs it first and quotes the failure, so "changes-requested"
 is sometimes a machine's verdict rather than a model's opinion.
 
@@ -35,7 +35,7 @@ openspec init                          # once per repository
 | What was chosen, over what | `<id>/design.md` |
 | Acceptance criteria | `<id>/tasks.md` |
 | Requirements on a published capability | `<id>/specs/<capability>/spec.md` |
-| Well-formed | `openspec change validate <id> --strict` |
+| Well-formed | `openspec validate <id> --strict` |
 | Done | every task ticked, in the commit that did it |
 | History | `openspec archive <id>` |
 

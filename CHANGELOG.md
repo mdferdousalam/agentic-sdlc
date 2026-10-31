@@ -3,6 +3,335 @@
 All notable changes to this plugin. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the versioning is [semantic](https://semver.org/).
 
+## [3.0.1] — 2026-10-31
+
+A security release. Every finding below was found by this pipeline's own readiness gate run
+against 3.0.0, which returned NOT-READY. Five were critical. 3.0.0 is published and
+bypassable; upgrade.
+
+The test suite goes from 248 assertions to 526. Each fix carries the reproduction that
+produced it, as a test.
+
+### Fixed — the refusal path
+
+- **The guard reads commands, not command lines.** Rules were matched as regular expressions
+  against the raw text of a command line, which failed in both directions at once.
+  `git -c core.pager=cat stash` was *allowed*, because a global option between `git` and the
+  subcommand defeated every `\bgit\s+stash\b` pattern — 18 of 18 refusals could be bypassed
+  this way, and the same hole let an ungated `git -c … push` past the protected-branch gate.
+  Meanwhile `sdlc finding write --detail "git stash is refused"` was *refused*, because prose
+  quoting a forbidden command read as the command itself; this blocked the readiness gate
+  from writing its own NOT-READY receipt, which is to say the control could not record its
+  own verdict.
+
+  The line is now tokenised, split at the shell operators, stripped of heredoc bodies and of
+  git's global options, and each rule is matched from the start of a command rather than
+  anywhere in the text. `sh -c "<code>"` is parsed in turn rather than scanned as a string.
+  Anything that cannot be parsed — an unbalanced quote, say — falls back to matching the raw
+  line exactly as before, so a parse failure fails closed. Secret-shaped strings
+  (`sk-…`, `ghp_…`, `AKIA…`) are still matched anywhere on the line: a secret is a secret
+  wherever it sits.
+
+  Closes the critical `F-d0c13a07` and the `F-67811454` false positives.
+
+  **The first attempt at this made things worse, and the history is worth keeping.** It
+  anchored each rule at position 0 of a simple command, which closed the false positive and
+  reopened the bypass class it was written for: an independent code review and security
+  review, run against the branch, each found it separately and measured 24 refusals that
+  held before the change and were allowed after. `echo hello` followed by a newline and
+  `git stash` was enough, with no intent to evade, because `shlex` reads an unquoted newline
+  as whitespace and the two commands collapsed into one unit anchored on `echo`. So did
+  `sudo -u ci git clean -fd`, `for f in a b; do git clean -fd; done`, `find . -exec`,
+  `git submodule foreach`, and a quoted `<<` that read as a heredoc and discarded every
+  following line unscanned.
+
+  The anchoring was never needed. Collapsing an argument's own whitespace already stops a
+  quoted sentence reading as the command it describes, so the rules are matched across the
+  whole of a simple command. Unquoted newlines end commands; heredoc markers are found with
+  the same quote-aware scan, and an unterminated one is a parse failure rather than licence
+  to swallow the rest; wrapper options that take a separate value are stepped over; shell
+  keywords are stripped; `--exec` values are parsed as the code they are; and an unperformed
+  expansion is widened to the word separator the shell will make of it, so `git${IFS}stash`
+  and `{git,stash}` are refused — both of which 3.0.0 allowed.
+
+  Net of all that, the branch refuses three things 3.0.0 did not: `git push --all` and
+  `git push --mirror`, which push the trunk without naming it, and `git branch -f`.
+
+- **A publish route the maintainer did not authorise.** `.github/workflows/publish.yml`
+  carried `workflow_dispatch` as a convenience, and a dispatch has no release tag, so the
+  tag-versus-manifest check sat behind `if: github.event_name == 'release'` and was skipped
+  on that path. `gh workflow run publish.yml --ref <anything>` would publish whatever version
+  that ref held, under the trusted-publisher identity. The trigger is gone; the version check
+  is unconditional; the mechanical gate moved to its own job, because a job that downloads
+  `markdownlint-cli2` from the network should not also hold a credential that can publish.
+  The guard now refuses `gh workflow run` by name, and `gh api` to a releases or dispatches
+  path when a method or field flag makes it a write. A plain read of the same path is still
+  allowed.
+
+- **The guard refuses when it cannot evaluate its own rules.** Every host reads exit 2 as a
+  block and any other non-zero exit as "carry on", so an unhandled exception was an *allow* —
+  and `"enforce": "all"` was enough to cause one, because a string has no `.get`. The eleven
+  config keys the guard reads are type-checked before use, and anything else that goes wrong
+  becomes a refusal that says so.
+
+- **A receipt dated in the future is not a receipt.** Staleness was `age > limit`, so a
+  receipt dated next month had a negative age and never expired: a hand-written
+  `readiness.json` unlocked a merge the guard had refused moments earlier. A timestamp more
+  than two minutes ahead is refused. `treeClean` was written on every receipt and read by
+  nothing; a receipt granted over a clean tree now stops holding once the tree is dirty.
+  Acceptances are written to the audit log, not only refusals.
+
+- **Loosening the configuration is itself a weakening.** Setting the six `enforce` flags to
+  `false` turned every refusal into an allow and left no trace, and committing that edit
+  passed `sdlc tests audit` in silence. Switching a flag off stays a legitimate choice — what
+  changes is that it is visible. The suite audit now reports nine kinds of loosening: a
+  refusal switched off, a branch dropped from `protected`, an action removed from
+  `neverByAgent`, a human approval downgraded to an agent's, receipts given a longer life, a
+  budget ceiling raised or removed, a budget that warns instead of refusing, a reviewer or
+  concern dropped, and a trunk change — plus the keys that decide what the gate *runs*:
+  `verifyCmd`, `gateCmd`, `secretScan`, `quality.cmd`, `quality.coverageNewPct` and
+  `spec.strict`. Replacing `verifyCmd` with `true` weakens the pipeline more completely than
+  any flag, and nothing reported it. And when a non-default flag lets a command through that
+  the defaults would have refused, the audit log records which rule and which flag.
+
+  A correction: an earlier draft of this entry said deleting `enforce` "reads as switching
+  all six off — which is what it does". That was wrong twice over. `enforce.get(flag, True)`
+  defaults every flag to *on*, so deleting the key changes nothing, and the detector
+  correctly reports nothing. The detector's defaults now mirror the guard's exactly, which
+  also fixes a real miss: `approvals.release` defaults to `human` in the guard, so an
+  explicit downgrade to `agent` from an absent key is a loosening and was not reported.
+
+- **A finding id is an id, not a path.** `finding show` and `finding close` joined the id
+  straight into a path, so `../../../elsewhere/victim` read a file outside the repository and
+  `close` rewrote it. The shape is checked and the resolved path confirmed to be inside
+  `.sdlc/findings`.
+
+- **A budget an agent can rename its way out of is not a ceiling.** It was keyed on the branch
+  name. With the ceiling spent, `git checkout -b other` made the next call allowed and
+  overwrote the counter. It is keyed on the merge base against the trunk now, which no rename
+  moves and which a new branch from the same point shares; counters are held per task rather
+  than overwriting; a task starting its own budget is audited.
+
+### Added
+
+- `openspec/changes/verification.md` — the verification stage, run for the first time. 18
+  requirements, 31 scenarios: 29 passed, 0 failed, **2 unexecuted**, both now findings of
+  their own. Three passing scenarios hold by observation and carry no regression test; they
+  are marked, because a scenario nothing guards is one a later change can break in silence.
+
+### Fixed — round two, from an independent review of this branch
+
+A code review and a security review, run against the branch, each independently found that
+the parser rewrite above had reopened the bypass class it was written to close. Both
+reports are in the commit history. Everything below came out of them, or out of working
+through the rest of what the gate had raised against 3.0.0.
+
+- **A refused command is refused wherever on the line it sits.** The credential rule keyed
+  on a verb list, so the next reader of the same path was allowed — `xxd` was listed, `base64`
+  was not. The path is a subject in its own right now.
+- **The findings store reaches the enforcement boundary.** A READY receipt let a merge
+  through with an open critical against the same commit. Open critical and high findings
+  block a merge and the refusal names them; advisory does not.
+- **Three paths that failed open.** `tree_clean` compared git's output to the empty string,
+  so git failing to run read as a clean tree. `known_rules` returned an empty set when the
+  rule table would not parse, and the caller then accepted any rule id at all. `subject_digest`
+  joined a receipt-supplied path to the root unchecked and read it whole into memory on every
+  guard call that consults that receipt.
+- **`fixed` needs a commit.** A claim that something was repaired, with nothing behind it, is
+  how a false-fix rate stays at zero while the defects come back.
+- **The budget cannot be re-keyed.** Moving the local trunk ref or editing `trunk` produced a
+  new key and a fresh ceiling. Spend is summed across the window; `reset --as` clears it.
+- **A reading is not a measurement.** Each concern profile says a finding it owns is `medium`
+  at most when read from a diff. That was prose; it is checked now, for the rules the control
+  spec declares as `llm`, and a reproduction still earns `high`.
+- **The detector no longer contains the strings it scans for.** The markers moved to
+  `schema/suppression-patterns.json`, so `bin/sdlc` comes out of `suiteAudit.exclude` and the
+  file implementing every control is scanned again. The obvious alternative — inferring from
+  a line's text whether a marker is quoted — was tried and reverted: one apostrophe defeats
+  it, and this project has rejected that heuristic twice before.
+- **The contract says what the pipeline does.** The stage map was missing Impact and the
+  architecture reviewer; `concerns` was absent from it entirely; reviewer selection had two
+  authorities and now has one, the config; and the generated rules file's links resolved to
+  nothing on every host.
+- **The impact stage leaves a receipt**, `sdlc metrics` reads a structured field instead of
+  re-parsing prose, the finding schema has a consumer in CI, secrets are redacted from the
+  audit log, and the four GitHub Actions are pinned to commit SHAs.
+
+### Fixed — rounds three to seven, and what they say about this control
+
+The parser above was rewritten six times. Rounds one, three, five and seven each introduced
+or left a bypass class that only an independent review found; the author's own probes passed
+every time, because they test the shapes the author is already thinking about. That record is
+kept here rather than summarised away, because it is the honest description of what a
+string-matching guard over shell can promise.
+
+- **A substitution inside double quotes still runs.** The critical of the fifth review, and
+  the fix for a false positive created it. Widening had been taught to leave quoted
+  expansions alone — correctly, since a quoted expansion is one word — but "not widened" was
+  then read as "nothing to look at", so `git commit -m "$(git push --force origin main)"`
+  exited 0. Substitution bodies are now parsed wherever the shell executes them, unquoted and
+  inside double quotes alike, separately from widening, which is only about word boundaries.
+  Single quotes and a backslash-escaped dollar or backtick stay inert, which is what keeps a
+  literal mention in a commit message allowed.
+- **A bound that returns one constant is not a bound.** Past 2000 untracked files the tree
+  digest returned the same string for every possible content, so the cap became the bypass.
+  Names are always hashed; content is hashed until the bounds are reached.
+- **A finding that vanishes is not a finding that was closed.** Corrupting one already read
+  as blocking; deleting one did not, because an absent file looks like a finding that never
+  existed. The readiness receipt records the ids open when the verdict was given and a merge
+  is refused when one of them is gone. Closing a critical or high as refused or deferred now
+  needs `--detail`.
+- **Who reads a heredoc body decides whether it is data — and that list was the wrong way
+  round.** The parser named the programs that *run* a body. `python3 - <<X`, `at now <<X` and
+  `make -f - <<X` were each missing from it, and each executed a body the parser had
+  discarded. The allowlist is inverted: consumers that write a body down are named, and every
+  other consumer has its body parsed and matched raw, because a body fed to `python3` or
+  `awk` is code in a language shell parsing cannot see inside.
+- **An operand another interpreter executes is code, whoever the program is.** A seventh
+  review found ten more: `git config alias.x '!…'`, `gh alias set x '!…'`, `less '+!…'`,
+  `vi '+!…'`, `sqlite3 '.shell …'`, `sed -n '1e …'` and a pipe into `at`. Rather than add
+  seven program names, the *shapes* are matched — a `!` operand is the shell escape by
+  convention across git aliases, pagers, editors and SQL clients; `.shell` and `.system` are
+  dot-commands; `sed`'s `e` command and `s///e` flag run what they read; and a pipe into a
+  runner that takes its command from stdin makes the whole line code, exactly as a pipe into
+  a shell already did.
+- **The guard cannot be made to hang.** The `sed` pattern added for the seventh review had two
+  ambiguous alternations: both branches could consume a backslash, so a failing search tried
+  every way of splitting a run of them — 34 backslashes took six seconds, 40 would take
+  minutes, in a hook that runs before every tool call. The alternatives are disjoint now and
+  a test bounds the time.
+- **A pipe into a runner makes the line suspect, and that has a cost.** `xargs git commit -m
+  "never use <refused phrase>"` is refused, because the raw line is matched once a pipe feeds
+  a stdin runner. That is the same prose-versus-code trade the heredoc rule makes, taken on
+  the safe side; the runner must now be the whole word, so `./scripts/at-deploy` is not one.
+- **The credential rule** missed several real reads: the PostgreSQL password file, the
+  process environment under `/proc`, gh's stored hosts file, git's credential store, a bare
+  `printenv`, `gh auth token`, reading a dotenv file out of git with `git show`, and a glob
+  standing in for the name. Using `env` to set a variable before a command is untouched.
+
+All 77 findings raised against this branch are closed. The test suite is 531 assertions, up
+from 248 at 3.0.0.
+
+### Known, and not fixed here
+
+- Three paths remain in `suiteAudit.exclude`: the marker data file, the suite that tests the
+  detector, and an eval fixture quoting a bad diff. Each has to contain the strings the
+  detector looks for in order to be what it is, and none holds logic. They are declared in
+  the config where a reviewer sees them, and acknowledging them is a maintainer's decision.
+- Two scenarios in `openspec/changes/verification.md` are `unexecuted`, and three more pass
+  by observation with no regression test. Both facts are recorded there rather than rounded
+  up to a pass.
+- Precision and recall are still unmeasured. That needs a seeded-defect corpus;
+  `docs/maturity.md` says how.
+- **Two medium findings from the eighth review are deferred, by the maintainer's decision.**
+  Neither is a regression — 3.0.0 allowed every command involved. `F-7cbc69ab`: a `$'!…'`
+  quoted word and the `GIT_CONFIG_*` environment routes reach a git alias without matching
+  the `!` shape. `F-afcbc050`: other spellings of shapes already matched — `sqlite3 '.once
+  |…'` and `.sh`, `vim '+silent !…'`, a `!` fed on stdin to `ed`, `ex` or `ftp`, and `at`
+  behind `env` or `nohup`. Each fix is another round of the same cycle, which is the limit of
+  matching shell with patterns; the protected-branch and receipt gates are what stand behind
+  it.
+- **`COMMAND_RUNNERS` and `CODE_OPTIONS` are still denylists.** Heredoc consumers and the
+  shell-escape operand shapes were inverted in this release; those two were not. The next
+  program missing from either is the next finding, and it is named here rather than left to
+  be discovered.
+- **Three routes are outside what this control can see, by construction, and are not
+  defects to be filed again.** Writing a command into a file and then running that file;
+  storing an alias for later without invoking it (`gh alias set`); and anything an
+  interpreter assembles at runtime. A guard that reads the command line cannot read a
+  command that is not on it. The protected-branch and receipt gates, which do not depend on
+  text matching, are what stand behind it.
+
+## [3.0.0] — 2026-10-25
+
+Findings become data, the gate can no longer be lowered to pass itself, and the six taxonomy
+domains the reviewers were silent on are covered.
+
+**Major, because the gate got stricter.** Nothing was removed and no configuration key
+changed meaning, but three things that previously passed now block: a configured
+`quality.cmd` actually runs, a diff that weakens the test suite is refused, and a budget
+ceiling stops a task. A repository that was green on 2.3.0 may not be green on this. That is
+the point, and it is a narrowing, so it is a major.
+
+### Added
+
+- **A finding contract.** `schema/finding.schema.json` and `sdlc finding write|list|show|close`.
+  A finding now carries an identity, a rule, a taxonomy address, evidence, a root cause, a
+  verification plan and a provenance — not just the word "blocking". Findings deduplicate by
+  content, so the same one raised twice is one finding rather than two comments.
+- **`docs/control-spec.md`**, normative for every agent: the four vocabularies, the repair
+  policy, the A–U and X1–X12 coverage map with an honest `review-level` marker, and a table of
+  56 rules. A rule that lives only in a prompt is that agent's opinion, and `sdlc finding
+  write` refuses a rule the table does not list.
+- **Severity and confidence as independent axes.** What an agent may repair unattended comes
+  from the pair, never from severity alone: `critical` at `low` confidence escalates to a
+  person, `high` at `medium` needs a reproduction first, and `advisory` is never committed at
+  any confidence.
+- **`sdlc baseline capture|compare|show`.** The branch-opener records what the verify command
+  said *before* any work began; the verifier and gate classify every later failure as `new`,
+  `pre-existing` or `fixed`. Comparison is over normalised signal lines, so it works in any
+  stack without a parser per test runner. Keyed to the merge base, so it survives commits —
+  unlike a receipt, which must not.
+- **`sdlc tests audit`.** Deleted test files, removed assertions, new skip markers, new
+  suppression directives and lowered thresholds. Every agent prompt already forbade these;
+  this is the part that does not negotiate. `--acknowledge` records a human decision and
+  deliberately does not waive the finding.
+- **`budget`.** `maxToolCalls` and `maxWallClockMin`, refused at the tool call and resettable
+  only by a person.
+- **`sdlc checkpoint write|resume|show`.** Stores a long task's progress *and the repository
+  state it assumed*; `resume` re-validates branch, commit ancestry, file digests and toolchain
+  before saying it is safe to continue.
+- **`concerns`**, a second profile axis beside `profile`. Six cross-cutting profiles —
+  `architecture`, `performance`, `memory`, `concurrency`, `data`, `platform` — covering
+  taxonomy domains B, E, F, G, J, K, N and S. A Go service wants `service` *and*
+  `concurrency`, which one field could not express. `sdlc init` proposes them from what the
+  repository actually contains and never imposes one.
+- **`sdlc-impact-analyst`** and **`sdlc-architecture-reviewer`**, both read-only. The first
+  reports dependents, published shapes and ordered migration steps *before* implementation;
+  the second walks the import graph, which is a different search from reading a diff.
+- **Environment fingerprint on every receipt**, so an environmental failure is distinguishable
+  from a defect.
+- **Metrics that measure outcomes**, not just activity: findings by severity and taxonomy
+  domain, verified repair rate, false-fix rate, human-intervention rate and reproducible
+  share.
+- Four evals for the new refusals, and tests for every detection in both directions.
+
+- **Publishing runs from a GitHub release, over OIDC.** `.github/workflows/publish.yml`
+  authenticates with npm Trusted Publishing — no stored token, no one-time password, and
+  provenance attached automatically. The trigger is a published release, so cutting one
+  stays the maintainer's act and the workflow is only the hands that carry it out; it
+  refuses if the tag and `package.json` disagree, and re-runs the gate rather than
+  trusting that it ran earlier.
+
+### Noted
+
+Running `sdlc tests audit` against this repository reported six weakenings that were not
+weakenings: its own detection patterns, its own test fixtures, and the eval that quotes a
+skipped test. A marker inside a string literal suppresses nothing and prose cannot disable a
+linter, so neither is excluded at the cost of a bypass — but six false positives on the
+tool's own diff is how a tool gets ignored, so both are now excluded, with regression tests
+in each direction. Found by dogfooding, which is the point of dogfooding.
+
+### Fixed
+
+- **`quality.cmd` never ran.** It was in the schema, documented as the Level 2 configuration,
+  and reserved as a receipt kind — and no agent or command executed it. The only consumer was
+  the generated CI workflow. The readiness gate and the mechanical gate now run it, and an
+  unset budget is reported as `skipped` rather than passed. Found by auditing this plugin
+  against its own design brief.
+- The OpenSpec commands in the agents and docs used `openspec change validate` and
+  `openspec change show`, which warn as deprecated on openspec 1.6. An agent reading our docs
+  would copy the deprecated form and paste the warning into its report as a finding. Found by
+  dogfooding: this repository now has the `openspec/` scaffolding its own config always said
+  it had.
+
+### Documented
+
+`docs/maturity.md` now says plainly what this still does not give you — detection precision
+and recall, runtime evidence, token accounting, sandboxing — and, for precision and recall,
+how to measure them yourself with a seeded-defect corpus. `docs/compliance.md` gains three
+more honest limits rather than three more claims.
+
 ## [2.3.0] — 2026-10-25
 
 Published through every package manager a developer is likely to already have.

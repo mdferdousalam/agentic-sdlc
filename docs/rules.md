@@ -9,10 +9,11 @@ them repeat it.
 | --- | --- | --- |
 | Specify | `sdlc-spec-writer` | a specification in the configured engine |
 | Review the spec | `sdlc-spec-reviewer` | a `spec` receipt: `approved` or `changes-requested` |
-| Branch | `sdlc-branch-opener` | a branch, only on an approved spec |
+| Branch | `sdlc-branch-opener` | a branch on an approved spec, and the baseline `verifyCmd` said before the work |
+| Impact | `sdlc-impact-analyst` | an `impact` receipt: who depends on what this changes |
 | Implement | `sdlc-implementer` | code and tests for one unit of work |
 | Verify | `sdlc-verifier` | a `verification` receipt: requirement-by-requirement |
-| Review the code | `sdlc-code-reviewer`, `sdlc-security-reviewer` | `review` / `security` receipts |
+| Review the code | `sdlc-code-reviewer`, `sdlc-security-reviewer`, `sdlc-architecture-reviewer` | `review` / `security` receipts, and findings |
 | Readiness | `sdlc-readiness-gate` | a `readiness` receipt: `ready` or `not-ready` |
 | Land | `sdlc-lander` | a pushed branch and a pull request |
 | Report | `sdlc-reporter` | the implementation report, and documentation brought up to date |
@@ -50,12 +51,46 @@ them is a synonym for the others.
 - Quote the command and the line of output that supports each claim. A claim with no evidence is
   a finding, not a pass.
 
+## 3a. Two more words for a finding: how bad, and how sure
+
+The five words say whether a criterion holds. They say nothing about a **finding** — a claim
+that something is wrong. A finding carries two further judgements, and they are independent:
+
+- **Severity**, if it is real: `critical` · `high` · `medium` · `low` · `advisory`.
+- **Confidence**, that it is real: `high` (a tool said so, or it reproduces) · `medium` (a
+  strong reading, not executed) · `low` (a pattern match).
+
+Keep them apart. A low-confidence fix for a critical vulnerability is not safe because the agent
+believes it solved the problem — that belief is exactly the thing in question. What an agent may
+repair unattended comes from the **pair**, in the policy table in
+[`docs/control-spec.md`](control-spec.md), never from severity alone.
+
+`advisory` is not a weak `low`. It means report the evidence and the alternatives and change
+nothing.
+
+Findings close with their own six words — `open`, `fixed`, `refused`, `deferred`, `unexecuted`,
+`escalated` — and `unexecuted` is not closed.
+
+[`docs/control-spec.md`](control-spec.md) is normative for all of this: the vocabularies, the
+repair policy and the rule every finding cites. A rule that lives only in one agent's prompt is
+that agent's opinion, and the next agent will disagree with it.
+
 ## 4. The configuration is the only place that knows your stack
 
 Everything stack-specific — package manager, trunk, verify command, test runner, spec engine,
 what counts as heavy work — lives in `sdlc.config.json`. Agents read it. No agent hardcodes
 `pnpm`, `main`, `pytest` or a directory layout. If something you need is not in the config, the
 config is wrong: say so rather than guessing.
+
+Two axes select the standards a review applies, and they are independent. `profile` is the
+kind of project and you pick one — `webapp`, `service`, `library`, `compiler`. `concerns` is a
+list and you pick any number — `architecture`, `performance`, `memory`, `concurrency`, `data`,
+`platform` — because a Go service needs `service` and `concurrency` both, and making that one
+choice would lose half of what you need. Where a profile and a concern disagree, the concern
+wins: it was chosen for this repository's evidence, and the profile is a default.
+
+`reviewers` is the single authority on who the readiness gate fans out to. An agent not in
+that list does not run because a prompt mentions it, and the gate names any it skipped.
 
 Opinions that only some projects want — a CRUD app's configurability rules, a library's API
 compatibility rules, a compiler's containment rules — live in `profiles/`, and apply only when
