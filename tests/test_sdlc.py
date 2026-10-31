@@ -485,6 +485,31 @@ os.remove(_cf)
 ok(guard(dcf, "gh pr merge --squash").returncode == 0, "removing it lets the merge through")
 shutil.rmtree(dcf)
 
+print("findings: one that vanishes is not one that was closed")
+dvan = newrepo(config={"version": 2, "trunk": "main"})
+_rv = run(["finding", "write", "--rule", "SEC-AUTHORITY", "--category", "D.30",
+           "--severity", "critical", "--confidence", "high", "--file", "a.py", "--line", "1",
+           "--by", "r", "--summary", "an admin path has no check on it"], dvan)
+_vid = _rv.stdout.split()[0]
+run(["receipt", "write", "readiness", "--verdict", "ready", "--by", "t", "--detail", "ok"], dvan)
+ok(guard(dvan, "gh pr merge --squash").returncode == 2, "an open critical blocks the merge")
+os.remove(os.path.join(dvan, ".sdlc/findings", _vid + ".json"))
+ok(guard(dvan, "gh pr merge --squash").returncode == 2,
+   "deleting the file does not unlock it — the receipt recorded the id")
+shutil.rmtree(dvan)
+
+print("receipts: a bound must not collapse every tree to one digest")
+dcap = newrepo(config={"version": 2, "trunk": "main"})
+for _i in range(2100):
+    open(os.path.join(dcap, f"f{_i}.txt"), "w").write("x\n")
+run(["receipt", "write", "gate", "--verdict", "passed", "--by", "t", "--detail", "v"], dcap)
+ok(run(["receipt", "check", "gate", "--verdict", "passed"], dcap).returncode == 0,
+   "holds with more untracked files than the content bound allows")
+open(os.path.join(dcap, "f0.txt"), "w").write("edited\n")
+ok(run(["receipt", "check", "gate", "--verdict", "passed"], dcap).returncode == 1,
+   "and editing one still voids it — past the cap, names carry the rest")
+shutil.rmtree(dcap)
+
 print("budget: what `show` reports is what enforcement sees")
 dbs = newrepo(config={"trunk": "main", "spec": {"engine": "prd-frd"},
                       "budget": {"maxToolCalls": 50}})
@@ -857,8 +882,14 @@ _cid = _rf.stdout.split()[0]
 ok(finding("close", _cid, "--outcome", "fixed").returncode == 3,
    "closing as fixed with no --commit is refused")
 for _o in ("refused", "deferred", "unexecuted"):
-    _r2 = finding("close", _cid, "--outcome", _o)
+    _r2 = finding("close", _cid, "--outcome", _o, "--detail", "not a defect: the call site "
+                  "is unreachable from any request path")
     ok(_r2.returncode == 0, f"but `{_o}` needs no commit — it claims no repair")
+# ...though at critical or high, refusing or deferring needs a reason recorded
+ok(finding("close", _cid, "--outcome", "refused").returncode == 3,
+   "refusing a critical with no --detail is itself refused")
+ok(finding("close", _cid, "--outcome", "unexecuted").returncode == 0,
+   "unexecuted needs none — it claims nothing at all")
 ok(finding("close", _cid, "--outcome", "fixed", "--commit", "abc1234").returncode == 0,
    "and fixed with a commit is accepted")
 

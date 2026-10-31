@@ -156,13 +156,19 @@ def tree_digest(root: str) -> str:
     ok_u, listing = git_ok("ls-files", "-o", "--exclude-standard", "-z", cwd=root)
     if not ok_u:
         return "unreadable-working-tree"
+    # Every name is hashed, always. Content is hashed until the bounds are reached, and
+    # then names alone carry the rest. Returning a constant past the cap meant a repository
+    # with many untracked files had one digest for every possible content — the bound
+    # became a bypass, which is the opposite of what a bound is for.
     seen = total = 0
+    capped = False
     for rel in sorted(x for x in listing.split("\0") if x and not ours(x)):
         seen += 1
-        if seen > SUBJECT_MAX_FILES:
-            return "too-many-untracked-files"
         h.update(b"\0")
         h.update(rel.encode())
+        if capped or seen > SUBJECT_MAX_FILES:
+            capped = True
+            continue
         full = os.path.join(root, rel)
         if os.path.islink(full):
             h.update(b"<symlink>")
@@ -175,11 +181,12 @@ def tree_digest(root: str) -> str:
                         break
                     total += len(chunk)
                     if total > SUBJECT_MAX_BYTES:
-                        return "untracked-content-too-large"
+                        capped = True
+                        break
                     h.update(chunk)
         except OSError:
             h.update(b"<unreadable>")
-    return h.hexdigest()[:16]
+    return ("capped-" if capped else "") + h.hexdigest()[:16]
 
 
 # ------------------------------------------------------------------------------------ config
@@ -524,6 +531,10 @@ def receipt_write(root: str, kind: str, verdict: str, subject: str, detail: str,
         "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "treeClean": tree_clean(root),
         "treeDigest": tree_digest(root),
+        # The ids open when this verdict was given. Corrupting a finding file was closed by
+        # reading it as blocking; deleting one was not, because an absent file looks exactly
+        # like a finding that never existed. A receipt that lists them can tell.
+        "openFindings": sorted(f["id"] for f in findings_blocking(root)),
         "env": environment(root),
     }
     p = receipt_path(root, kind)
@@ -915,6 +926,53 @@ def newlines_to_separators(command: str) -> str:
     return "".join(out)
 
 
+def code_substitutions(text: str):
+    """Every `$(...)` and backquoted span that the shell will execute.
+
+    A substitution inside DOUBLE quotes still runs — it is one word to the shell, but the
+    command inside it executes all the same. Widening was taught to leave quoted expansions
+    alone, correctly, because they are one word; but "not widened" was then read as "nothing
+    to look at", and `git commit -m "$(git push --force origin main)"` became invisible.
+    One word and no command are different claims.
+
+    Inside SINGLE quotes nothing is substituted, and a backslash-escaped `$` or backtick in
+    double quotes is literal. `quote_spans` already tracks both.
+    """
+    out, i, n = [], 0, len(text)
+    state = {k: q for k, _c, q in quote_spans(text)}
+    escaped = set()
+    k = 0
+    while k < n - 1:
+        if text[k] == "\\" and state.get(k) != "'":
+            escaped.add(k + 1)
+            k += 2
+            continue
+        k += 1
+    while i < n:
+        q = state.get(i)
+        if q == "'" or i in escaped:
+            i += 1
+            continue
+        if text.startswith("$(", i):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if text[j] == "(" and j not in escaped:
+                    depth += 1
+                elif text[j] == ")" and j not in escaped:
+                    depth -= 1
+                j += 1
+            out.append(text[i + 2:j - 1] if depth == 0 else text[i + 2:])
+            i = j
+            continue
+        if text[i] == "`":
+            j = text.find("`", i + 1)
+            out.append(text[i + 1:j] if j != -1 else text[i + 1:])
+            i = (j + 1) if j != -1 else n
+            continue
+        i += 1
+    return [c for c in out if c.strip()]
+
+
 def program_name(token: str) -> str:
     return os.path.basename(token.strip("`\\'\""))
 
@@ -1020,6 +1078,11 @@ def command_units(command: str, depth: int = 0) -> list[tuple[str, bool]]:
     # one token here and two words to bash, and `{git,stash}` is a brace list that expands to
     # a real command. Widen the line and parse it again -- it has to happen before lexing,
     # because an argument's own whitespace is collapsed afterwards.
+    # A substitution executes wherever it is not single-quoted, so its body is parsed as
+    # the command it is — separately from widening, which is about word boundaries.
+    if depth < 3:
+        for sub in code_substitutions(command):
+            units += [u for u in command_units(sub, depth + 1) if u[1]]
     widened_line = widen_expansions(command) if UNEXPANDED.search(command) else command
     if widened_line != command:
         # An expansion outside quotes is a word separator the shell has not performed yet.
@@ -1123,6 +1186,22 @@ def findings_blocking(root: str) -> list:
     return out
 
 
+def receipt_vanished_findings(root: str) -> set:
+    """Ids the readiness receipt recorded as open that are no longer in the store."""
+    p = receipt_path(root, "readiness")
+    if not os.path.exists(p):
+        return set()
+    try:
+        recorded = set(json.load(open(p)).get("openFindings") or [])
+    except Exception:
+        return set()
+    if not recorded:
+        return set()
+    here = {os.path.basename(f)[:-5]
+            for f in glob.glob(os.path.join(root, FINDING_DIR, "*.json"))}
+    return recorded - here
+
+
 def guard_problem(root: str, command: str, cfg: dict, record: bool = True) -> str | None:
     enforce = cfg.get("enforce") or {}
     units = command_units(command)
@@ -1181,6 +1260,13 @@ def guard_problem(root: str, command: str, cfg: dict, record: bool = True) -> st
             # same commit. A verdict and a defect list that disagree is the gate believing
             # its own paperwork.
             blocking = findings_blocking(root)
+            vanished = receipt_vanished_findings(root)
+            if vanished:
+                return (f"{len(vanished)} finding(s) the readiness receipt recorded as open "
+                        f"are no longer in the store: {', '.join(sorted(vanished)[:4])}.\n"
+                        f"A finding that disappears is not a finding that was closed. Restore "
+                        f"them, or re-run `/agentic-sdlc:readiness` so the verdict describes "
+                        f"the findings that actually exist.")
             if blocking:
                 worst = ", ".join(f"{f['id']} {f['classification']['severity']}"
                                   for f in blocking[:4])
@@ -3420,6 +3506,15 @@ def cmd_finding(args) -> int:
     if p is None or not os.path.exists(p):
         print(f"no finding {args.id}", file=sys.stderr)
         return 1
+    _sev = ((json.load(open(p)).get("classification") or {}).get("severity")
+            if os.path.exists(p) else None)
+    if args.outcome in ("refused", "deferred") and _sev in ("critical", "high") \
+            and not (args.detail or "").strip():
+        print(f"closing a {_sev} finding as `{args.outcome}` needs --detail saying why.\n"
+              "Those two outcomes are a judgement that something real will not be acted on "
+              "now, and a judgement with no reason recorded is indistinguishable from "
+              "clearing the board.", file=sys.stderr)
+        return 3
     if args.outcome == "fixed" and not args.commit:
         print("closing a finding as `fixed` needs --commit <sha>.\n"
               "`fixed` is a claim that something was repaired, and a claim with nothing "
