@@ -31,11 +31,12 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 CONFIG_NAMES = ("sdlc.config.json", ".opencode/sdlc.json")
 RECEIPT_DIR = ".sdlc/receipts"
-RECEIPT_KINDS = ("spec", "verification", "review", "security", "quality", "gate",
+RECEIPT_KINDS = ("spec", "impact", "verification", "review", "security", "quality", "gate",
                  "readiness", "approval_merge", "approval_release", "approval_exception",
                  "release", "postdeploy")
 AUDIT_LOG = ".sdlc/audit.log"
@@ -1089,7 +1090,7 @@ def config_type_problems(cfg) -> list:
     return out
 
 
-def guard_decide(root: str, command: str, cfg: dict) -> str | None:
+def guard_decide(root: str, command: str, cfg: dict, meter: bool = True) -> str | None:
     """Evaluate the rules, and refuse when they cannot be evaluated.
 
     Every host reads exit 2 as a block and anything else as "something went wrong, carry on".
@@ -1104,7 +1105,7 @@ def guard_decide(root: str, command: str, cfg: dict) -> str | None:
                 "not a control. Fix the type and the refusals resume. The shape is in "
                 "schema/sdlc.config.schema.json.")
     try:
-        problem = guard_problem(root, command, cfg)
+        problem = guard_problem(root, command, cfg, record=meter)
     except Exception as e:
         return (f"the guard failed while evaluating its rules: {e.__class__.__name__}: {e}\n"
                 "Refused rather than allowed. This is a defect in agentic-sdlc — please report "
@@ -1137,7 +1138,9 @@ def cmd_guard(args) -> int:
     """
     if getattr(args, "command", None):
         root = repo_root()
-        problem = guard_decide(root, args.command, load_config(root))
+        # `guard --command` is the git-hook entry point. A hook firing is not an agent
+        # tool call, and counting it made the ceiling mean two different things.
+        problem = guard_decide(root, args.command, load_config(root), meter=False)
         if problem:
             audit(root, "blocked", f"{problem.splitlines()[0]} :: {args.command}")
             print(f"BLOCKED by agentic-sdlc: {redact(problem)}", file=sys.stderr)
@@ -2076,6 +2079,22 @@ def budget_problem(root: str, cfg: dict) -> str | None:
     st["branch"] = branch(root)
     budget_save(root, all_st)
 
+    # Spend is summed across every task started inside the window, so changing the key --
+    # by moving the trunk ref, or editing `trunk` in the config -- carries the old spend
+    # forward instead of starting over. `sdlc budget reset --as` is the way to start over,
+    # and it records who accepted the cost.
+    window = int(b.get("maxWallClockMin") or 0) or 240
+    now = time.time()
+    spent = 0
+    for t in tasks.values():
+        try:
+            began = calendar.timegm(time.strptime(t.get("startedAt", ""), "%Y-%m-%dT%H:%M:%SZ"))
+        except Exception:
+            began = now
+        if (now - began) / 60 <= window:
+            spent += t.get("toolCalls", 0)
+    st = dict(st, toolCalls=max(st.get("toolCalls", 0), spent))
+
     warn_only = (b.get("stopPolicy") or "refuse") == "warn"
     limit = int(b.get("maxToolCalls") or 0)
     if limit and st["toolCalls"] > limit and warn_only:
@@ -2116,11 +2135,13 @@ def cmd_budget(args) -> int:
             return 3
         key = budget_task_key(root, cfg)
         all_st = budget_state(root)
-        spent = ((all_st.get("tasks") or {}).get(key) or {}).get("toolCalls", 0)
-        all_st.setdefault("tasks", {})[key] = {
+        spent = sum(t.get("toolCalls", 0) for t in (all_st.get("tasks") or {}).values())
+        # Every task, not only the current key: spend is summed across the window, so
+        # clearing one key would leave the rest carried forward and the reset would not
+        # reset anything.
+        budget_save(root, {"tasks": {key: {
             "toolCalls": 0, "task": key, "branch": branch(root),
-            "startedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-        budget_save(root, all_st)
+            "startedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}}})
         audit(root, "budget.reset", f"task {key} at {spent} tool calls, by {args.as_person}")
         print(f"budget reset for this task by {args.as_person}")
         return 0
@@ -2638,7 +2659,13 @@ NOISE = (
     (re.compile(r"\b\d+(\.\d+)?\s*(ms|s|sec|secs|seconds|m|min|minutes)\b", re.I), "<time>"),
     (re.compile(r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}\S*"), "<ts>"),
     (re.compile(r"0x[0-9a-fA-F]{4,}"), "<addr>"),
-    (re.compile(r"/(?:tmp|var/folders|private/var)/\S+"), "<tmp>"),
+    # The platform's own answer, not three guesses that happened to cover macOS and Linux.
+    (re.compile("(?:" + "|".join(
+        re.escape(t.rstrip("/")) for t in sorted(
+            {tempfile.gettempdir(), "/tmp", "/private/var/folders", "/var/folders",
+             os.environ.get("TMPDIR") or "", os.environ.get("TEMP") or "",
+             os.environ.get("RUNNER_TEMP") or ""} - {""}, key=len, reverse=True)
+    ) + r")[\\/]\S*"), "<tmp>"),
     (re.compile(r":\d+:\d+"), ":<pos>"),
     (re.compile(r"\b[0-9a-f]{7,40}\b"), "<sha>"),
     (re.compile(r"\s+"), " "),
@@ -2868,6 +2895,24 @@ def known_rules() -> set:
     return rules
 
 
+def concern_rules() -> set:
+    """Rule IDs from the control spec's "Concern rules" sub-table.
+
+    These are the rules a concern profile owns, and every profile says the same thing: a
+    finding raised by reading is `medium` confidence at most, because a reading is not a
+    measurement. That was a sentence in a profile and nothing checked it. Scoped to this
+    sub-table rather than to every `llm` finding, because `--detection` defaults to `llm`
+    and the cap the profiles state is theirs, not the whole taxonomy's.
+    """
+    body = control_spec_body()
+    _, _, tail = body.partition("### Concern rules")
+    # Only the rules the table itself declares as detected by reading. A concern rule whose
+    # row says `deterministic` -- MEM-SAFETY names a sanitiser -- has a tool behind it, and
+    # the cap is about readings, not about the domain.
+    return {m.group(1) for m in
+            re.finditer(r"^\|\s*`([A-Z][A-Z0-9-]*)`\s*\|[^|]*\|\s*llm\s*\|", tail, re.M)}
+
+
 def finding_id(rule: str, file: str, line, summary: str) -> str:
     """Stable identity, so the same finding raised twice is one finding and not two.
 
@@ -2949,6 +2994,18 @@ def finding_problems(rec: dict) -> list:
         out.append(f'severity "{cl.get("severity")}" is not one of: {", ".join(SEVERITIES)}')
     if cl.get("confidence") not in CONFIDENCES:
         out.append(f'confidence "{cl.get("confidence")}" is not one of: {", ".join(CONFIDENCES)}')
+    # A reading is not a measurement. The concern profiles already say a finding raised by
+    # reading is `medium` confidence at most; it was a sentence in a profile and nothing
+    # checked it, so `--detection llm --confidence high` was accepted. `high` is what tool
+    # output or a reproduction earns.
+    prov = rec.get("provenance") or {}
+    ev = rec.get("evidence") or {}
+    if (rec.get("ruleId") in concern_rules() and prov.get("detection") == "llm"
+            and cl.get("confidence") == "high"
+            and not ev.get("repro") and not ev.get("toolOutput")):
+        out.append('confidence "high" on a finding detected by reading needs evidence that '
+                   'does not depend on the reading: supply --repro or --tool-output, or '
+                   'raise it at --confidence medium')
     if cl.get("exploitability") and cl["exploitability"] not in EXPLOITABILITY:
         out.append(f'exploitability "{cl["exploitability"]}" is not one of: '
                    f'{", ".join(EXPLOITABILITY)}')
@@ -3133,6 +3190,15 @@ def cmd_finding(args) -> int:
     if p is None or not os.path.exists(p):
         print(f"no finding {args.id}", file=sys.stderr)
         return 1
+    if args.outcome == "fixed" and not args.commit:
+        print("closing a finding as `fixed` needs --commit <sha>.\n"
+              "`fixed` is a claim that something was repaired, and a claim with nothing "
+              "behind it is how a false-fix rate stays at zero while defects come back. "
+              "If the finding was wrong, or will not be acted on, say so instead:\n"
+              "  --outcome refused    it is not a defect, and why\n"
+              "  --outcome deferred   it is real and not now\n"
+              "  --outcome unexecuted nobody checked", file=sys.stderr)
+        return 3
     if args.outcome not in FINDING_OUTCOMES or args.outcome == "open":
         print(f'outcome must be one of: {", ".join(w for w in FINDING_OUTCOMES if w != "open")}',
               file=sys.stderr)

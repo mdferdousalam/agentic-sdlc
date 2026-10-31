@@ -722,7 +722,7 @@ print("findings: a defect that comes back is not still closed")
 r = fwrite(rule="CODE-ERROR-SWALLOWED", cat="C.25", sev="high", conf="high",
            f="src/reopen.ts", line="5", summary="the error path is swallowed on retry")
 rid = r.stdout.split()[0]
-finding("close", rid, "--outcome", "fixed", "--by", "sdlc-remediator")
+finding("close", rid, "--outcome", "fixed", "--commit", "deadbee", "--by", "sdlc-remediator")
 ok(rid not in run(["finding", "list", "--open"], df).stdout, "closing removes it from open")
 r = fwrite(rule="CODE-ERROR-SWALLOWED", cat="C.25", sev="high", conf="high",
            f="src/reopen.ts", line="5", summary="the error path is swallowed on retry")
@@ -735,7 +735,7 @@ r2 = fwrite(rule="SEC-SECRET-PRESENT", cat="D.36", sev="critical", conf="high",
             f="src/cfg.ts", line="2", summary="an API token is committed in the config",
             extra=["--by", "sdlc-security-reviewer"])
 rid2 = r2.stdout.split()[0]
-r = finding("close", rid2, "--outcome", "fixed", "--by", "sdlc-remediator")
+r = finding("close", rid2, "--outcome", "fixed", "--commit", "deadbee", "--by", "sdlc-remediator")
 ok("sdlc-security-reviewer raised this" in r.stdout,
    "closing another agent's finding is recorded, not silent")
 rec = json.load(open(os.path.join(df, ".sdlc/findings", rid2 + ".json")))
@@ -744,7 +744,8 @@ ok("by sdlc-remediator" in open(os.path.join(df, ".sdlc/audit.log")).read(),
    "and in the audit log")
 
 print("findings: closing says what actually happened")
-ok(finding("close", fid, "--outcome", "fixed", "--detail", "test q.spec.ts").returncode == 0,
+ok(finding("close", fid, "--outcome", "fixed", "--commit", "deadbee",
+            "--detail", "test q.spec.ts").returncode == 0,
    "a finding closes as fixed")
 ok(finding("close", fid, "--outcome", "resolved").returncode != 0,
    "a word outside the vocabulary cannot close a finding")
@@ -754,6 +755,39 @@ r = finding("close", fid, "--outcome", "unexecuted")
 ok("not closed" in r.stdout, "unexecuted says plainly that it is not closed")
 ok("finding.write" in open(os.path.join(df, ".sdlc/audit.log")).read(),
    "findings reach the audit log like every other stage")
+
+print("findings: `fixed` is a claim, and a claim names the commit behind it")
+_rf = fwrite(f="src/claim.ts", summary="a finding to close without evidence behind it")
+_cid = _rf.stdout.split()[0]
+ok(finding("close", _cid, "--outcome", "fixed").returncode == 3,
+   "closing as fixed with no --commit is refused")
+for _o in ("refused", "deferred", "unexecuted"):
+    _r2 = finding("close", _cid, "--outcome", _o)
+    ok(_r2.returncode == 0, f"but `{_o}` needs no commit — it claims no repair")
+ok(finding("close", _cid, "--outcome", "fixed", "--commit", "abc1234").returncode == 0,
+   "and fixed with a commit is accepted")
+
+print("findings: a reading is not a measurement")
+# Every concern profile says a finding it owns is medium confidence at most when it comes
+# from reading a diff. That was prose in a profile and nothing checked it.
+_rc = finding("write", "--rule", "PERF-N-PLUS-ONE", "--category", "E.50", "--severity",
+              "high", "--confidence", "high", "--detection", "llm", "--file", "src/q.ts",
+              "--line", "9", "--summary", "a query sits inside a loop over users")
+ok(_rc.returncode == 3, "a concern finding read from a diff cannot claim high confidence")
+ok("medium" in _rc.stdout + _rc.stderr, "and the refusal names the route")
+ok(finding("write", "--rule", "PERF-N-PLUS-ONE", "--category", "E.50", "--severity", "high",
+           "--confidence", "medium", "--detection", "llm", "--file", "src/q.ts", "--line",
+           "9", "--summary", "a query sits inside a loop over users").returncode == 0,
+   "at medium it is accepted")
+ok(finding("write", "--rule", "PERF-N-PLUS-ONE", "--category", "E.50", "--severity", "high",
+           "--confidence", "high", "--detection", "llm", "--file", "src/q2.ts", "--line", "9",
+           "--repro", "ab -n 500 /users shows 501 queries",
+           "--summary", "a query sits inside a loop over accounts").returncode == 0,
+   "with a reproduction, high is earned")
+ok(finding("write", "--rule", "SEC-INJECTION-SQL", "--category", "D.31", "--severity",
+           "critical", "--confidence", "high", "--file", "src/q3.ts", "--line", "9",
+           "--summary", "user input is concatenated into SQL here").returncode == 0,
+   "and the cap is the concern profiles' own, not the whole taxonomy's")
 
 print("findings: the two copies of the contract agree")
 # bin/sdlc validates by hand because it has no dependencies; the schema is the published
@@ -1137,7 +1171,12 @@ subprocess.run(["git", "checkout", "-q", "main"], cwd=dbr, capture_output=True)
 open(os.path.join(dbr, "next.txt"), "w").write("x\n")
 subprocess.run(["git", "add", "next.txt"], cwd=dbr)
 subprocess.run(["git", "commit", "-qm", "trunk moves on"], cwd=dbr)
-ok(guard(dbr, "git status").returncode == 0, "work from a new trunk point gets its own budget")
+# Spend is summed across the window, so advancing the trunk does not hand back a fresh
+# ceiling either — that was the last way to mint one. A person resets, and it is recorded.
+ok(guard(dbr, "git status").returncode == 2,
+   "a new trunk point does not hand back a fresh ceiling inside the window")
+run(["budget", "reset", "--as", "a person"], dbr)
+ok(guard(dbr, "git status").returncode == 0, "and a named person is how it starts over")
 shutil.rmtree(dbr)
 
 # The guard evaluates the rules a second time to ask what the defaults would have done.
