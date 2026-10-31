@@ -41,6 +41,7 @@ RECEIPT_KINDS = ("spec", "verification", "review", "security", "quality", "gate"
 AUDIT_LOG = ".sdlc/audit.log"
 FEEDBACK = ".sdlc/feedback.json"
 DEFAULT_MAX_AGE_MIN = 180
+RECEIPT_SKEW_MIN = 2        # clock skew between a CI runner and a laptop, no more
 FINDING_DIR = ".sdlc/findings"
 BASELINE = ".sdlc/baseline.json"
 BUDGET = ".sdlc/budget.json"
@@ -403,9 +404,37 @@ def receipt_problem(root: str, kind: str, verdict: str | None, max_age_min: int,
         age = (time.time() - calendar.timegm(time.strptime(r["at"], "%Y-%m-%dT%H:%M:%SZ"))) / 60
     except Exception:
         return f"the {kind} receipt has no readable timestamp"
+    # A future timestamp was the whole forgery: staleness is `age > limit`, and a receipt
+    # dated next month has a negative age, so it never expired. Nothing can be granted before
+    # the work it describes. The tolerance is for clock skew between a CI runner and a laptop,
+    # not a margin anyone should rely on.
+    if age < -RECEIPT_SKEW_MIN:
+        return (f"the {kind} receipt is dated {int(-age)} minutes in the future — a receipt "
+                f"cannot be granted before the work it attests to")
     if age > max_age_min:
         return f"the {kind} receipt is {int(age)} minutes old (limit {max_age_min})"
+    # `treeClean` was written on every receipt and read by nothing. A receipt granted over a
+    # clean tree says nothing about work that was never committed.
+    if r.get("treeClean") and not tree_clean(root):
+        return (f"the {kind} receipt was granted over a clean tree, and the tree is dirty now — "
+                f"there is uncommitted work it did not see")
     return None
+
+
+def receipt_holds(root: str, kind: str, verdict: str | None, max_age_min: int,
+                  require_commit: bool = True, why: str = "") -> str | None:
+    """`receipt_problem`, and a record either way.
+
+    Refusals were written to the audit log and acceptances were not, so the log showed every
+    door that stayed shut and none that opened. For an auditor that is the wrong half.
+    """
+    problem = receipt_problem(root, kind, verdict, max_age_min, require_commit)
+    where = f" ({why})" if why else ""
+    if problem:
+        audit(root, f"receipt.{kind}.refused", f"{problem}{where}")
+    else:
+        audit(root, f"receipt.{kind}.accepted", f"{verdict or 'any verdict'} held{where}")
+    return problem
 
 
 # ------------------------------------------------------------------------------------- guard
@@ -670,7 +699,8 @@ def guard_problem(root: str, command: str, cfg: dict) -> str | None:
         targets_protected = bool(re.search(rf"\b({prot_re})\b", pushed)) or (
             not named and re.fullmatch(rf"({prot_re})", cur or "") is not None)
         if targets_protected:
-            why = receipt_problem(root, "gate", "passed", max_age)
+            why = receipt_holds(root, "gate", "passed", max_age,
+                                why="pushing a protected branch")
             if why:
                 return (f"pushing a protected branch needs a passed gate receipt, and {why}.\n"
                         f"Run `/agentic-sdlc:gate` (the mechanical checks and the secret scan), or "
@@ -684,13 +714,14 @@ def guard_problem(root: str, command: str, cfg: dict) -> str | None:
             merging = bool(gm) and not re.search(r"--(abort|continue|quit)\b", gm) \
                 and re.fullmatch(rf"({prot_re})", cur or "") is not None
         if merging:
-            why = receipt_problem(root, "readiness", "ready", max_age)
+            why = receipt_holds(root, "readiness", "ready", max_age, why="merging")
             if why:
                 return (f"merging needs a READY readiness receipt, and {why}.\n"
                         f"Run `/agentic-sdlc:readiness`. It runs the reviewers, the secret scan and "
                         f"the verify command, and checks every acceptance criterion against evidence.")
             if approvals.get("merge") == "human":
-                why = receipt_problem(root, "approval_merge", "granted", max_age)
+                why = receipt_holds(root, "approval_merge", "granted", max_age,
+                                    why="merging")
                 if why:
                     return (f"this project requires a human to approve a merge, and {why}.\n"
                             f"A person runs:  sdlc approve merge --as '<their name>'\n"
@@ -707,12 +738,13 @@ def guard_problem(root: str, command: str, cfg: dict) -> str | None:
     deploying = any(hit(units, pat) for pat in DEPLOY_PATTERNS)
     if deploying:
         if approvals.get("release", "human") == "human":
-            why = receipt_problem(root, "approval_release", "granted", max_age)
+            why = receipt_holds(root, "approval_release", "granted", max_age,
+                                why="deploying")
             if why:
                 return (f"deploying needs a human approval, and {why}.\n"
                         f"A person runs:  sdlc approve release --as '<their name>'\n"
                         f"Deployment changes what users are running. No agent grants itself that.")
-        why = receipt_problem(root, "readiness", "ready", max_age)
+        why = receipt_holds(root, "readiness", "ready", max_age, why="deploying")
         if why:
             return f"deploying needs a READY readiness receipt, and {why}."
     return None
@@ -868,7 +900,8 @@ def cmd_receipt(args) -> int:
         return 0
     cfg = load_config(root)
     max_age = args.max_age_min or int(((cfg.get("receipts") or {}).get("maxAgeMin")) or DEFAULT_MAX_AGE_MIN)
-    why = receipt_problem(root, args.kind, args.verdict, max_age, require_commit=not args.any_commit)
+    why = receipt_holds(root, args.kind, args.verdict, max_age,
+                        require_commit=not args.any_commit, why="sdlc receipt check")
     if why:
         print(f"{args.kind} receipt does not hold: {why}", file=sys.stderr)
         return 1

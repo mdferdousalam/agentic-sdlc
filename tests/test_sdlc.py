@@ -189,6 +189,46 @@ ok(run(["receipt", "check", "readiness", "--verdict", "ready"], d).returncode ==
    "a new commit voids the readiness receipt")
 ok(guard(d, "gh pr merge --squash").returncode == 2, "blocked: merge after a new commit")
 
+print("receipts: a file written by hand is not a verdict")
+# Staleness was `age > limit`, so a receipt dated next month had a negative age and never
+# expired. `treeClean` was written on every receipt and read by nothing.
+dforge = newrepo(config={"version": 2, "trunk": "main"})
+head_sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=dforge,
+                          capture_output=True, text=True).stdout.strip()
+
+
+def forge(kind, verdict, seconds_ahead, clean=True):
+    at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + seconds_ahead))
+    os.makedirs(os.path.join(dforge, ".sdlc", "receipts"), exist_ok=True)
+    with open(os.path.join(dforge, ".sdlc", "receipts", kind + ".json"), "w") as fh:
+        json.dump({"kind": kind, "verdict": verdict, "commit": head_sha, "branch": "main",
+                   "subject": None, "subjectDigest": None, "detail": "hand written",
+                   "by": "nobody", "at": at, "treeClean": clean, "env": {}}, fh)
+
+
+forge("readiness", "ready", 30 * 86400)
+ok(run(["receipt", "check", "readiness", "--verdict", "ready"], dforge).returncode == 1,
+   "a receipt dated a month ahead does not hold")
+ok(guard(dforge, "gh pr merge --squash").returncode == 2,
+   "and does not unlock the merge it was forged for")
+forge("gate", "passed", 30 * 86400)
+ok(guard(dforge, "git push origin main").returncode == 2,
+   "nor a protected-branch push")
+forge("gate", "passed", 60)
+ok(run(["receipt", "check", "gate", "--verdict", "passed"], dforge).returncode == 0,
+   "a minute of clock skew is still tolerated")
+# treeClean is now read: a receipt granted over a clean tree says nothing about work that
+# was never committed.
+open(os.path.join(dforge, "uncommitted.txt"), "w").write("x\n")
+subprocess.run(["git", "add", "uncommitted.txt"], cwd=dforge)
+ok(run(["receipt", "check", "gate", "--verdict", "passed"], dforge).returncode == 1,
+   "a receipt claiming a clean tree stops holding once the tree is dirty")
+# Refusals were logged and acceptances were not, which is the wrong half for an auditor.
+alog = open(os.path.join(dforge, ".sdlc", "audit.log")).read()
+ok("receipt.gate.accepted" in alog, "an accepted receipt is recorded, not only a refused one")
+ok("receipt.readiness.refused" in alog, "and a refused one still is")
+shutil.rmtree(dforge)
+
 print("receipts: bound to the subject's content")
 spec = os.path.join(d, "spec.md")
 open(spec, "w").write("# spec v1\n")

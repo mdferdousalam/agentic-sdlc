@@ -49,7 +49,15 @@ outside this tool, and treat the receipt as corroboration rather than proof.
 1. **Local, not central.** Receipts and the audit log live in a working copy. A determined
    actor can delete them; the hook refuses the *action*, but it does not protect the record.
    For real assurance, enforce the same gates in CI, where the agent has no write access.
-2. **No cryptographic identity.** See above.
+2. **No cryptographic identity. A receipt is a file, not a signature.** Anyone who can write
+   to `.sdlc/receipts/` can write one, and the checks on it are consistency checks rather than
+   proof of authorship: the commit must match HEAD, the subject digest must match what was
+   approved, the timestamp must be neither stale nor in the future, and a receipt granted over
+   a clean tree stops holding once the tree is dirty. Those catch a receipt that has drifted
+   from the work it describes. They do not catch a hand-written one that is internally
+   consistent, and nothing local can — `by` is a string the writer chooses. Every acceptance
+   and every refusal is written to `.sdlc/audit.log`, so a forgery leaves a trace; the log is
+   local too. CI is the boundary that does not rely on any of this.
 3. **Deterministic analysis is yours to supply.** `quality.cmd` runs whatever analyser you
    configure. The pipeline does not ship one, and an LLM reviewer is not a substitute for
    deterministic analysis — it is a complement with different coverage. This is visible rather
